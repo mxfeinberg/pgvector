@@ -12,3 +12,6 @@ regression.*
 *.obj
 *.lib
 *.exp
+/graphify-out
+agtalk_posts.sql
+/docs
