@@ -50,6 +50,32 @@ typedef struct TqBuildState
 	double		indtuples;
 
 	MemoryContext tmpCtx;
+
+	/* Blocked build staging (v4 format) */
+	uint8	   *codeStage;		/* TQ_BLOCK_CODE_BYTES(dimCodes), reused per block */
+	TqBlockSideRec sideStage;	/* staged side record for the current block */
+	int			slot;			/* next free lane 0..TQ_BLOCK_WIDTH-1 */
+	uint32		blockCount;		/* blocks flushed */
+
+	/*
+	 * Streaming code-plane chain cursor.  Each block's code-plane is appended
+	 * straight to this page chain as it flushes, rather than accumulated in a
+	 * single in-memory buffer: a StringInfo caps at MaxAllocSize (~1 GB) and
+	 * would error out a large build (~2M rows at dim=768) well before the meta
+	 * page's 2^32 nVectors limit.  The reassembled byte stream is independent
+	 * of how blocks are split across page items (TqReadBytes concatenates item
+	 * contents in chain order), so this is on-disk-identical to a one-shot
+	 * write of the whole stream.
+	 */
+	BlockNumber codeStart;		/* first code-chain block (set on first append) */
+	Buffer		codeBuf;		/* code-chain page cursor */
+	Page		codePage;
+	GenericXLogState *codeState;
+
+	BlockNumber sideStart;		/* first side-chain block (set on first append) */
+	Buffer		sideBuf;		/* side-chain page cursor */
+	Page		sidePage;
+	GenericXLogState *sideState;
 }			TqBuildState;
 
 /*
@@ -168,6 +194,11 @@ TqCreateMetaPage(TqBuildState * buildstate)
 	metap->codebookStart = InvalidBlockNumber;
 	metap->qjlStart = InvalidBlockNumber;
 	metap->dataStart = InvalidBlockNumber;
+	metap->codeStart = InvalidBlockNumber;
+	metap->sideStart = InvalidBlockNumber;
+	metap->tailStart = InvalidBlockNumber;
+	metap->blockWidth = TQ_BLOCK_WIDTH;
+	metap->blockCount = 0;
 	metap->qjlScale = 0.0f;
 
 	((PageHeader) page)->pd_lower =
@@ -232,9 +263,71 @@ TqWriteBytes(TqBuildState * buildstate, const char *bytes, Size nbytes)
 }
 
 /*
- * Read a raw byte buffer back from a linked page chain into dest.
+ * Append raw bytes to the streaming code-plane page chain, extending it across
+ * as many linked pages as needed.  The chain is opened lazily on the first
+ * call (recording its first block in buildstate->codeStart) and stays open
+ * between calls; TqBuildIndex commits the final page after the scan.
+ *
+ * This packs bytes into page items using the same chunking as TqWriteBytes, so
+ * a block's code-plane may be split across items / pages.  That is fine: the
+ * reader (TqReadBytes) reassembles by concatenating item contents in chain
+ * order, so the on-disk byte stream is identical to a one-shot write of the
+ * full concatenation, regardless of item boundaries.
  */
 static void
+TqCodeAppend(TqBuildState * buildstate, const char *bytes, Size nbytes)
+{
+	Relation	index = buildstate->index;
+	ForkNumber	forkNum = buildstate->forkNum;
+	Size		offset = 0;
+
+	/* Lazily open the code chain on the first block flush. */
+	if (buildstate->codePage == NULL)
+	{
+		buildstate->codeBuf = TqNewBuffer(index, forkNum);
+		TqInitRegisterPage(index, &buildstate->codeBuf, &buildstate->codePage,
+						   &buildstate->codeState);
+		buildstate->codeStart = BufferGetBlockNumber(buildstate->codeBuf);
+	}
+
+	while (offset < nbytes)
+	{
+		Size		avail = PageGetFreeSpace(buildstate->codePage);
+		Size		chunk;
+		OffsetNumber offno;
+
+		/* Reserve space for the item's line pointer + alignment */
+		if (avail <= sizeof(ItemIdData))
+		{
+			TqAppendPage(index, &buildstate->codeBuf, &buildstate->codePage,
+						 &buildstate->codeState, forkNum);
+			continue;
+		}
+
+		chunk = avail - sizeof(ItemIdData);
+		chunk = chunk - (chunk % MAXIMUM_ALIGNOF);	/* keep items aligned */
+		if (chunk == 0)
+		{
+			TqAppendPage(index, &buildstate->codeBuf, &buildstate->codePage,
+						 &buildstate->codeState, forkNum);
+			continue;
+		}
+		if (chunk > nbytes - offset)
+			chunk = nbytes - offset;
+
+		offno = PageAddItem(buildstate->codePage, (Item) (bytes + offset), chunk,
+							InvalidOffsetNumber, false, false);
+		if (offno == InvalidOffsetNumber)
+			elog(ERROR, "failed to add code-plane item to \"%s\"", RelationGetRelationName(index));
+
+		offset += chunk;
+	}
+}
+
+/*
+ * Read a raw byte buffer back from a linked page chain into dest.
+ */
+void
 TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes)
 {
 	BlockNumber blkno = startBlock;
@@ -281,7 +374,9 @@ static void
 TqUpdateMeta(Relation index, ForkNumber forkNum, BlockNumber rotationStart,
 			 BlockNumber codebookStart, BlockNumber qjlStart, float qjlScale,
 			 BlockNumber dataStart, uint32 nVectors,
-			 uint16 fastRotation, uint16 dimPadded)
+			 uint16 fastRotation, uint16 dimPadded,
+			 BlockNumber codeStart, BlockNumber sideStart, BlockNumber tailStart,
+			 uint16 blockWidth, uint32 blockCount)
 {
 	Buffer		buf;
 	Page		page;
@@ -302,6 +397,11 @@ TqUpdateMeta(Relation index, ForkNumber forkNum, BlockNumber rotationStart,
 	metap->nVectors = nVectors;
 	metap->fastRotation = fastRotation;
 	metap->dimPadded = dimPadded;
+	metap->codeStart = codeStart;
+	metap->sideStart = sideStart;
+	metap->tailStart = tailStart;
+	metap->blockWidth = blockWidth;
+	metap->blockCount = blockCount;
 
 	TqCommitBuffer(buf, state);
 }
@@ -428,7 +528,66 @@ TqAppendEntry(TqBuildState * buildstate)
 }
 
 /*
- * Callback for table_index_build_scan: encode one heap tuple and append it.
+ * Append one TqBlockSideRec to the side-chain page cursor.  Records the first
+ * block into *sideStart on the first append.  The side chain is page-addressable
+ * (one PageAddItem item per block), unlike the raw code-plane byte stream.
+ */
+static void
+TqAppendSideRec(TqBuildState * buildstate, BlockNumber *sideStart,
+				const TqBlockSideRec *rec)
+{
+	Relation	index = buildstate->index;
+	OffsetNumber offno;
+
+	/* Lazily open the side-chain cursor on first append. */
+	if (buildstate->sidePage == NULL)
+	{
+		buildstate->sideBuf = TqNewBuffer(index, buildstate->forkNum);
+		TqInitRegisterPage(index, &buildstate->sideBuf, &buildstate->sidePage,
+						   &buildstate->sideState);
+		*sideStart = BufferGetBlockNumber(buildstate->sideBuf);
+	}
+
+	if (PageGetFreeSpace(buildstate->sidePage) < sizeof(TqBlockSideRec))
+		TqAppendPage(index, &buildstate->sideBuf, &buildstate->sidePage,
+					 &buildstate->sideState, buildstate->forkNum);
+
+	offno = PageAddItem(buildstate->sidePage, (Item) rec, sizeof(TqBlockSideRec),
+						InvalidOffsetNumber, false, false);
+	if (offno == InvalidOffsetNumber)
+		elog(ERROR, "failed to add tqflat side record to \"%s\"",
+			 RelationGetRelationName(index));
+}
+
+/*
+ * Flush the currently-staged block: append its code-plane to the contiguous
+ * code byte stream and its side record to the side chain.
+ */
+static void
+TqFlushBlock(TqBuildState * buildstate)
+{
+	int			dc = buildstate->dimCodes;
+
+	buildstate->sideStage.nvecs = (uint16) buildstate->slot;
+	buildstate->sideStage.deletedMask = 0;
+	buildstate->sideStage.pad = 0;
+
+	/* Code plane -> streamed straight onto the code-plane page chain. */
+	TqCodeAppend(buildstate, (char *) buildstate->codeStage,
+				 TQ_BLOCK_CODE_BYTES(dc));
+
+	/* Side record -> one addressable item in the side chain. */
+	TqAppendSideRec(buildstate, &buildstate->sideStart, &buildstate->sideStage);
+
+	memset(buildstate->codeStage, 0, TQ_BLOCK_CODE_BYTES(dc));
+	buildstate->slot = 0;
+	buildstate->blockCount++;
+	MemSet(&buildstate->sideStage, 0, sizeof(buildstate->sideStage));
+}
+
+/*
+ * Callback for table_index_build_scan: encode one heap tuple and stage it into
+ * the current block.  The block is flushed once it fills (TQ_BLOCK_WIDTH lanes).
  */
 static void
 TqBuildCallback(Relation index, ItemPointer tid, Datum *values,
@@ -437,29 +596,31 @@ TqBuildCallback(Relation index, ItemPointer tid, Datum *values,
 	TqBuildState *buildstate = (TqBuildState *) state;
 	MemoryContext oldCtx;
 	Vector	   *vec;
+	int			slot;
 
 	if (isnull[0])
 		return;
 
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
-
 	vec = DatumGetVector(values[0]);
 
-	/* Zero the full entry (codes + signs) before encoding */
 	memset(buildstate->entry, 0, buildstate->entrySize);
-
 	TqEncode(&buildstate->model, vec->x, buildstate->entry);
 
-	buildstate->entry->heaptid = *tid;
-	buildstate->entry->deleted = 0;
+	slot = buildstate->slot;
+	TqScatterCodes(&buildstate->model, buildstate->entry->data, slot,
+				   buildstate->codeStage);
+	buildstate->sideStage.side[slot].heaptid = *tid;
+	buildstate->sideStage.side[slot].norm = buildstate->entry->norm;
+	buildstate->sideStage.side[slot].scale = buildstate->entry->scale;
+	buildstate->slot++;
 
 	MemoryContextSwitchTo(oldCtx);
 
-	/* Append outside tmpCtx reset window (entry lives in build state) */
-	TqAppendEntry(buildstate);
+	if (buildstate->slot == TQ_BLOCK_WIDTH)
+		TqFlushBlock(buildstate);
 
 	buildstate->indtuples++;
-
 	MemoryContextReset(buildstate->tmpCtx);
 }
 
@@ -495,9 +656,17 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 
 	/* Options */
 	buildstate->bits = opts ? opts->bits : TQ_DEFAULT_BITS;
+	if (buildstate->bits != 4)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tqflat blocked layout supports only bits = 4")));
 	/* Defaults single-sourced with the reloption registration in tq.c so the
 	 * no-WITH-clause path can't drift from `WITH (...)`. */
 	buildstate->tqProd = opts ? opts->tqProd : TQ_DEFAULT_TQPROD;
+	if (buildstate->tqProd)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tqflat blocked layout does not support tq_prod (QJL); use the default tq_prod = false")));
 	buildstate->fastRotation = opts ? opts->fastRotation : TQ_DEFAULT_FAST_ROTATION;
 	buildstate->nLevels = 1 << buildstate->bits;
 
@@ -531,6 +700,20 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->entry = palloc0(buildstate->entrySize);
 
+	/* Blocked build staging (v4 format) */
+	buildstate->codeStage = palloc0(TQ_BLOCK_CODE_BYTES(buildstate->dimCodes));
+	buildstate->slot = 0;
+	buildstate->blockCount = 0;
+	buildstate->codeStart = InvalidBlockNumber;
+	buildstate->codeBuf = InvalidBuffer;
+	buildstate->codePage = NULL;
+	buildstate->codeState = NULL;
+	buildstate->sideStart = InvalidBlockNumber;
+	buildstate->sideBuf = InvalidBuffer;
+	buildstate->sidePage = NULL;
+	buildstate->sideState = NULL;
+	MemSet(&buildstate->sideStage, 0, sizeof(buildstate->sideStage));
+
 	buildstate->reltuples = 0;
 	buildstate->indtuples = 0;
 
@@ -559,7 +742,7 @@ TqBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	BlockNumber cbStart;
 	BlockNumber qjlStart;
 	float		qjlScale;
-	BlockNumber dataStart;
+	BlockNumber dataStart = InvalidBlockNumber;
 
 	TqInitBuildState(buildstate, heap, index, indexInfo, forkNum);
 
@@ -567,25 +750,34 @@ TqBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	TqCreateMetaPage(buildstate);
 	TqBuildModelAndSidePages(buildstate, &rotStart, &cbStart, &qjlStart, &qjlScale);
 
-	/* Open the first data page */
-	buildstate->buf = TqNewBuffer(index, forkNum);
-	TqInitRegisterPage(index, &buildstate->buf, &buildstate->page, &buildstate->state);
-	dataStart = BufferGetBlockNumber(buildstate->buf);
-
-	/* Scan the heap and append encoded entries (skip for empty/unlogged) */
+	/* Scan the heap and stage encoded entries into blocks (skip for empty) */
 	if (heap != NULL)
 		buildstate->reltuples = table_index_build_scan(heap, index, indexInfo,
 													   true, true, TqBuildCallback,
 													   (void *) buildstate, NULL);
 
-	/* Commit the final data page */
-	TqCommitBuffer(buildstate->buf, buildstate->state);
+	/* Flush any partial trailing block. */
+	if (buildstate->slot > 0)
+		TqFlushBlock(buildstate);
+
+	/* Close the side-chain page cursor. */
+	if (buildstate->sidePage != NULL)
+		TqCommitBuffer(buildstate->sideBuf, buildstate->sideState);
+
+	/*
+	 * Close the streaming code-plane page cursor.  codeStart stays
+	 * InvalidBlockNumber when no block ever flushed (empty index).
+	 */
+	if (buildstate->codePage != NULL)
+		TqCommitBuffer(buildstate->codeBuf, buildstate->codeState);
 
 	/* Backfill meta page */
 	TqUpdateMeta(index, forkNum, rotStart, cbStart, qjlStart, qjlScale, dataStart,
 				 (uint32) buildstate->indtuples,
 				 (uint16) (buildstate->model.fastRotation ? 1 : 0),
-				 (uint16) buildstate->model.dimPadded);
+				 (uint16) buildstate->model.dimPadded,
+				 buildstate->codeStart, buildstate->sideStart, InvalidBlockNumber,
+				 TQ_BLOCK_WIDTH, buildstate->blockCount);
 
 	/* Write WAL for init fork since GenericXLog does not */
 	if (forkNum == INIT_FORKNUM)
@@ -718,7 +910,7 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
-	BlockNumber dataStart;
+	BlockNumber tailStart;
 	BlockNumber insertPage;
 	MemoryContext insertCtx;
 	MemoryContext oldCtx;
@@ -753,7 +945,15 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 
 	MemoryContextSwitchTo(oldCtx);
 
-	/* ---- Find the tail data page ---- */
+	/*
+	 * ---- Find the head of the row-major insert tail chain ----
+	 *
+	 * In the v4 blocked format the built rows live in the block code-plane /
+	 * side chains; freshly inserted rows go to a separate row-major "tail"
+	 * chain (metap->tailStart) that the scan reads with TqScoreEntry.  The
+	 * tail chain is created lazily on the first insert, so tailStart is
+	 * InvalidBlockNumber until then.
+	 */
 	{
 		Buffer		metabuf;
 		Page		metapage;
@@ -763,19 +963,91 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 		metapage = BufferGetPage(metabuf);
 		metap = TqPageGetMeta(metapage);
-		dataStart = metap->dataStart;
+		tailStart = metap->tailStart;
 		UnlockReleaseBuffer(metabuf);
 	}
-
-	if (!BlockNumberIsValid(dataStart))
-		elog(ERROR, "tqflat index has no data page");
-
-	insertPage = TqFindInsertPage(index, dataStart);
 
 	/*
 	 * tqinsert only writes MAIN_FORKNUM; the init fork is written only by
 	 * tqbuildempty.
-	 *
+	 */
+	if (!BlockNumberIsValid(tailStart))
+	{
+		/* First insert: create the tail chain's first page. */
+		Buffer		newbuf;
+		Page		newpage;
+		GenericXLogState *newstate;
+		BlockNumber newblk;
+		OffsetNumber offno;
+
+		LockRelationForExtension(index, ExclusiveLock);
+		newbuf = TqNewBuffer(index, MAIN_FORKNUM);
+		UnlockRelationForExtension(index, ExclusiveLock);
+
+		newblk = BufferGetBlockNumber(newbuf);
+		newstate = GenericXLogStart(index);
+		newpage = GenericXLogRegisterBuffer(newstate, newbuf, GENERIC_XLOG_FULL_IMAGE);
+		TqInitPage(newbuf, newpage);
+		TqPageGetOpaque(newpage)->nextblkno = InvalidBlockNumber;
+		offno = PageAddItem(newpage, (Item) entry, entrySize,
+							InvalidOffsetNumber, false, false);
+		if (offno == InvalidOffsetNumber)
+		{
+			GenericXLogAbort(newstate);
+			UnlockReleaseBuffer(newbuf);
+			elog(ERROR, "failed to add tqflat tail item on first insert");
+		}
+		GenericXLogFinish(newstate);
+		UnlockReleaseBuffer(newbuf);
+
+		/* Record tailStart (and bump nVectors) in the meta page. */
+		{
+			Buffer		mbuf;
+			Page		mpage;
+			GenericXLogState *mstate;
+			TqMetaPage	mp;
+
+			mbuf = ReadBuffer(index, TQ_METAPAGE_BLKNO);
+			LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+			mstate = GenericXLogStart(index);
+			mpage = GenericXLogRegisterBuffer(mstate, mbuf, 0);
+			mp = TqPageGetMeta(mpage);
+
+			if (BlockNumberIsValid(mp->tailStart))
+			{
+				/*
+				 * Another session won the concurrent first-insert race: it
+				 * acquired this exclusive meta lock first and already set
+				 * tailStart.  Our newblk page is committed but unreferenced;
+				 * it becomes a stranded page reclaimed at REINDEX (same
+				 * trade-off as ivfflat).  Abort our meta xlog, release, and
+				 * fall through to the normal append path so our entry is not
+				 * lost.
+				 */
+				tailStart = mp->tailStart;	/* capture before release */
+				GenericXLogAbort(mstate);
+				UnlockReleaseBuffer(mbuf);
+
+				/* Append our entry via the normal tail-walk path. */
+				insertPage = TqFindInsertPage(index, tailStart);
+				goto append_entry;
+			}
+
+			mp->tailStart = newblk;
+			mp->nVectors += 1;
+			GenericXLogFinish(mstate);
+			UnlockReleaseBuffer(mbuf);
+		}
+
+		goto insert_done;
+	}
+
+	/* Normal path: tail chain already exists. */
+	insertPage = TqFindInsertPage(index, tailStart);
+
+append_entry:
+
+	/*
 	 * Append to the tail page (or a new page), mirroring ivfinsert's loop.
 	 * The for(;;) retry is needed because TqFindInsertPage walks the chain
 	 * under share locks and releases them before we take the exclusive lock
@@ -801,8 +1073,12 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 			offno = PageAddItem(page, (Item) entry, entrySize,
 								InvalidOffsetNumber, false, false);
 			if (offno == InvalidOffsetNumber)
+			{
+				GenericXLogAbort(state);
+				UnlockReleaseBuffer(buf);
 				elog(ERROR, "failed to add tqflat data item to \"%s\"",
 					 RelationGetRelationName(index));
+			}
 
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(buf);
@@ -854,8 +1130,12 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 			offno = PageAddItem(page, (Item) entry, entrySize,
 								InvalidOffsetNumber, false, false);
 			if (offno == InvalidOffsetNumber)
+			{
+				GenericXLogAbort(state);
+				UnlockReleaseBuffer(buf);
 				elog(ERROR, "failed to add tqflat data item to \"%s\"",
 					 RelationGetRelationName(index));
+			}
 
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(buf);
@@ -882,6 +1162,7 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		UnlockReleaseBuffer(metabuf);
 	}
 
+insert_done:
 	MemoryContextDelete(insertCtx);
 
 	return false;
@@ -1077,7 +1358,9 @@ tqflat_test_meta(PG_FUNCTION_ARGS)
 	uint32		nVectors;
 	uint16		fastRotation;
 	uint16		dimPadded;
-	Datum		elems[7];
+	uint16		blockWidth;
+	uint32		blockCount;
+	Datum		elems[9];
 	ArrayType  *result;
 	Buffer		buf;
 	Page		page;
@@ -1095,6 +1378,8 @@ tqflat_test_meta(PG_FUNCTION_ARGS)
 	nVectors = metap->nVectors;
 	fastRotation = metap->fastRotation;
 	dimPadded = metap->dimPadded;
+	blockWidth = metap->blockWidth;
+	blockCount = metap->blockCount;
 	UnlockReleaseBuffer(buf);
 
 	index_close(index, AccessShareLock);
@@ -1106,8 +1391,10 @@ tqflat_test_meta(PG_FUNCTION_ARGS)
 	elems[4] = Int32GetDatum((int) nVectors);
 	elems[5] = Int32GetDatum((int) fastRotation);
 	elems[6] = Int32GetDatum((int) dimPadded);
+	elems[7] = Int32GetDatum((int) blockWidth);
+	elems[8] = Int32GetDatum((int) blockCount);
 
-	result = construct_array(elems, 7, INT4OID, sizeof(int32), true, TYPALIGN_INT);
+	result = construct_array(elems, 9, INT4OID, sizeof(int32), true, TYPALIGN_INT);
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }

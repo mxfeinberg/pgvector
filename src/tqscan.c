@@ -53,6 +53,9 @@ typedef struct TqScanOpaqueData
 
 	/* Per-query state (rebuilt on each rescan). */
 	float	   *lut;			/* dim * nLevels */
+	uint8	   *lut8;			/* 8-bit query LUT for the block kernel */
+	float		lutBias;		/* affine recovery: mse = lutScale*sum + dc*lutBias */
+	float		lutScale;
 	float	   *qjlQuery;		/* dim, or NULL when !tqProd */
 	Vector	   *queryVec;		/* normalized query (for rerank / cosine) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
@@ -130,6 +133,7 @@ tqbeginscan(Relation index, int nkeys, int norderbys)
 	so->heapAttno = index->rd_index->indkey.values[0];
 
 	so->lut = NULL;
+	so->lut8 = NULL;
 	so->qjlQuery = NULL;
 	so->queryVec = NULL;
 	so->results = NULL;
@@ -191,6 +195,7 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	 */
 	MemoryContextReset(so->tmpCtx);
 	so->lut = NULL;
+	so->lut8 = NULL;
 	so->qjlQuery = NULL;
 	so->queryVec = NULL;
 	so->results = NULL;
@@ -236,6 +241,10 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		if (model->tqProd)
 			so->qjlQuery = palloc(sizeof(float) * model->dimCodes);
 		TqBuildQueryLut(model, q->x, so->lut, so->qjlQuery);
+
+		/* Build the 8-bit LUT + affine recovery constants for the block kernel. */
+		so->lut8 = palloc(model->dimCodes * model->nLevels);
+		TqBuildLut8(model, so->lut, so->lut8, &so->lutBias, &so->lutScale);
 	}
 
 	MemoryContextSwitchTo(oldCtx);
@@ -262,6 +271,32 @@ TqEstToDist(TqScanOpaque so, const TqEntry *entry, float est)
 		case TQ_METRIC_L2:
 		default:
 			return so->qNormSq + (double) entry->norm * (double) entry->norm
+				- 2.0 * (double) est;
+	}
+}
+
+/*
+ * Like TqEstToDist but takes the stored norm directly (the block path has no
+ * TqEntry, only the side record's norm).  MUST mirror TqEstToDist's formulas.
+ */
+static inline double
+TqEstToDistSide(TqScanOpaque so, float norm, float est)
+{
+	switch (so->metric)
+	{
+		case TQ_METRIC_IP:
+			return -(double) est;
+		case TQ_METRIC_COSINE:
+			{
+				double		n = (double) norm;
+
+				if (n < 1e-12)
+					return 1.0;
+				return 1.0 - (double) est / n;
+			}
+		case TQ_METRIC_L2:
+		default:
+			return so->qNormSq + (double) norm * (double) norm
 				- 2.0 * (double) est;
 	}
 }
@@ -335,13 +370,17 @@ TqDoScan(IndexScanDesc scan)
 	TqScanOpaque so = (TqScanOpaque) scan->opaque;
 	TqModel    *model = so->model;
 	Relation	index = scan->indexRelation;
-	BlockNumber blkno;
+	int			dc = model->dimCodes;
+	BlockNumber codeStart;
+	BlockNumber sideStart;
+	BlockNumber tailStart;
+	uint32		blockCount;
 	int			capacity;
 	int			n = 0;
 	TqScanResult *results;
 	MemoryContext oldCtx;
 
-	/* dataStart from the meta page. */
+	/* Block-layout chain heads + counts from the meta page. */
 	{
 		Buffer		metabuf;
 		Page		metapage;
@@ -351,7 +390,10 @@ TqDoScan(IndexScanDesc scan)
 		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 		metapage = BufferGetPage(metabuf);
 		metap = TqPageGetMeta(metapage);
-		blkno = metap->dataStart;
+		codeStart = metap->codeStart;
+		sideStart = metap->sideStart;
+		tailStart = metap->tailStart;
+		blockCount = metap->blockCount;
 		capacity = (int) metap->nVectors;
 		UnlockReleaseBuffer(metabuf);
 	}
@@ -362,41 +404,163 @@ TqDoScan(IndexScanDesc scan)
 		capacity = 1;
 	results = palloc(sizeof(TqScanResult) * capacity);
 
-	/* Walk every data page following nextblkno; score each non-deleted entry. */
-	while (BlockNumberIsValid(blkno))
+	/*
+	 * Block scan: read the whole code-plane chain into one contiguous buffer,
+	 * then walk the side chain in block order.  For each block, fold its
+	 * code-plane into the 32-lane accumulator with the SIMD kernel and recover
+	 * each live lane's estimate from the side record's per-lane scale/norm.
+	 */
+	if (blockCount > 0 && BlockNumberIsValid(codeStart))
 	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber offno;
+		Size		blockCodeBytes = TQ_BLOCK_CODE_BYTES(dc);
+		Size		codeLen = (Size) blockCount * blockCodeBytes;
+		char	   *codeBuf = palloc(codeLen);
+		BlockNumber sblk = sideStart;
+		uint32		b = 0;
 
-		buf = ReadBuffer(index, blkno);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		maxoff = PageGetMaxOffsetNumber(page);
+		TqReadBytes(index, codeStart, codeBuf, codeLen);
 
-		for (offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		while (BlockNumberIsValid(sblk))
 		{
-			TqEntry    *entry = (TqEntry *) PageGetItem(page, PageGetItemId(page, offno));
-			float		est;
+			Buffer		sbuf = ReadBuffer(index, sblk);
+			Page		spage;
+			OffsetNumber soff,
+						smax;
+			BlockNumber nextblk;
 
-			if (entry->deleted)
-				continue;
+			LockBuffer(sbuf, BUFFER_LOCK_SHARE);
+			spage = BufferGetPage(sbuf);
+			smax = PageGetMaxOffsetNumber(spage);
 
-			est = TqScoreEntry(model, so->lut, so->qjlQuery, entry, entry->data);
-
-			if (n >= capacity)
+			for (soff = FirstOffsetNumber; soff <= smax; soff = OffsetNumberNext(soff))
 			{
-				capacity *= 2;
-				results = repalloc(results, sizeof(TqScanResult) * capacity);
-			}
-			results[n].dist = TqEstToDist(so, entry, est);
-			results[n].tid = entry->heaptid;
-			n++;
-		}
+				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
+				const uint8 *plane = (const uint8 *) codeBuf + (Size) b * blockCodeBytes;
 
-		blkno = TqPageGetOpaque(page)->nextblkno;
-		UnlockReleaseBuffer(buf);
+				if (tqflat_force_scalar)
+				{
+					int			nLevels = model->nLevels;
+					int			j;
+
+					for (j = 0; j < srec->nvecs; j++)
+					{
+						int			lane = j & 15;
+						bool		high = j >= 16;
+						double		mse = 0.0;
+						float		est;
+						TqBlockSide *sd;
+						int			ii;
+
+						if (srec->deletedMask & (1u << j))
+							continue;
+
+						for (ii = 0; ii < dc; ii++)
+						{
+							uint8		cellb = plane[(Size) ii * 16 + lane];
+							uint8		code = high ? (uint8) (cellb >> 4) : (uint8) (cellb & 0x0F);
+
+							mse += (double) so->lut[(Size) ii * nLevels + code];
+						}
+						sd = &srec->side[j];
+						est = (float) ((double) sd->scale * mse);
+
+						if (n >= capacity)
+						{
+							capacity *= 2;
+							results = repalloc(results, sizeof(TqScanResult) * capacity);
+						}
+						results[n].dist = TqEstToDistSide(so, sd->norm, est);
+						results[n].tid = sd->heaptid;
+						n++;
+					}
+				}
+				else
+				{
+					TqBlockAccum acc;
+					int			j;
+
+					TqBlockAccumInit(&acc);
+					TqScoreBlockRange(so->lut8, plane, 0, dc, &acc);
+					TqBlockAccumFinish(&acc);
+
+					for (j = 0; j < srec->nvecs; j++)
+					{
+						double		mse;
+						float		est;
+						TqBlockSide *sd;
+
+						if (srec->deletedMask & (1u << j))
+							continue;
+
+						sd = &srec->side[j];
+						mse = (double) so->lutScale * acc.acc32[j] + (double) dc * so->lutBias;
+						est = (float) ((double) sd->scale * mse);
+
+						if (n >= capacity)
+						{
+							capacity *= 2;
+							results = repalloc(results, sizeof(TqScanResult) * capacity);
+						}
+						results[n].dist = TqEstToDistSide(so, sd->norm, est);
+						results[n].tid = sd->heaptid;
+						n++;
+					}
+				}
+				b++;
+			}
+
+			nextblk = TqPageGetOpaque(spage)->nextblkno;
+			UnlockReleaseBuffer(sbuf);
+			sblk = nextblk;
+		}
+		Assert(b == blockCount);
+	}
+
+	/*
+	 * Tail scan: rows inserted post-build live in the row-major tail chain
+	 * (Invalid until the first insert).  Score them with the scalar kernel over
+	 * the float LUT, exactly as the pre-block layout did.
+	 */
+	if (BlockNumberIsValid(tailStart))
+	{
+		BlockNumber tblk = tailStart;
+
+		while (BlockNumberIsValid(tblk))
+		{
+			Buffer		tbuf = ReadBuffer(index, tblk);
+			Page		tpage;
+			OffsetNumber toff,
+						tmax;
+			BlockNumber nextblk;
+
+			LockBuffer(tbuf, BUFFER_LOCK_SHARE);
+			tpage = BufferGetPage(tbuf);
+			tmax = PageGetMaxOffsetNumber(tpage);
+
+			for (toff = FirstOffsetNumber; toff <= tmax; toff = OffsetNumberNext(toff))
+			{
+				TqEntry    *entry = (TqEntry *) PageGetItem(tpage, PageGetItemId(tpage, toff));
+				float		est;
+
+				if (entry->deleted)
+					continue;
+
+				est = TqScoreEntry(model, so->lut, so->qjlQuery, entry, entry->data);
+
+				if (n >= capacity)
+				{
+					capacity *= 2;
+					results = repalloc(results, sizeof(TqScanResult) * capacity);
+				}
+				results[n].dist = TqEstToDist(so, entry, est);
+				results[n].tid = entry->heaptid;
+				n++;
+			}
+
+			nextblk = TqPageGetOpaque(tpage)->nextblkno;
+			UnlockReleaseBuffer(tbuf);
+			tblk = nextblk;
+		}
 	}
 
 	/*

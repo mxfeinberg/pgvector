@@ -1,0 +1,2 @@
+metric,method,build_s,idx_size,recall,qps,avg_ms
+l2,"tqflat (bits=4,rerank=200) [8bit] [dense,noqjl]",106.37512716600001,46.7 MB,1.0,57.83743650230489,17.289839599999368

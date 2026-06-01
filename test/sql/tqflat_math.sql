@@ -145,3 +145,24 @@ SELECT tqflat_test_rht_norm(1536) < 1e-5 AS rht_norm_preserved_1536;
 -- Lemma 1 for RHT: coordinates of RHT(unit vectors) have mean~0, var~1/d' (d'=256).
 SELECT abs((tqflat_test_rht_coord_stats(200))[1]) < 0.01 AS rht_mean_zero;
 SELECT abs((tqflat_test_rht_coord_stats(200))[2] - (1.0/256)) / (1.0/256) < 0.10 AS rht_var_inv_dprime;
+
+-- ============================================================
+-- Blocked fast-scan kernel (tqfastscan.c).
+-- ============================================================
+-- Transpose roundtrip: scatter N vectors' codes into a block code-plane and read
+-- each lane's codes back; returns mismatches (0 = identity), incl. slot>=16 and
+-- nvecs<32 tail. Args: dim int, nvecs int.
+SELECT tqflat_test_transpose_roundtrip(256, 32) AS transpose_full_0;
+SELECT tqflat_test_transpose_roundtrip(256, 19) AS transpose_partial_0;
+SELECT tqflat_test_transpose_roundtrip(2048, 32) AS transpose_highdim_0;
+-- 8-bit LUT recovery: |recovered_mse - float_mse| / |float_mse| averaged over a
+-- block of deterministic vectors; should be within the quantization bound.
+SELECT tqflat_test_lut8_recovery(256) < 0.25 AS lut8_recovery_ok;
+SELECT tqflat_test_lut8_recovery(2048) < 0.25 AS lut8_recovery_highdim_ok;
+-- Overflow flush: dc>257 must not overflow the uint16 stage. Assert exactness of
+-- the scalar lane sum vs a uint64 reference. Returns 0 on match.
+SELECT tqflat_test_score_block(2048) AS score_block_exact_0;
+
+-- SIMD block kernel is bit-identical to the scalar Default (NEON on arm64).
+SELECT tqflat_test_score_block_consistency(256) AS simd_matches_default_256;
+SELECT tqflat_test_score_block_consistency(2048) AS simd_matches_default_2048;

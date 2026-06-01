@@ -34,6 +34,8 @@ SET tqflat.rerank = 100;
 SELECT id FROM tqvac ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector LIMIT 3;
 
 -- nVectors before delete: 10 physical entries.
+-- meta = {dim,bits,metric,tqProd,nVectors,fastRotation,dimPadded,blockWidth,blockCount}
+-- = {8,4,0,0,10,1,8,32,1} (blockCount = ceil(10/32) = 1).
 SELECT tqflat_test_meta('tqvac_idx'::regclass);
 
 -- Delete ids 1, 2, and 6 (the ones nearest to [10,0,...] and [-10,0,...]).
@@ -58,6 +60,7 @@ SELECT count(*) AS deleted_id_2_count
 	WHERE id = 2;
 
 -- nVectors after vacuum: still 10 (physical count unchanged; tombstones remain).
+-- {8,4,0,0,10,1,8,32,1}
 SELECT tqflat_test_meta('tqvac_idx'::regclass);
 
 -- Remaining rows still return correct results:
@@ -75,6 +78,7 @@ VACUUM FULL tqvac;
 SELECT id FROM tqvac ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector LIMIT 3;
 
 -- nVectors after VACUUM FULL: 7 (rebuilt from 7 live rows).
+-- {8,4,0,0,7,1,8,32,1} (blockCount = ceil(7/32) = 1).
 SELECT tqflat_test_meta('tqvac_idx'::regclass);
 
 -- Delete all remaining rows, vacuum, empty index must return no results.

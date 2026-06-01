@@ -16,7 +16,7 @@
 #define TQ_MAX_DIM 16000
 #define TQ_MIN_BITS 2
 #define TQ_MAX_BITS 4
-#define TQ_DEFAULT_BITS 2
+#define TQ_DEFAULT_BITS 4
 #define TQ_DEFAULT_TQPROD false			/* QJL stage off by default (mse estimator
 										 * wins on recall + IP accuracy on real data) */
 #define TQ_DEFAULT_FAST_ROTATION true	/* structured RHT rotation by default */
@@ -28,7 +28,7 @@
 /* Page layout */
 #define TQ_METAPAGE_BLKNO 0
 #define TQ_MAGIC_NUMBER 0x71665451	/* magic for tqflat meta page */
-#define TQ_VERSION 3
+#define TQ_VERSION 4
 #define TQ_PAGE_ID 0xFF92			/* for identification of tqflat indexes */
 
 /*
@@ -66,6 +66,7 @@ typedef enum
 
 /* GUC */
 extern int	tqflat_rerank;
+extern bool tqflat_force_scalar;
 
 /* reloptions */
 typedef struct TqOptions
@@ -93,11 +94,18 @@ typedef struct TqMetaPageData
 	uint16		fastRotation;	/* bool: structured RHT rotation/QJL */
 	uint16		dimPadded;		/* next_pow2(dim); working dim in fast mode */
 	uint32		nLevels;		/* 1 << bits */
-	uint32		nVectors;		/* live + tombstoned entries written */
+	uint32		nVectors;		/* live + tombstoned entries written; this uint32
+								 * caps a tqflat index at 2^32-1 (~4.29 billion)
+								 * vectors */
 	BlockNumber rotationStart;	/* first page of rotation matrix (Invalid in fast mode) */
 	BlockNumber codebookStart;	/* first page of codebook */
 	BlockNumber qjlStart;		/* first page of QJL matrix (Invalid if !tqProd or fast mode) */
 	BlockNumber dataStart;		/* first data page */
+	BlockNumber codeStart;		/* first page of the code-plane chain */
+	BlockNumber sideStart;		/* first page of the side-data chain */
+	BlockNumber tailStart;		/* first page of the row-major insert tail (Invalid until first insert) */
+	uint16		blockWidth;		/* TQ_BLOCK_WIDTH at build time */
+	uint32		blockCount;		/* number of full+partial blocks written */
 	float		qjlScale;		/* QJL estimator constant (0 if !tqProd) */
 }			TqMetaPageData;
 
@@ -202,6 +210,38 @@ TqUnpackCode(const char *codes, int codesBytes, int idx, int bits)
 	return (uint8) ((cur >> off) & ((1 << bits) - 1));
 }
 
+/* Blocked fast-scan layout (TQ_VERSION 4). */
+#define TQ_BLOCK_WIDTH 32		/* vectors per block (fixed SIMD width) */
+#define TQ_LUT_FLUSH 128		/* coords between uint16->uint32 accumulator flushes */
+
+/* Per-lane side data, parallel to a block's code-plane (never read by the kernel). */
+typedef struct TqBlockSide
+{
+	ItemPointerData heaptid;
+	float		norm;			/* stripped L2 length */
+	float		scale;			/* renormalization correction */
+}			TqBlockSide;
+
+/* One side-chain record per block: tombstone mask + live count + 32 side records. */
+typedef struct TqBlockSideRec
+{
+	uint32		deletedMask;	/* bit j set => lane j tombstoned */
+	uint16		nvecs;			/* live+tombstoned lanes populated (1..32) */
+	uint16		pad;
+	TqBlockSide side[TQ_BLOCK_WIDTH];
+}			TqBlockSideRec;
+
+/* Code-plane byte size for one block at dimCodes dc (4-bit nibble layout). */
+#define TQ_BLOCK_CODE_BYTES(dc) ((Size) (dc) * 16)
+
+/* Kernel accumulator: 32 lanes, with a uint16 stage flushed to uint32. */
+typedef struct TqBlockAccum
+{
+	uint16		acc16[TQ_BLOCK_WIDTH];
+	uint32		acc32[TQ_BLOCK_WIDTH];
+	int			sinceFlush;		/* coords accumulated since last flush */
+}			TqBlockAccum;
+
 /* Type-info vtable returned by tqflat_support (one per opclass) */
 typedef struct TqTypeInfo
 {
@@ -225,8 +265,39 @@ extern void TqEncode(const TqModel *model, const float *vec, TqEntry *entry);
 extern void TqBuildQueryLut(const TqModel *model, const float *query,
 							float *lut /* dim*nLevels */, float *qjlQuery /* dim or NULL */);
 
+/* ---- tqfastscan.c ---- */
+/* Reset an accumulator to zero before scoring a block. */
+extern void TqBlockAccumInit(TqBlockAccum *acc);
+/* Fold coords [c0,c1) of one block's code-plane into acc (function pointer;
+ * Default/Neon/Avx512 set by TqInitDispatch). codeRun points at the byte for
+ * coord c0 (i.e. codePlane + c0*16). lut8 is the full dc*nLevels 8-bit LUT. */
+extern void (*TqScoreBlockRange) (const uint8 *lut8, const uint8 *codeRun,
+								  int c0, int c1, TqBlockAccum *acc);
+/* Finalize: flush the uint16 stage into acc32 (call after the last range). */
+extern void TqBlockAccumFinish(TqBlockAccum *acc);
+/* Build the 8-bit per-query LUT + affine recovery constants from the float LUT. */
+extern void TqBuildLut8(const TqModel *model, const float *lut,
+						uint8 *lut8, float *lutBias, float *lutScale);
+/* Scatter one vector's row-major packed codes into a block code-plane at `slot`. */
+extern void TqScatterCodes(const TqModel *model, const char *codes,
+						   int slot, uint8 *codePlane);
+/* Scalar reference range kernel (also the Default pointer target). */
+extern void TqScoreBlockRangeDefault(const uint8 *lut8, const uint8 *codeRun,
+									 int c0, int c1, TqBlockAccum *acc);
+/* NEON range kernel (arm64 only; selected by TqInitDispatch when available). */
+extern void TqScoreBlockRangeNeon(const uint8 *lut8, const uint8 *codeRun,
+								  int c0, int c1, TqBlockAccum *acc);
+/* AVX-512F+BW range kernel (x86-64 only; selected by TqInitDispatch when detected). */
+#if defined(__x86_64__)
+extern bool TqSupportsAvx512(void);
+extern void TqScoreBlockRangeAvx512(const uint8 *lut8, const uint8 *codeRun,
+									int c0, int c1, TqBlockAccum *acc);
+#endif
+
 /* ---- tqdistance.c ---- */
 extern void TqInitDispatch(void);
+/* Name of the dispatched block-scorer kernel ("default"/"neon"/"avx512"). */
+extern const char *TqActiveKernelName(void);
 
 /*
  * Scoring kernel selected at load time (TqInitDispatch).  Returns an estimate
@@ -251,6 +322,7 @@ extern bool tqinsert(Relation index, Datum *values, bool *isnull,
 					  IndexUniqueCheck checkUnique,
 					  bool indexUnchanged, struct IndexInfo *indexInfo);
 extern TqModel *TqGetCachedModel(Relation index);
+extern void TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes);
 
 /* ---- tqscan.c ---- */
 extern IndexScanDesc tqbeginscan(Relation index, int nkeys, int norderbys);

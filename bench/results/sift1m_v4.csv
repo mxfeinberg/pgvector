@@ -1,0 +1,4 @@
+metric,method,build_s,idx_size,recall,qps,avg_ms
+l2,exact (seqscan),0.0,—,0.999,8.132856954967464,122.95802146000004
+l2,"tqflat (bits=4,rerank=200) [8bit] [fast,noqjl]",4.988984333999994,77.8 MB,0.9995,7.309461636678916,136.80898125
+l2,"tqflat (bits=4,rerank=2000) [8bit] [fast,noqjl]",4.988984333999994,77.8 MB,0.9995,7.094318921285047,140.9578581249999

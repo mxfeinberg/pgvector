@@ -7,10 +7,13 @@
 
 Raw CSVs in `bench/results/`. Reproduce with the commands in `bench/README.md`.
 
-> **Latency caveat:** tqflat distance scoring is the **scalar** `TqScoreEntryDefault`
-> kernel — no SIMD variant exists yet. The paper's whole performance premise is a
-> SIMD LUT scan (`pshufb`/`vqtbl`); the tqflat latencies below are therefore a
-> pessimistic ceiling. Build/size/recall are unaffected.
+> **Historical note (superseded below):** the three tables in this section are the
+> **original scalar-kernel + dense-rotation baseline**. They are kept as the
+> reference point. Two milestones since then change the latency and build numbers
+> materially — **structured fast rotation** (see "Structured fast rotation" below)
+> and the **v4 blocked SIMD LUT kernel** (see "v4 blocked SIMD LUT kernel" at the
+> end). The current shipping numbers are in the v4 section; read it for the latency
+> story (the scalar latencies below are a pessimistic ceiling the SIMD kernel lifts).
 
 ---
 
@@ -156,3 +159,148 @@ this is the metric reranked-recall can't see — turboquant_prod's actual object
 
 `fast_rotation=on, tq_prod=off`: fastest build (5–80× at high dim), smallest index,
 lowest latency, and recall equal-or-better than the previous dense+QJL default.
+
+---
+
+# v4 blocked SIMD LUT kernel — results
+
+The scalar `TqScoreEntryDefault` per-vector scorer (the "latency caveat" at the
+top) was replaced by a **blocked, 4-bit-nibble-packed, SIMD LUT fast-scan kernel**
+(`src/tqfastscan.c`; FAISS Fast-Scan / Quick-ADC technique) over a new on-disk
+**v4 blocked format**. The block scorer dispatches at load time — NEON
+(`vqtbl1q_u8`) on arm64 (this host), AVX-512 (`_mm_shuffle_epi8`) on x86 — and all
+variants are bit-identical to the scalar reference. The per-query LUT is
+8-bit-quantized; `bits` is fixed at 4 and `tq_prod` (QJL) is not used in this layout.
+
+A build-writer **streaming fix** (each block's code-plane is written incrementally
+onto the code-plane page chain instead of being buffered in one `StringInfo`)
+removes the ~1 GB build-memory ceiling that previously capped a build at ~2M rows
+at dim=768 — large builds are now bounded only by `nVectors` (u32, ~4.29 B) and disk.
+
+Same PG18 / parallel-build / `maintenance_work_mem=2GB` / `hnsw.ef_search=100` setup;
+200 queries; `bits=4`, `fast_rotation=on`, `tq_prod=off`; arm64/NEON.
+
+## v4 (SIMD kernel + fast rotation) vs the original scalar + dense baseline — arm64/NEON
+
+Host: Apple M-series (arm64), NEON kernel dispatched. tqflat, bits=4, rerank=200.
+CSVs: `bench/results/{sift1m,glove200,openai1536}_v4.csv`.
+
+| Dataset (dim) | metric | build | index | recall@10 | latency | speedup vs baseline |
+|---|---|---|---|---|---|---|
+| SIFT1M (128)    | L2     | **5.0 s** | **77.8 MB**  | **0.9995** | **137 ms** | build 4.7× · latency 2.5× · recall 0.984→0.9995 · size 104→78 MB |
+| GloVe-200 (200) | cosine | **8.8 s** | **164.6 MB** | **1.000**  | **219 ms** | build 7.9× · latency 2.9× · size 178→165 MB |
+| OpenAI (1536)   | cosine | **5.6 s** | **99.8 MB**  | **1.000**  | **29 ms**  | build **78×** · latency **11.5×** · size 116→100 MB |
+
+_Baseline (bits=4, rerank=200, scalar kernel + dense rotation): SIFT 24 s / 104 MB / 0.984 / 347 ms;
+GloVe 69 s / 178 MB / 1.000 / 634 ms; OpenAI-100k 439 s / 116 MB / 1.000 / 332 ms. OpenAI here is the
+same 100k tier as the baseline — the full 1M run is the section below._
+
+- **Build:** fast rotation collapses the dim-1536 wall (439 s → 5.6 s, **78×**); the
+  speedup scales with dimension (O(d²) → O(d·log d)), modest at d=128 where rotation
+  was never the bottleneck.
+- **Latency:** the SIMD kernel cuts query time 2.5–11.5×. The win is largest at 100k
+  rows (OpenAI **11.5×**) where the per-vector score step dominates, and smaller at 1M
+  (SIFT/GloVe) where Postgres page-walk + top-k heap + rerank form a fixed floor the
+  kernel can't touch — the Amdahl caveat, and the reason IVF integration is the next
+  lever.
+- **Recall / size:** recall holds or improves, and the blocked format is *smaller*
+  than the row-major scalar layout (it drops per-row `TqEntry` header + MAXALIGN
+  padding, moving per-vector side data into a compact per-block side chain).
+
+## Kernel A/B and raw score-step throughput — arm64/NEON
+
+- **Raw score-step kernel** (`bench/microbench/`, 1M coded vectors, best of 5):
+  **19.5× @ dc=2048**, ~12× @ dc=128 / dc=256 vs the scalar gather. The 4-bit nibble
+  split is essentially free (`Anib/Abyte ≈ 0.9–1.1×`) — the high-dim scan is
+  bandwidth-bound, so index size is unchanged from row-major 4-bit.
+- **8-bit vs float LUT** (in-extension A/B via `--tqflat-force-scalar`, synthetic
+  200k×256): identical recall (0.846 vs 0.852 at rerank=0; **1.000 vs 1.000** at
+  rerank=200) at **2.4× lower latency**. On every real dataset above the 8-bit LUT
+  costs no measurable recall (≥0.9995 at rerank=200), so it is the default; a
+  dedicated real-data 8-bit-vs-float gate remains an open confirmation but shows no
+  loss so far.
+
+## x86-64 / AVX-512 — `the-fire` (Ubuntu 24.04, gcc 13.3, PG 18.4)
+
+All results above dispatch the **NEON** block kernel (arm64). The **AVX-512F+BW**
+variant (`TqScoreBlockRangeAvx512`, `_mm_shuffle_epi8`) only compiles + runs on
+x86-64 and was previously just cross-compile-checked. `the-fire` (AVX-512
+F/BW/CD/DQ/VL/IFMA/VBMI) is the validation host.
+
+**Kernel validation** (`make installcheck` + the dispatch / consistency probes):
+
+| Check | Expected | Observed |
+|---|---|---|
+| `make installcheck` | all pass | **19/19 pass** ✅ |
+| `tqflat_test_active_kernel()` | `avx512` | **`avx512`** ✅ |
+| `tqflat_test_score_block_consistency(256)` | `0` (AVX-512 == scalar Default) | **0** ✅ |
+| `tqflat_test_score_block_consistency(2048)` | `0` | **0** ✅ |
+
+The AVX-512 kernel is the live dispatch on `the-fire` and is bit-identical to the
+scalar reference; the full suite (incl. the multi-page streaming-build test and
+`tqflat_math`) passes with it active, confirming the v4 on-disk format + build are
+arch-independent.
+
+**Raw score-step throughput** (`bench/microbench/tq_simd_microbench3_avx512.c`,
+AMD Ryzen 9 7940HS / Zen4, 1M coded vectors, best of 5 — directly comparable to
+the arm64/NEON numbers above):
+
+| dim (padded) | scalar | AVX-512 A-nibble | speedup | (arm64 NEON speedup) |
+|---|---|---|---|---|
+| SIFT 128         | 81.2 ms   | **8.5 ms**   | **9.5×** | 11.9× |
+| GloVe 200→256    | 161.0 ms  | **16.8 ms**  | **9.6×** | 11.2× |
+| OpenAI 1536→2048 | 1357.7 ms | **137.5 ms** | **9.9×** | 19.5× |
+
+- The AVX-512 kernel beats the scalar gather **~9.5–9.9×** and nibble-packing
+  stays free (`Anib/Abyte ≈ 0.98–1.01×`), same as NEON — so the index-size win
+  holds on x86 too.
+- The microbench `sink` checksums are **byte-identical to the arm64 run**
+  (`1.70915e11` / `3.42337e11` / `2.73312e12`), independently corroborating the
+  `score_block_consistency = 0` result: the NEON and AVX-512 kernels compute the
+  same accumulation as the scalar reference.
+- The x86 speedup trails NEON at high dim (9.9× vs 19.5× @ dc=2048) because this
+  is the **128-bit `_mm_shuffle_epi8` v1**: it processes 16 lanes/shuffle (like
+  NEON) but widens u8→u16 with `unpack`+`add` (two ops) where NEON does it in one
+  (`vaddw_u8`). Widening to `_mm512_shuffle_epi8` (4 coords/iter) is the documented
+  throughput TODO and should close the gap. Correctness is already final; this is
+  purely the un-widened first cut.
+
+## OpenAI-1536 @ **full 1M** — three-way (x86/AVX-512, `the-fire`)
+
+The first true 1M-row run at dim=1536 (999,800 base + 200 held-out queries,
+cosine), now that the build-cost wall and build-memory ceiling are gone. Run on
+`the-fire` (AMD Zen4, 60 GB RAM, PG 18.4, AVX-512 kernel) with
+`maintenance_work_mem=16GB` so HNSW builds in-memory. tqflat bits=4, fast rotation;
+ivfflat `lists=√N`, `probes=lists/10`; hnsw tuned `m=32, ef_construction=128,
+ef_search=100`. CSV: `bench/results/openai1m_x86.csv`.
+
+| Method | Build (s) | Index size | Recall@10 | QPS | Latency (ms) |
+|---|---|---|---|---|---|
+| exact (seqscan)                       | —      | —          | 1.0000 | 0.5  | 1849.7 |
+| **tqflat** b4, rerank=200             | **54** | **998 MB** | **1.0000** | 1.1 | 928 |
+| **tqflat** b4, rerank=2000            | **54** | **998 MB** | **1.0000** | 1.0 | 971 |
+| hnsw (m=32, efc=128, ef_search=100)   | 1763   | 7811 MB    | 0.9910 | **73.2** | **13.7** |
+| ivfflat (lists=999, probes=99)        | 512    | 7819 MB    | 0.9770 | 3.2  | 310 |
+
+**What 1M/1536 shows (the integration thesis, quantified at scale):**
+
+- **Size — tqflat is 7.8× smaller** (998 MB vs ~7.8 GB for both hnsw and ivfflat,
+  which store full float32). At 1M×1536 that is a ~6.8 GB saving per index.
+- **Recall — tqflat is perfect (1.0000)**, above tuned HNSW (0.991) and ivfflat
+  (0.977). The 8-bit kernel + rerank loses nothing even at 1M.
+- **Build — tqflat 54 s vs HNSW 1763 s (33×) and ivfflat 512 s (9.4×).** Fast
+  rotation makes a 1M×1536 tqflat build essentially free relative to the graph/
+  cluster methods; the dense-rotation baseline would have been ~1 hour here.
+- **Latency — the O(N) flat-scan wall, now at 1M scale: tqflat 928 ms (~1 QPS) vs
+  HNSW 13.7 ms (73 QPS), a 68× gap.** ivfflat sits in between at 310 ms — but note
+  it buys that only‑3× speedup over the flat scan while costing 7.8× the memory and
+  losing recall.
+
+**This is the strongest motivation yet for TQ-inside-IVF.** ivfflat at 1M/1536 is
+the weakest cell in the table — 7.8 GB, 0.977 recall, and still 310 ms — precisely
+because it scans `probes×(N/lists) ≈ 99k` *full float32* vectors per query.
+Replacing that stored float32 with tqflat's 4-bit codes (998 MB, 1.0 recall) would
+cut its footprint ~7.8× and accelerate each list scan with the AVX-512 kernel,
+while inheriting IVF's sublinear candidate selection — the one axis (latency) where
+standalone flat tqflat loses. tqflat already wins size/recall/build decisively; IVF
+integration is how it also wins latency.

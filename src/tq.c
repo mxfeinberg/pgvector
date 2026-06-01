@@ -9,6 +9,7 @@
 #include "commands/vacuum.h"
 #include "tq.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/selfuncs.h"
@@ -19,6 +20,7 @@
 #endif
 
 int			tqflat_rerank;
+bool		tqflat_force_scalar = false;
 static relopt_kind tq_relopt_kind;
 
 /*
@@ -29,7 +31,7 @@ TqInit(void)
 {
 	tq_relopt_kind = add_reloption_kind();
 	add_int_reloption(tq_relopt_kind, "bits", "Bits per coordinate",
-					  TQ_DEFAULT_BITS, TQ_MIN_BITS, TQ_MAX_BITS, AccessExclusiveLock);
+					  4, 4, 4, AccessExclusiveLock);
 	add_bool_reloption(tq_relopt_kind, "tq_prod", "Enable 1-bit QJL residual stage",
 					   TQ_DEFAULT_TQPROD, AccessExclusiveLock);
 	add_bool_reloption(tq_relopt_kind, "fast_rotation",
@@ -39,6 +41,11 @@ TqInit(void)
 	DefineCustomIntVariable("tqflat.rerank", "Number of candidates to rerank with full precision",
 							"0 disables rerank.", &tqflat_rerank,
 							TQ_DEFAULT_RERANK, 0, TQ_MAX_RERANK, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("tqflat.force_scalar",
+							 "Score blocked tqflat indexes with the float LUT instead of the 8-bit SIMD kernel (A/B diagnostic).",
+							 NULL, &tqflat_force_scalar, false, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("tqflat");
 
@@ -1132,4 +1139,325 @@ tqflat_test_rht_coord_stats(PG_FUNCTION_ARGS)
 	result = construct_array(elems, 3, FLOAT8OID,
 							 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+/*
+ * Build a transient fast-mode model for kernel unit tests (bits=4, no QJL).
+ * Caller pfrees boundaries/centroids.
+ */
+static void
+tq_test_init_model(TqModel *m, int dim)
+{
+	m->dim = dim;
+	m->bits = 4;
+	m->nLevels = 16;
+	m->metric = TQ_METRIC_L2;
+	m->tqProd = false;
+	m->fastRotation = true;
+	m->dimPadded = TqNextPow2(dim);
+	m->dimCodes = m->dimPadded;
+	m->rotSeed = TQ_ROTATION_SEED;
+	m->qjlSeed = TQ_QJL_SEED;
+	m->rotation = NULL;
+	m->qjl = NULL;
+	m->qjlScale = 0.0f;
+	m->boundaries = palloc(sizeof(float) * (m->nLevels - 1));
+	m->centroids = palloc(sizeof(float) * m->nLevels);
+	TqBuildCodebook(m->dimCodes, m->bits, m->boundaries, m->centroids);
+}
+
+/*
+ * tqflat_test_transpose_roundtrip(dim int, nvecs int) RETURNS int
+ * Encode nvecs deterministic vectors, scatter their codes into a block plane,
+ * unpack each lane back, count mismatches vs the original packed codes.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_transpose_roundtrip);
+Datum
+tqflat_test_transpose_roundtrip(PG_FUNCTION_ARGS)
+{
+	int			dim = PG_GETARG_INT32(0);
+	int			nvecs = PG_GETARG_INT32(1);
+	TqModel		m;
+	int			dc;
+	int			codesBytes;
+	uint8	   *plane;
+	int			mismatches = 0;
+	int			v,
+				i;
+	TqEntry    *entry;
+	Size		entrySize;
+	char	  **saved;
+	float	   *vec;
+
+	if (nvecs < 1 || nvecs > TQ_BLOCK_WIDTH)
+		ereport(ERROR, (errmsg("nvecs must be 1..%d", TQ_BLOCK_WIDTH)));
+
+	tq_test_init_model(&m, dim);
+	dc = m.dimCodes;
+	codesBytes = TQ_CODES_BYTES(dc, m.bits);
+	entrySize = TqEntrySize(dc, m.bits, false);
+	plane = palloc0(TQ_BLOCK_CODE_BYTES(dc));
+
+	saved = palloc(sizeof(char *) * nvecs);
+	vec = palloc(sizeof(float) * dim);
+
+	for (v = 0; v < nvecs; v++)
+	{
+		entry = palloc0(entrySize);
+		for (i = 0; i < dim; i++)
+			vec[i] = (float) sin(i * 0.17 + v * 1.1);
+		TqEncode(&m, vec, entry);
+		saved[v] = palloc(codesBytes);
+		memcpy(saved[v], entry->data, codesBytes);
+		TqScatterCodes(&m, entry->data, v, plane);
+	}
+
+	for (v = 0; v < nvecs; v++)
+	{
+		int			lane = v & 15;
+		bool		high = v >= 16;
+
+		for (i = 0; i < dc; i++)
+		{
+			uint8		cell = plane[(Size) i * 16 + lane];
+			uint8		got = high ? (uint8) (cell >> 4) : (uint8) (cell & 0x0F);
+			uint8		want = TqUnpackCode(saved[v], codesBytes, i, m.bits);
+
+			if (got != want)
+				mismatches++;
+		}
+	}
+
+	PG_RETURN_INT32(mismatches);
+}
+
+/*
+ * tqflat_test_lut8_recovery(dim int) RETURNS float8
+ * Average relative error between the 8-bit-recovered mse and the float-LUT mse
+ * over a block of deterministic vectors and a deterministic query.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_lut8_recovery);
+Datum
+tqflat_test_lut8_recovery(PG_FUNCTION_ARGS)
+{
+	int			dim = PG_GETARG_INT32(0);
+	TqModel		m;
+	int			dc;
+	float	   *query;
+	float	   *lut;
+	uint8	   *lut8;
+	float		lutBias,
+				lutScale;
+	uint8	   *plane;
+	TqEntry    *entry;
+	Size		entrySize;
+	int			i,
+				v;
+	double		sumRel = 0.0;
+	int			nv = TQ_BLOCK_WIDTH;
+	TqBlockAccum acc;
+	float	   *vec;
+
+	tq_test_init_model(&m, dim);
+	dc = m.dimCodes;
+	entrySize = TqEntrySize(dc, m.bits, false);
+
+	query = palloc(sizeof(float) * dim);
+	for (i = 0; i < dim; i++)
+		query[i] = (float) cos(i * 0.23);
+	lut = palloc(sizeof(float) * dc * m.nLevels);
+	TqBuildQueryLut(&m, query, lut, NULL);
+	lut8 = palloc(dc * m.nLevels);
+	TqBuildLut8(&m, lut, lut8, &lutBias, &lutScale);
+
+	plane = palloc0(TQ_BLOCK_CODE_BYTES(dc));
+	vec = palloc(sizeof(float) * dim);
+	for (v = 0; v < nv; v++)
+	{
+		entry = palloc0(entrySize);
+		for (i = 0; i < dim; i++)
+			vec[i] = (float) sin(i * 0.13 + v * 0.7);
+		TqEncode(&m, vec, entry);
+		TqScatterCodes(&m, entry->data, v, plane);
+	}
+
+	TqBlockAccumInit(&acc);
+	TqScoreBlockRange(lut8, plane, 0, dc, &acc);
+	TqBlockAccumFinish(&acc);
+
+	for (v = 0; v < nv; v++)
+	{
+		int			lane = v & 15;
+		bool		high = v >= 16;
+		double		fmse = 0.0;
+		double		recovered;
+		double		denom;
+
+		for (i = 0; i < dc; i++)
+		{
+			uint8		cell = plane[(Size) i * 16 + lane];
+			uint8		code = high ? (uint8) (cell >> 4) : (uint8) (cell & 0x0F);
+
+			fmse += (double) lut[(Size) i * m.nLevels + code];
+		}
+		recovered = (double) lutScale * acc.acc32[v] + (double) dc * lutBias;
+		denom = fabs(fmse) < 1e-9 ? 1e-9 : fabs(fmse);
+		sumRel += fabs(recovered - fmse) / denom;
+	}
+
+	PG_RETURN_FLOAT8(sumRel / nv);
+}
+
+/*
+ * tqflat_test_score_block_consistency(dim int) RETURNS int
+ * Scores a 32-vector block with the scalar Default kernel and the dispatched
+ * kernel (NEON/AVX-512 when present); returns the number of lanes whose uint32
+ * sums differ.  0 == the SIMD variant is bit-identical to Default.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_score_block_consistency);
+Datum
+tqflat_test_score_block_consistency(PG_FUNCTION_ARGS)
+{
+	int			dim = PG_GETARG_INT32(0);
+	TqModel		m;
+	int			dc;
+	float	   *query;
+	float	   *lut;
+	uint8	   *lut8;
+	float		lutBias,
+				lutScale;
+	uint8	   *plane;
+	Size		entrySize;
+	int			i,
+				v,
+				mismatches = 0;
+	TqBlockAccum a1,
+				a2;
+	float	   *vec;
+
+	tq_test_init_model(&m, dim);
+	dc = m.dimCodes;
+	entrySize = TqEntrySize(dc, m.bits, false);
+
+	query = palloc(sizeof(float) * dim);
+	for (i = 0; i < dim; i++)
+		query[i] = (float) cos(i * 0.19 + 0.5);
+	lut = palloc(sizeof(float) * dc * m.nLevels);
+	TqBuildQueryLut(&m, query, lut, NULL);
+	lut8 = palloc(dc * m.nLevels);
+	TqBuildLut8(&m, lut, lut8, &lutBias, &lutScale);
+
+	plane = palloc0(TQ_BLOCK_CODE_BYTES(dc));
+	vec = palloc(sizeof(float) * dim);
+	for (v = 0; v < TQ_BLOCK_WIDTH; v++)
+	{
+		TqEntry    *entry = palloc0(entrySize);
+
+		for (i = 0; i < dim; i++)
+			vec[i] = (float) sin(i * 0.07 + v * 0.5);
+		TqEncode(&m, vec, entry);
+		TqScatterCodes(&m, entry->data, v, plane);
+	}
+
+	TqBlockAccumInit(&a1);
+	TqScoreBlockRangeDefault(lut8, plane, 0, dc, &a1);
+	TqBlockAccumFinish(&a1);
+
+	TqBlockAccumInit(&a2);
+	TqScoreBlockRange(lut8, plane, 0, dc, &a2);
+	TqBlockAccumFinish(&a2);
+
+	for (v = 0; v < TQ_BLOCK_WIDTH; v++)
+		if (a1.acc32[v] != a2.acc32[v])
+			mismatches++;
+
+	PG_RETURN_INT32(mismatches);
+}
+
+/*
+ * tqflat_test_score_block(dim int) RETURNS int
+ * Assert the kernel's uint32 lane sums equal a uint64 reference over the 8-bit
+ * LUT (exactness of accumulation incl. the >128-coord flush). Returns mismatches.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_score_block);
+Datum
+tqflat_test_score_block(PG_FUNCTION_ARGS)
+{
+	int			dim = PG_GETARG_INT32(0);
+	TqModel		m;
+	int			dc;
+	float	   *query;
+	float	   *lut;
+	uint8	   *lut8;
+	float		lutBias,
+				lutScale;
+	uint8	   *plane;
+	TqEntry    *entry;
+	Size		entrySize;
+	int			i,
+				v;
+	int			mismatches = 0;
+	TqBlockAccum acc;
+	float	   *vec;
+
+	tq_test_init_model(&m, dim);
+	dc = m.dimCodes;
+	entrySize = TqEntrySize(dc, m.bits, false);
+
+	query = palloc(sizeof(float) * dim);
+	for (i = 0; i < dim; i++)
+		query[i] = (float) cos(i * 0.31 + 0.2);
+	lut = palloc(sizeof(float) * dc * m.nLevels);
+	TqBuildQueryLut(&m, query, lut, NULL);
+	lut8 = palloc(dc * m.nLevels);
+	TqBuildLut8(&m, lut, lut8, &lutBias, &lutScale);
+
+	plane = palloc0(TQ_BLOCK_CODE_BYTES(dc));
+	vec = palloc(sizeof(float) * dim);
+	for (v = 0; v < TQ_BLOCK_WIDTH; v++)
+	{
+		entry = palloc0(entrySize);
+		for (i = 0; i < dim; i++)
+			vec[i] = (float) sin(i * 0.11 + v * 0.9);
+		TqEncode(&m, vec, entry);
+		TqScatterCodes(&m, entry->data, v, plane);
+	}
+
+	TqBlockAccumInit(&acc);
+	TqScoreBlockRange(lut8, plane, 0, dc, &acc);
+	TqBlockAccumFinish(&acc);
+
+	for (v = 0; v < TQ_BLOCK_WIDTH; v++)
+	{
+		int			lane = v & 15;
+		bool		high = v >= 16;
+		uint64		ref = 0;
+
+		for (i = 0; i < dc; i++)
+		{
+			uint8		cell = plane[(Size) i * 16 + lane];
+			uint8		code = high ? (uint8) (cell >> 4) : (uint8) (cell & 0x0F);
+
+			ref += lut8[(Size) i * m.nLevels + code];
+		}
+		if ((uint64) acc.acc32[v] != ref)
+			mismatches++;
+	}
+
+	PG_RETURN_INT32(mismatches);
+}
+
+/*
+ * tqflat_test_active_kernel() RETURNS text
+ *
+ * Test-only wrapper: the block-scorer kernel TqInitDispatch selected at load
+ * ("default" / "neon" / "avx512").  Lets the amd64 validation positively confirm
+ * AVX-512 is the live kernel rather than inferring it from output consistency.
+ * Prototype; drop before upstream.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_active_kernel);
+Datum
+tqflat_test_active_kernel(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(TqActiveKernelName()));
 }

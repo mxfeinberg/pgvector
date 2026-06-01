@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "halfvec.h"
 #include "tq.h"
 
 /*
@@ -92,14 +93,43 @@ float		(*TqScoreEntry) (const TqModel *model, const float *lut,
 							 const char *codes);
 
 /*
- * TqInitDispatch -- set the scoring function pointer at load time.
+ * TqInitDispatch -- set the scoring function pointers at load time.
  *
- * SIMD variants are out of scope for now; we wire up only the scalar Default
- * variant.  The load-time indirection is kept so a future SIMD variant
- * (numerically consistent with Default) can be selected here.
+ * Dispatch order: Default (baseline) -> NEON (arm64) -> AVX-512F+BW (x86-64,
+ * runtime-detected).  All SIMD variants are bit-identical to Default by
+ * construction; TqScoreBlockRange is the only pointer currently upgraded.
  */
 void
 TqInitDispatch(void)
 {
 	TqScoreEntry = TqScoreEntryDefault;
+	TqScoreBlockRange = TqScoreBlockRangeDefault;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+	TqScoreBlockRange = TqScoreBlockRangeNeon;
+#endif
+#if defined(USE_DISPATCH) && defined(__x86_64__)
+	if (TqSupportsAvx512())
+		TqScoreBlockRange = TqScoreBlockRangeAvx512;
+#endif
+}
+
+/*
+ * TqActiveKernelName -- name of the block-scorer variant TqInitDispatch selected
+ * ("default", "neon", or "avx512").  Lets a caller positively confirm which
+ * kernel is live, rather than inferring it from output-consistency alone.
+ */
+const char *
+TqActiveKernelName(void)
+{
+	if (TqScoreBlockRange == TqScoreBlockRangeDefault)
+		return "default";
+#if defined(__aarch64__) || defined(__ARM_NEON)
+	if (TqScoreBlockRange == TqScoreBlockRangeNeon)
+		return "neon";
+#endif
+#if defined(USE_DISPATCH) && defined(__x86_64__)
+	if (TqScoreBlockRange == TqScoreBlockRangeAvx512)
+		return "avx512";
+#endif
+	return "unknown";
 }

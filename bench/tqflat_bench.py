@@ -151,20 +151,27 @@ def create_table(conn, dim):
     _execute(conn, f"CREATE TABLE {TABLE} (id int PRIMARY KEY, v vector({dim}))")
 
 
-def load_vectors(conn, vectors, batch=2000):
-    """Bulk-insert vectors as PostgreSQL vector literals."""
+def load_vectors(conn, vectors, batch=20000):
+    """Bulk-insert vectors as PostgreSQL vector literals via batched COPY.
+
+    The COPY payload is streamed in batches of `batch` rows rather than
+    materialized as one StringIO: at high dim and large N the full buffer is
+    enormous (e.g. 1M x 1536 is ~18 GB of text), which thrashes swap / fills
+    disk.  Batching bounds the in-memory buffer to ~one batch.
+    """
     n, dim = vectors.shape
     print(f"  Loading {n:,} vectors (dim={dim}) …", end="", flush=True)
     t0 = time.perf_counter()
 
-    # Use COPY for speed
-    buf = io.StringIO()
-    for i, vec in enumerate(vectors):
-        buf.write(f"{i}\t[{','.join(str(float(x)) for x in vec)}]\n")
-    buf.seek(0)
-
     cur = conn.cursor()
-    cur.copy_expert(f"COPY {TABLE} (id, v) FROM STDIN", buf)
+    for start in range(0, n, batch):
+        buf = io.StringIO()
+        for i in range(start, min(start + batch, n)):
+            vec = vectors[i]
+            buf.write(f"{i}\t[{','.join(str(float(x)) for x in vec)}]\n")
+        buf.seek(0)
+        cur.copy_expert(f"COPY {TABLE} (id, v) FROM STDIN", buf)
+        buf.close()
     cur.close()
 
     elapsed = time.perf_counter() - t0
@@ -295,9 +302,12 @@ def bench_exact(conn, queries, k, gt, op="<->", verbose=False):
     }
 
 
-def bench_hnsw(conn, queries, k, gt, dim, op="<->", opclass="vector_l2_ops", ef_search=100, verbose=False):
-    ddl = f"CREATE INDEX {INDEX_NAME} ON {TABLE} USING hnsw (v {opclass})"
-    print(f"  Building hnsw index ({opclass}) …", end="", flush=True)
+def bench_hnsw(conn, queries, k, gt, dim, op="<->", opclass="vector_l2_ops", ef_search=100,
+               m=16, ef_construction=64, verbose=False):
+    ddl = (f"CREATE INDEX {INDEX_NAME} ON {TABLE} USING hnsw (v {opclass}) "
+           f"WITH (m={m}, ef_construction={ef_construction})")
+    print(f"  Building hnsw index ({opclass}, m={m}, ef_construction={ef_construction}) …",
+          end="", flush=True)
     build_s = build_index_and_time(conn, ddl)
     print(f" {build_s:.1f}s")
 
@@ -309,7 +319,7 @@ def bench_hnsw(conn, queries, k, gt, dim, op="<->", opclass="vector_l2_ops", ef_
     rec = recall_at_k(results, gt, k)
 
     return {
-        "method": f"hnsw (m=16,ef_search={ef_search})",
+        "method": f"hnsw (m={m},ef_construction={ef_construction},ef_search={ef_search})",
         "build_s": build_s,
         "idx_size": format_bytes(sz),
         "recall": rec,
@@ -361,10 +371,13 @@ def bench_tqflat_build(conn, bits, opclass="vector_l2_ops", fast_rotation=True, 
     return build_s, sz
 
 
-def bench_tqflat_query(conn, queries, k, gt, bits, rerank, build_s, idx_bytes, op="<->", verbose=False):
+def bench_tqflat_query(conn, queries, k, gt, bits, rerank, build_s, idx_bytes, op="<->", verbose=False,
+                       force_scalar="off"):
     """Query an already-built tqflat index at a given rerank level."""
-    label = f"tqflat (bits={bits},rerank={rerank})"
+    kernel = "[float]" if force_scalar == "on" else "[8bit]"
+    label = f"tqflat (bits={bits},rerank={rerank}) {kernel}"
     _execute(conn, f"SET tqflat.rerank = {rerank}")
+    _execute(conn, f"SET tqflat.force_scalar = {force_scalar}")
     _execute(conn, "SET enable_seqscan = off")
     results, qps, avg_ms = run_queries(conn, queries, k, op=op, verbose=verbose, explain_first=verbose)
     _execute(conn, "SET enable_seqscan = on")
@@ -507,10 +520,17 @@ def parse_args():
     p.add_argument("--hnsw-ef-search", type=int, default=100,
                    help="hnsw.ef_search at query time (default 100; pgvector's default is 40, "
                         "which under-recalls on hard datasets like GloVe-angular)")
+    p.add_argument("--hnsw-m", type=int, default=16,
+                   help="hnsw m (max connections per layer; build reloption, default 16)")
+    p.add_argument("--hnsw-ef-construction", type=int, default=64,
+                   help="hnsw ef_construction (build candidate list size, default 64; "
+                        "raise with m for higher recall at high dimension)")
     p.add_argument("--tqflat-fast-rotation", choices=["on", "off"], default="on",
                    help="tqflat fast_rotation reloption (default on; off = dense O(d^2) baseline for A/B)")
     p.add_argument("--tqflat-tq-prod", choices=["on", "off"], default="on",
                    help="tqflat tq_prod (QJL residual stage) reloption (default on)")
+    p.add_argument("--tqflat-force-scalar", choices=["on", "off"], default="off",
+                   help="A/B: score blocked tqflat with the float LUT (on) vs the 8-bit SIMD kernel (off, default)")
     p.add_argument("--no-hnsw", action="store_true", help="Skip hnsw benchmark")
     p.add_argument("--no-ivfflat", action="store_true", help="Skip ivfflat benchmark")
     p.add_argument("--csv", default="bench/results.csv", help="Output CSV path")
@@ -615,7 +635,8 @@ def main():
             for rerank in args.tqflat_reranks:
                 print(f"  Querying rerank={rerank} …", end="", flush=True)
                 row = bench_tqflat_query(conn, queries, k, gt, bits, rerank,
-                                         build_s, idx_bytes, op=op, verbose=args.verbose)
+                                         build_s, idx_bytes, op=op, verbose=args.verbose,
+                                         force_scalar=args.tqflat_force_scalar)
                 row["method"] += tag
                 row["metric"] = metric
                 print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
@@ -625,7 +646,8 @@ def main():
         if not args.no_hnsw:
             print(f"\n--- HNSW ({metric}) ---")
             row = bench_hnsw(conn, queries, k, gt, dim, op=op, opclass=opclass,
-                             ef_search=args.hnsw_ef_search, verbose=args.verbose)
+                             ef_search=args.hnsw_ef_search, m=args.hnsw_m,
+                             ef_construction=args.hnsw_ef_construction, verbose=args.verbose)
             row["metric"] = metric
             results_rows.append(row)
 

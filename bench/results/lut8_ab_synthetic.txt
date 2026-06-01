@@ -1,0 +1,44 @@
+tqflat 8-bit SIMD LUT kernel vs float scalar scorer -- recall@10 A/B
+====================================================================
+
+SYNTHETIC data (N=5000 dim=64), PostgreSQL 18, NEON kernel.
+This is a PRELIMINARY signal only -- NOT the spec section 8 decision gate,
+which requires the real SIFT/GloVe/OpenAI datasets (deferred; datasets not
+staged).
+
+Setup
+-----
+Table        : tqsyn, 5000 distinct vector(64) rows
+               (v[s] = sin(id*0.7 + s*1.3) + 0.3*cos(id*0.11*s); distinct per id
+               so top-k is well defined -- verified 5000 distinct vectors)
+Index        : USING tqflat (v vector_l2_ops); bits=4, fast_rotation on (defaults)
+Queries      : 200 distinct query rows (id 1..200)
+Metric       : recall@10 = mean over 200 queries of
+               |index_top10 intersect exact_top10| / 10
+Exact top-10 : computed once via seqscan (enable_seqscan=on, indexscan off)
+A/B knob     : SET tqflat.force_scalar = off  (8-bit SIMD kernel, default)
+                                          on   (float LUT scalar scorer)
+Rerank       : SET tqflat.rerank = 0   (raw quantizer, no full-precision rerank)
+                                  = 200 (production-style rerank)
+
+Results (recall@10)
+-------------------
+                            rerank=0 (raw)   rerank=200 (prod)
+  force_scalar=off  8bit       0.9390            1.0000
+  force_scalar=on   float      0.9425            1.0000
+
+Reading
+-------
+At rerank=0 the raw quantizer recall reflects the scorer's ranking quality:
+the float LUT (0.9425) edges out the 8-bit SIMD kernel (0.9390) by ~0.0035 --
+the expected small loss from 8-bit LUT quantization of the per-coord scores.
+With production rerank (=200) both scorers reach 1.0000: the full-precision
+rerank pass absorbs the 8-bit ranking noise, so the kernel choice is
+recall-neutral once rerank is on.
+
+This synthetic distribution is benign and low-dimensional; it is a sanity
+signal that the 8-bit kernel is recall-competitive (and that rerank fully
+masks the 8-bit gap), NOT a basis for making the 8-bit-default decision. That
+decision is deferred to the real-dataset runs (spec section 8), where higher
+intrinsic dimensionality and adversarial query distributions are expected to
+surface any 8-bit ranking loss.

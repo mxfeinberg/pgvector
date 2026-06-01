@@ -1,66 +1,60 @@
--- tqflat build tests: M2.1 (meta/side pages + loader), M2.2 (heap scan + data pages),
--- M2.4 (QJL residual encode side: tq_prod meta/side pages + signs region)
--- Scan is not implemented yet (M3), so we exercise build + meta only.
+-- tqflat build tests: M2.1 (meta/side pages + loader), M2.2 (heap scan + data pages).
+-- v4 blocked layout: bits MUST be 4, tq_prod MUST be false (QJL unsupported).
+-- fast_rotation in {on (default), off} are both supported.
+-- tqflat_test_meta returns 9 ints:
+--   {dim, bits, metric, tqProd, nVectors, fastRotation, dimPadded, blockWidth, blockCount}
+-- blockWidth is always 32; blockCount = ceil(nVectorsBuiltAtBuildTime / 32).
 
 CREATE TABLE tqbuild (id serial, v vector(8));
 INSERT INTO tqbuild (v)
 	SELECT ('[' || array_to_string(array(SELECT (i * 7 + g) % 13 - 6 FROM generate_series(1, 8) i), ',') || ']')::vector
 	FROM generate_series(1, 500) g;
 
--- bits = 2 with tq_prod = true (exercises the QJL stage; tq_prod now defaults OFF)
-CREATE INDEX tqbuild_idx2 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 2, tq_prod = true);
-SELECT tqflat_test_meta('tqbuild_idx2'::regclass);
-SELECT pg_relation_size('tqbuild_idx2') > 0 AS idx2_nonempty;
-
--- bits = 4 grows the meta bits field
-CREATE INDEX tqbuild_idx4 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 4);
-SELECT tqflat_test_meta('tqbuild_idx4'::regclass);
-
--- default (no options): bits = 2, tq_prod = off (the new default), fast_rotation = on
+-- (a) default (no options): bits = 4, tq_prod = off, fast_rotation = on.
+-- 500 rows -> blockCount = ceil(500/32) = 16.
 CREATE INDEX tqbuild_idxdef ON tqbuild USING tqflat (v vector_l2_ops);
-SELECT tqflat_test_meta('tqbuild_idxdef'::regclass);
+SELECT tqflat_test_meta('tqbuild_idxdef'::regclass);  -- {8,4,0,0,500,1,8,32,16}
+SELECT pg_relation_size('tqbuild_idxdef') > 0 AS idxdef_nonempty;
 
--- M2.4: tq_prod = false disables the QJL stage (tqProd column = 0)
-CREATE INDEX tqbuild_idxnoprod ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 2, tq_prod = false);
-SELECT tqflat_test_meta('tqbuild_idxnoprod'::regclass);
+-- (b) explicit bits = 4 (same as default).
+CREATE INDEX tqbuild_idx4 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 4);
+SELECT tqflat_test_meta('tqbuild_idx4'::regclass);    -- {8,4,0,0,500,1,8,32,16}
+SELECT pg_relation_size('tqbuild_idx4') > 0 AS idx4_nonempty;
 
--- M2.4: tq_prod = true index carries the per-entry signs region (dim/8 B each)
--- plus a QJL side page, so it is strictly larger than the otherwise-identical
--- tq_prod = false index.  Pinned to dense rotation: under fast_rotation the QJL
--- side page is absent and, at dim = 8 / bits = 2, the 1-byte signs region is
--- absorbed by MAXALIGN, so the two indexes are byte-identical in size.
-CREATE INDEX tqbuild_idx2_dense ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 2, tq_prod = true, fast_rotation = false);
-CREATE INDEX tqbuild_idxnoprod_dense ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 2, tq_prod = false, fast_rotation = false);
-SELECT pg_relation_size('tqbuild_idx2_dense') > pg_relation_size('tqbuild_idxnoprod_dense') AS prod_is_larger;
-DROP INDEX tqbuild_idx2_dense;
-DROP INDEX tqbuild_idxnoprod_dense;
+-- (c) bits = 4, fast_rotation = false (dense rotation path).
+-- fastRotation = 0; dimPadded = dim = 8.
+CREATE INDEX tqbuild_idxdense ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 4, fast_rotation = false);
+SELECT tqflat_test_meta('tqbuild_idxdense'::regclass);  -- {8,4,0,0,500,0,8,32,16}
+SELECT pg_relation_size('tqbuild_idxdense') > 0 AS idxdense_nonempty;
 
--- M2.4: QJL matrix round-trips through TqLoadModel.
--- Returns {tqProd, qjlScale, qjl[0], max|reload - recompute|}.
--- tq_prod = true: tqProd = 1, qjlScale > 0, reload matches recompute exactly (maxdiff = 0).
-WITH q AS (SELECT tqflat_test_qjl('tqbuild_idx2'::regclass) AS r)
-SELECT (r)[1] AS tqprod, (r)[2] > 0 AS scale_positive, (r)[4] AS reload_maxdiff FROM q;
--- tq_prod = false: no QJL matrix; all-zero descriptor.
-SELECT tqflat_test_qjl('tqbuild_idxnoprod'::regclass);
+-- tq_prod = true is rejected by the blocked layout (QJL unsupported in v4).
+\set ON_ERROR_STOP 0
+CREATE INDEX tqbuild_idxprod ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 4, tq_prod = true);
+\set ON_ERROR_STOP 1
 
--- bad bits must error
-CREATE INDEX tqbuild_idxbad ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 5);
+-- Bad bits must error at reloption validation: only bits = 4 is valid.
+\set ON_ERROR_STOP 0
+CREATE INDEX tqbuild_idxbad1 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 1);
+CREATE INDEX tqbuild_idxbad2 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 2);
+CREATE INDEX tqbuild_idxbad3 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 3);
+CREATE INDEX tqbuild_idxbad5 ON tqbuild USING tqflat (v vector_l2_ops) WITH (bits = 5);
+\set ON_ERROR_STOP 1
 
--- M2.3: single-row insert (tqinsert) -- build then insert, nVectors must increase.
+-- M2.3: single-row insert (tqinsert) -- build then insert, nVectors must increase
+-- while blockCount stays the same (inserts go to the row-major tail, not new blocks).
 -- A single INSERT updates ALL indexes on the table simultaneously, so one batch of
 -- 100 rows increments nVectors on every index from 500 to 600.
 INSERT INTO tqbuild (v)
 	SELECT ('[' || array_to_string(array(SELECT (i * 3 + g) % 7 - 3 FROM generate_series(1, 8) i), ',') || ']')::vector
 	FROM generate_series(1, 100) g;
 
--- tq_prod = true (explicit): nVectors 500 -> 600
-SELECT tqflat_test_meta('tqbuild_idx2'::regclass);    -- {8,2,0,1,600,0,8}
--- tq_prod = false: nVectors 500 -> 600
-SELECT tqflat_test_meta('tqbuild_idxnoprod'::regclass);  -- {8,2,0,0,600,0,8}
--- bits = 4, tq_prod = off (default): nVectors 500 -> 600
-SELECT tqflat_test_meta('tqbuild_idx4'::regclass);    -- {8,4,0,0,600,0,8}
+-- nVectors 500 -> 600 (5th element); blockCount stays 16 (9th element).
+SELECT tqflat_test_meta('tqbuild_idxdef'::regclass);    -- {8,4,0,0,600,1,8,32,16}
+SELECT tqflat_test_meta('tqbuild_idx4'::regclass);      -- {8,4,0,0,600,1,8,32,16}
+-- dense path: nVectors 500 -> 600; blockCount stays 16; fastRotation = 0.
+SELECT tqflat_test_meta('tqbuild_idxdense'::regclass);  -- {8,4,0,0,600,0,8,32,16}
 
 -- index size must be non-zero after inserts
-SELECT pg_relation_size('tqbuild_idx2') > 0 AS idx2_nonempty_after_insert;
+SELECT pg_relation_size('tqbuild_idx4') > 0 AS idx4_nonempty_after_insert;
 
 DROP TABLE tqbuild;

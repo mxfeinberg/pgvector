@@ -35,12 +35,14 @@ tqbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 {
 	Relation	index = info->index;
 	BlockNumber blkno;
+	BlockNumber sideStart;
+	BlockNumber tailStart;
 	BufferAccessStrategy bas = GetAccessStrategy(BAS_BULKREAD);
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
-	/* Read dataStart from the meta page. */
+	/* Read the side-chain and tail-chain heads from the meta page. */
 	{
 		Buffer		metabuf;
 		Page		metapage;
@@ -50,11 +52,88 @@ tqbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 		metapage = BufferGetPage(metabuf);
 		metap = TqPageGetMeta(metapage);
-		blkno = metap->dataStart;
+		sideStart = metap->sideStart;
+		tailStart = metap->tailStart;
 		UnlockReleaseBuffer(metabuf);
 	}
 
-	/* Walk the data-page chain. */
+	/*
+	 * --- Side chain: tombstone lanes via deletedMask ---
+	 *
+	 * The built rows live in the blocked code-plane; their heap TIDs and
+	 * tombstone bits are carried in the parallel side chain (one
+	 * TqBlockSideRec per block).  We set deletedMask bit j for any lane whose
+	 * heap TID the callback wants removed; the scan skips those lanes.
+	 */
+	blkno = sideStart;
+	while (BlockNumberIsValid(blkno))
+	{
+		Buffer		buf;
+		Page		page;
+		GenericXLogState *state;
+		OffsetNumber offno;
+		OffsetNumber maxoffno;
+		bool		modified = false;
+		BlockNumber nextblkno;
+
+		vacuum_delay_point();
+
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, bas);
+
+		/*
+		 * ambulkdelete cannot delete entries from pages that are pinned by
+		 * other backends.  LockBufferForCleanup waits until no other backend
+		 * holds a pin on this buffer (mirrors ivfvacuum.c).
+		 */
+		LockBufferForCleanup(buf);
+
+		state = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(state, buf, 0);
+
+		maxoffno = PageGetMaxOffsetNumber(page);
+
+		for (offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+		{
+			TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(page, PageGetItemId(page, offno));
+			int			j;
+
+			for (j = 0; j < srec->nvecs; j++)
+			{
+				/* Skip already-tombstoned lanes (avoids double-counting). */
+				if (srec->deletedMask & (1u << j))
+					continue;
+
+				if (callback(&srec->side[j].heaptid, callback_state))
+				{
+					srec->deletedMask |= (1u << j);
+					modified = true;
+					stats->tuples_removed++;
+				}
+				else
+					stats->num_index_tuples++;
+			}
+		}
+
+		/* Capture nextblkno before we finish/abort the xlog state. */
+		nextblkno = TqPageGetOpaque(page)->nextblkno;
+
+		if (modified)
+			GenericXLogFinish(state);
+		else
+			GenericXLogAbort(state);
+
+		UnlockReleaseBuffer(buf);
+
+		blkno = nextblkno;
+	}
+
+	/*
+	 * --- Tail chain: tombstone row-major TqEntry items ---
+	 *
+	 * Rows inserted after the build live in the row-major tail chain as
+	 * TqEntry items; tombstone them via entry->deleted (the scan skips those).
+	 */
+	blkno = tailStart;
 	while (BlockNumberIsValid(blkno))
 	{
 		Buffer		buf;

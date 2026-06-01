@@ -39,14 +39,18 @@ CREATE INDEX tqscan_empty_idx ON tqscan_empty USING tqflat (v vector_l2_ops);
 SELECT id FROM tqscan_empty ORDER BY v <-> '[1,2,3,4]'::vector LIMIT 5;
 
 -- Insert-then-query: a newly inserted exact match is found via the index.
+-- The insert goes to the row-major tail; the new row is found by the scan.
 INSERT INTO tqscan VALUES (9, '[0,0,0,0,10,0,0,0]');
-SELECT id FROM tqscan ORDER BY v <-> '[0,0,0,0,10,0,0,0]'::vector LIMIT 1;
+SELECT id FROM tqscan ORDER BY v <-> '[0,0,0,0,10,0,0,0]'::vector LIMIT 1;  -- expect 9
 
--- tq_prod = true index also returns the unambiguous nearest neighbour.
+-- tq_prod = true is unsupported in the blocked v4 layout; CREATE INDEX must error.
+\set ON_ERROR_STOP 0
 CREATE INDEX tqscan_idx_prod ON tqscan USING tqflat (v vector_l2_ops) WITH (bits = 4, tq_prod = true);
-DROP INDEX tqscan_idx;
+\set ON_ERROR_STOP 1
+
+-- The existing (tq_prod = false) index still returns the unambiguous nearest neighbours.
 SET tqflat.rerank = 100;
-SELECT id FROM tqscan ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector LIMIT 2;
+SELECT id FROM tqscan ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector LIMIT 2;  -- expect 1, 2
 
 RESET tqflat.rerank;
 RESET enable_seqscan;
@@ -81,11 +85,11 @@ SELECT id FROM tqmetrics ORDER BY v <#> '[1,0,0,0,0,0,0,0]'::vector LIMIT 3;
 -- Inner-product aligned with dimension 3: id 4 wins.
 SELECT id FROM tqmetrics ORDER BY v <#> '[0,0,1,0,0,0,0,0]'::vector LIMIT 1;
 
--- Cosine: direction [1,0,...] — ids 1,2,5,6 all point the same direction.
--- The query [1,0,...] is unit-norm; the four same-direction vectors must all rank
--- before id 2 (which has a small cosine-perpendicular component) and before id 7
--- (anti-parallel).  Verify ids 5 and 6 appear before id 7.
-SELECT id FROM tqmetrics WHERE id IN (5, 6, 7) ORDER BY v <=> '[1,0,0,0,0,0,0,0]'::vector LIMIT 3;
+-- Cosine: direction [1,0,...] — ids 5,6 point the same direction (cosine distance 0),
+-- id 7 is anti-parallel (cosine distance 2).  ids 5 and 6 are an exact cosine tie, so
+-- their relative order under the blocked estimate is unspecified; what matters is that
+-- both rank before id 7.  ORDER BY also breaks the 5/6 tie by id for determinism.
+SELECT id FROM tqmetrics WHERE id IN (5, 6, 7) ORDER BY v <=> '[1,0,0,0,0,0,0,0]'::vector, id LIMIT 3;
 
 -- Cosine query aligned with dimension 2: id 3 wins (independent of magnitude).
 SELECT id FROM tqmetrics ORDER BY v <=> '[0,1,0,0,0,0,0,0]'::vector LIMIT 1;
@@ -112,3 +116,43 @@ SELECT id FROM tqfast ORDER BY v <-> '[0,0,0,0,0,0,0,10]'::vector LIMIT 1;  -- e
 RESET tqflat.rerank;
 RESET enable_seqscan;
 DROP TABLE tqfast;
+
+-- Multi-page code-plane chain: build an index large enough that the block
+-- code-plane byte stream spans several index pages, then verify the scan reads
+-- it back correctly.  At dim=32 (dimCodes=32) each block's code-plane is
+-- TQ_BLOCK_CODE_BYTES = 32*16 = 512 bytes; 2001 rows -> ceil(2001/32) = 63
+-- blocks -> 63*512 = 32256 bytes, which spans ~4 index pages (~8152 usable
+-- bytes each).  The 500-row dim=8 build in tqflat_build only fills a single
+-- code page, so this is the regression guard for cross-page code-chain
+-- read/write (e.g. the streaming build writer).
+CREATE TABLE tqbig (id int, v vector(32));
+-- 2000 deterministic filler rows with small bounded coordinates (all far from
+-- the dim-1 probe direction below), plus one planted unambiguous nearest
+-- neighbour (id 9999) that is the only large-magnitude dim-1 vector.
+INSERT INTO tqbig
+	SELECT g,
+		('[' || array_to_string(array(SELECT ((g * 7 + i * 3) % 5) - 2 FROM generate_series(1, 32) i), ',') || ']')::vector
+	FROM generate_series(1, 2000) g;
+INSERT INTO tqbig VALUES
+	(9999, ('[100,' || array_to_string(array(SELECT 0 FROM generate_series(1, 31) i), ',') || ']')::vector);
+
+CREATE INDEX tqbig_idx ON tqbig USING tqflat (v vector_l2_ops) WITH (bits = 4);
+
+-- blockCount (9th element) = ceil(2001/32) = 63: confirms the multi-page scale.
+SELECT (tqflat_test_meta('tqbig_idx'::regclass))[9] AS block_count;
+
+SET enable_seqscan = off;
+
+-- The planted spike is the unambiguous nearest neighbour to its own direction;
+-- reranked top-1 must be id 9999, found across the multi-page code chain.
+SET tqflat.rerank = 100;
+SELECT id FROM tqbig ORDER BY v <-> ('[100,' || array_to_string(array(SELECT 0 FROM generate_series(1, 31) i), ',') || ']')::vector LIMIT 1;  -- expect 9999
+
+-- rerank = 0 (pure kernel estimate over every block): the scan still returns
+-- exactly LIMIT rows with no error across all ~4 code pages.
+SET tqflat.rerank = 0;
+SELECT count(*) FROM (SELECT id FROM tqbig ORDER BY v <-> ('[100,' || array_to_string(array(SELECT 0 FROM generate_series(1, 31) i), ',') || ']')::vector LIMIT 10) s;
+
+RESET tqflat.rerank;
+RESET enable_seqscan;
+DROP TABLE tqbig;
