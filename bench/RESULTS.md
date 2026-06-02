@@ -261,9 +261,12 @@ the arm64/NEON numbers above):
 - The x86 speedup trails NEON at high dim (9.9× vs 19.5× @ dc=2048) because this
   is the **128-bit `_mm_shuffle_epi8` v1**: it processes 16 lanes/shuffle (like
   NEON) but widens u8→u16 with `unpack`+`add` (two ops) where NEON does it in one
-  (`vaddw_u8`). Widening to `_mm512_shuffle_epi8` (4 coords/iter) is the documented
-  throughput TODO and should close the gap. Correctness is already final; this is
-  purely the un-widened first cut.
+  (`vaddw_u8`). **This has since been fixed** — the widened 256/512-bit kernel
+  (one `_mm256_shuffle_epi8` for both nibbles + one `_mm512_cvtepu8_epi16` widen,
+  register-resident accumulators) reaches **24.6–31.8× vs scalar**, past NEON parity,
+  and is bit-identical to the v1/Default. See the *AVX-512 fast-scan kernel widening*
+  section at the end of this file for the throughput and end-to-end numbers.
+  Correctness was already final at the first cut; the widening is pure throughput.
 
 ## OpenAI-1536 @ **full 1M** — three-way (x86/AVX-512, `the-fire`)
 
@@ -322,6 +325,13 @@ built index** (probes/rerank are query-time GUCs). tqflat bits=4, fast rotation,
 no-QJL. hnsw tuned `m=32, ef_construction=128, ef_search=100`. SIFT/GloVe use the
 shipped file ground truth (500 queries); OpenAI-1M computes exact GT (200 queries).
 CSVs: `bench/results/{sift1m,glove200,openai1m}_tqivf_x86.csv`.
+
+> **Kernel note.** The four-way tables below were measured with the **128-bit v1**
+> AVX-512 score kernel. The kernel was subsequently widened (256/512-bit); recall is
+> unchanged (the kernel is bit-identical) and end-to-end latency drops ~5–22% where
+> the score step dominates. The before/after deltas are in the *AVX-512 fast-scan
+> kernel widening* section at the end of this file; the prior CSVs are preserved as
+> `bench/results/*_tqivf_x86_oldkernel.csv`.
 
 ## OpenAI-1536 @ 1M — four-way (the headline)
 
@@ -417,3 +427,67 @@ and every higher probe point out-recalls HNSW by a wide margin (HNSW tops out at
 prior sections motivated — it wins size, recall, and build like flat tqflat *and*
 turns the O(N) latency wall into IVF-sublinear selection, beating ivfflat outright
 and trading raw latency to HNSW only in exchange for ~8× less memory.
+
+# AVX-512 fast-scan kernel widening (256/512-bit) — throughput + end-to-end
+
+The AVX-512 score kernel (`TqScoreBlockRangeAvx512`, `src/tqfastscan.c`) was rewritten
+from the **128-bit `_mm_shuffle_epi8` v1** (the un-widened first cut benchmarked in all
+sections above) to a widened **256/512-bit** kernel. Three bottlenecks were removed:
+(1) the per-coordinate `acc16` load/store traffic — accumulators are now
+**register-resident** (`acc16` in one zmm, `acc32` in two); (2) the u8→u16 widen, now
+**one `_mm512_cvtepu8_epi16` + `vpaddw`** instead of `unpacklo/hi` + add; (3) the nibble
+shuffle, now **one 256-bit `_mm256_shuffle_epi8`** (both nibbles, LUT broadcast to both
+lanes) instead of two 128-bit lookups. The kernel stays **bit-identical** to the scalar
+`TqScoreBlockRangeDefault` — the mandatory `& 0x0F` after the 16-bit shift and the
+128-coord `TQ_LUT_FLUSH` cadence are preserved.
+
+**Raw score-step throughput** (`bench/microbench/tq_simd_microbench3_avx512.c`, AMD
+Ryzen 9 7940HS / Zen4 `the-fire`, 1M coded vectors, best of 7; the bench runs both
+kernels back-to-back and asserts their checksums match):
+
+| dim (padded) | scalar | 128-bit v1 | **256/512 (new)** | new vs scalar | **new vs v1** | checksum |
+|---|---|---|---|---|---|---|
+| SIFT 128         | 81.4 ms   | 8.5 ms   | **2.6 ms**   | **31.6×** | **3.31×** | MATCH |
+| GloVe 200→256    | 162.0 ms  | 16.9 ms  | **5.1 ms**   | **31.8×** | **3.31×** | MATCH |
+| OpenAI 1536→2048 | 1367.2 ms | 137.6 ms | **55.7 ms**  | **24.6×** | **2.47×** | MATCH |
+
+The widened kernel is **2.5–3.3× faster than v1** and clears the ~20× NEON-parity
+target (NEON peaks at 19.5× @ dc=2048). The register-resident accumulator was the
+dominant win.
+
+**Validation on `the-fire`** (the §x86/AVX-512 checklist, re-run with the new kernel
+live, PG 18.4):
+
+| Check | Expected | Observed |
+|---|---|---|
+| `make installcheck` | all pass | **22/22 pass** ✅ |
+| `tqflat_test_active_kernel()` | `avx512` | **`avx512`** ✅ |
+| `tqflat_test_score_block_consistency(256)` | `0` | **0** ✅ |
+| `tqflat_test_score_block_consistency(2048)` | `0` | **0** ✅ |
+| microbench checksum (v1 vs new, all dims) | identical | **MATCH** ✅ |
+
+**End-to-end four-way re-run (new kernel vs v1, same host/params).** Recall is
+unchanged at every point (bit-identical kernel); the table below is the latency delta.
+The win tracks the score-step fraction: largest on high-dim OpenAI, smaller on
+low-dim SIFT where the page-walk/rerank dominates, and absent (run-to-run noise only)
+for `hnsw`/`ivfflat`/`exact`, which don't use the kernel.
+
+| Dataset | Operating point | recall | v1 ms | **new ms** | speedup |
+|---|---|---|---|---|---|
+| OpenAI-1M×1536 | tqivf p99 / rerank200  | 0.980 | 62.1  | **51.3**  | **1.21×** |
+| OpenAI-1M×1536 | tqivf p200 / rerank200 | 0.992 | 121.8 | **100.3** | **1.21×** |
+| OpenAI-1M×1536 | tqivf p400 / rerank100 | 0.998 | 236.9 | **194.4** | **1.22×** |
+| OpenAI-1M×1536 | tqflat flat scan r200  | 1.000 | 980   | **882**   | 1.11× |
+| GloVe-200      | tqivf p99 / rerank200  | 0.936 | 22.1  | **20.6**  | 1.08× |
+| GloVe-200      | tqivf p400 / rerank200 | 0.987 | 82.8  | **77.3**  | 1.07× |
+| SIFT1M         | tqivf p99 / rerank200  | 0.999 | 15.2  | **14.6**  | 1.04× |
+| SIFT1M         | tqivf p400 / rerank200 | 0.999 | 57.8  | **54.8**  | 1.05× |
+
+On the headline OpenAI-1M set `tqivf` is **~18–22% faster end-to-end at every real
+operating point**, with the win monotone across the whole `probes × rerank` sweep —
+the signature of a genuine kernel speedup rather than noise. The matched-recall cell
+vs ivfflat (p99, 0.98) drops 62 → 51 ms, so `tqivf` is now **~4.1× faster than
+ivfflat** (was 3.5×) at the same 7.6× size advantage. The tiny low-probe points
+(p10, 10–13 ms, dominated by fixed per-query overhead) are too small/variable to read
+as a kernel signal. CSVs: `bench/results/{sift1m,glove200,openai1m}_tqivf_x86.csv`
+(new) vs `*_oldkernel.csv` (v1 baseline).
