@@ -152,7 +152,7 @@ TqScoreBlockRangeNeon(const uint8 *lut8, const uint8 *codeRun,
 #define TARGET_TQ_AVX512
 #define TARGET_TQ_XSAVE
 #else
-#define TARGET_TQ_AVX512 __attribute__((target("avx512f,avx512bw")))
+#define TARGET_TQ_AVX512 __attribute__((target("avx512f,avx512bw,avx2")))
 #define TARGET_TQ_XSAVE  __attribute__((target("xsave")))
 #endif
 
@@ -198,80 +198,96 @@ TqSupportsAvx512(void)
 }
 
 /*
- * TqScoreBlockRangeAvx512 -- 128-bit-shuffle fast-scan kernel, bit-identical
- * to TqScoreBlockRangeDefault.
+ * TqScoreBlockRangeAvx512 -- AVX-512 fast-scan kernel, bit-identical to
+ * TqScoreBlockRangeDefault.  Rewrite of the original 128-bit-shuffle v1 to
+ * close the throughput gap to the NEON kernel.
  *
- * Lane-mapping rationale (independently verified):
- *   codes = 16 packed bytes; cell[j] holds lo-nibble for lane j (0..15) and
- *   hi-nibble for lane j+16 (16..31).
- *   lo[j] = cell[j] & 0x0F  -> tbl lookup -> r0 byte j = tbl[cell[j]&0x0F]
- *   hi[j] = (cell[j]>>4)&0x0F -> tbl lookup -> r1 byte j = tbl[cell[j]>>4]
- *   _mm_unpacklo_epi8(r0, z) -> u16 { r0[0]..r0[7] }  -> acc16[0..7]
- *   _mm_unpackhi_epi8(r0, z) -> u16 { r0[8]..r0[15] } -> acc16[8..15]
- *   _mm_unpacklo_epi8(r1, z) -> u16 { r1[0]..r1[7] }  -> acc16[16..23]
- *   _mm_unpackhi_epi8(r1, z) -> u16 { r1[8]..r1[15] } -> acc16[24..31]
- *   Scalar: acc16[j] += tbl[cell[j]&0x0F]; acc16[j+16] += tbl[cell[j]>>4]
- *   => r0 byte j -> acc16[j], r1 byte j -> acc16[j+16]. Match. ✓
+ * Three changes vs the original 128-bit version, each removing a bottleneck:
  *
- * CRITICAL x86-vs-NEON difference: _mm_srli_epi16 is a 16-BIT shift; it
- * bleeds bits from the adjacent byte into the top of each byte.  The 0x0F
- * mask after the shift is mandatory to zero those bleed bits before the
- * table lookup.  NEON's vshrq_n_u8 is a true per-byte shift and needs no
- * post-mask.
+ *  1. ONE 256-bit vpshufb per coordinate does BOTH nibble lookups.  The 16-byte
+ *     LUT is broadcast to both 128-bit lanes; the index register carries the lo
+ *     nibbles in lane 0 and the hi nibbles in lane 1, so a single shuffle yields
+ *     { tbl[cell[j]&0x0F] for j=0..15, tbl[cell[j]>>4] for j=0..15 } -- all 32
+ *     results.  (The original issued two 128-bit shuffles.)
  *
- * NOTE: amd64 consistency with TqScoreBlockRangeDefault is deferred to the
+ *  2. ONE vpmovzxbw (_mm512_cvtepu8_epi16) widens all 32 u8 results to u16 and a
+ *     single _mm512_add_epi16 accumulates them.  (The original did four
+ *     unpacklo/unpackhi + four adds; NEON's vaddw_u8 widens-and-adds in one op,
+ *     which is why the old x86 path trailed NEON ~2x.)
+ *
+ *  3. The accumulators stay in REGISTERS for the whole call: acc16 (32xu16) in
+ *     one zmm, acc32 (32xu32) in two.  The struct is read once at entry and
+ *     written once at exit.  The original reloaded and restored the entire
+ *     64-byte acc16 from memory on every coordinate -- that load/store traffic
+ *     was the dominant cost.
+ *
+ * Lane mapping (matches Default exactly):
+ *   r byte j, lane 0 = tbl[cell[j] & 0x0F]        -> acc16[j]      (j=0..15)
+ *   r byte j, lane 1 = tbl[(cell[j] >> 4) & 0x0F] -> acc16[j + 16]
+ *   vpmovzxbw preserves byte order, so cvtepu8_epi16(r) widens to u16 words
+ *   { acc16[0..15] addends (lane 0), acc16[16..31] addends (lane 1) }.
+ *   Default does acc16[j] += tbl[cell[j]&0x0F]; acc16[j+16] += tbl[cell[j]>>4].
+ *   Match. ✓
+ *
+ * CRITICAL x86-vs-NEON difference: _mm256_srli_epi16 is a 16-BIT shift; it
+ * bleeds the low bits of the adjacent byte into the top of each byte.  The
+ * 0x0F mask after the shift is mandatory.  NEON's vshrq_n_u8 is a true per-byte
+ * shift and needs no post-mask.
+ *
+ * The acc16 -> acc32 flush cadence (every TQ_LUT_FLUSH coords) is honored so
+ * the u16 lanes never overflow (255*128 < 65535); folding is plain integer
+ * addition, so any grouping is bit-identical to Default.
+ *
+ * NOTE: amd64 consistency with TqScoreBlockRangeDefault is verified on the
  * amd64 box; tqflat_test_score_block_consistency asserts ==Default there.
- * TODO(amd64 throughput): widen to _mm512_shuffle_epi8 (4 coords/iter).
  */
 TARGET_TQ_AVX512 void
 TqScoreBlockRangeAvx512(const uint8 *lut8, const uint8 *codeRun,
 						int c0, int c1, TqBlockAccum *acc)
 {
-	const __m128i mask = _mm_set1_epi8(0x0F);
+	const __m256i mask = _mm256_set1_epi8(0x0F);
+	__m512i		va16 = _mm512_loadu_si512((const void *) acc->acc16);
+	__m512i		va32lo = _mm512_loadu_si512((const void *) (acc->acc32));
+	__m512i		va32hi = _mm512_loadu_si512((const void *) (acc->acc32 + 16));
+	int			sinceFlush = acc->sinceFlush;
 	int			i;
 
 	for (i = c0; i < c1; i++)
 	{
 		const uint8 *cell = codeRun + (Size) (i - c0) * 16;
-		__m128i		tbl = _mm_loadu_si128((const __m128i *) (lut8 + (Size) i * 16));
-		__m128i		codes = _mm_loadu_si128((const __m128i *) cell);
-		__m128i		lo = _mm_and_si128(codes, mask);
+		__m128i		cell128 = _mm_loadu_si128((const __m128i *) cell);
+		__m128i		tbl128 = _mm_loadu_si128((const __m128i *) (lut8 + (Size) i * 16));
+		__m256i		bc = _mm256_broadcastsi128_si256(cell128);
+		__m256i		sh = _mm256_srli_epi16(bc, 4);
 
 		/*
-		 * _mm_srli_epi16 shifts 16-bit lanes right by 4: bits [7:4] of byte N
-		 * get bits [11:8] of the 16-bit word, i.e. the low 4 bits of byte N+1
-		 * bleed in.  The 0x0F mask discards those bleed bits, leaving only the
-		 * original hi nibble of each byte.
+		 * idx lane 0 = cell (-> lo nibbles after the mask), lane 1 = cell >> 4
+		 * (-> hi nibbles).  _mm256_blend_epi32 control 0xF0 takes the upper four
+		 * dwords (the high 128-bit lane) from `sh` and the lower four from `bc`.
+		 * The 0x0F mask then strips the shift's cross-byte bleed in lane 1 and
+		 * isolates the low nibble in lane 0.
 		 */
-		__m128i		hi = _mm_and_si128(_mm_srli_epi16(codes, 4), mask);
-		__m128i		r0 = _mm_shuffle_epi8(tbl, lo);	/* result for lanes 0..15 */
-		__m128i		r1 = _mm_shuffle_epi8(tbl, hi);	/* result for lanes 16..31 */
-		__m128i		z = _mm_setzero_si128();
-		__m128i		a0 = _mm_loadu_si128((const __m128i *) (acc->acc16 + 0));
-		__m128i		a1 = _mm_loadu_si128((const __m128i *) (acc->acc16 + 8));
-		__m128i		a2 = _mm_loadu_si128((const __m128i *) (acc->acc16 + 16));
-		__m128i		a3 = _mm_loadu_si128((const __m128i *) (acc->acc16 + 24));
+		__m256i		idx = _mm256_and_si256(_mm256_blend_epi32(bc, sh, 0xF0), mask);
+		__m256i		tbl = _mm256_broadcastsi128_si256(tbl128);
+		__m256i		r = _mm256_shuffle_epi8(tbl, idx);
 
-		/*
-		 * Widen u8 -> u16 by interleaving with zero, then add.
-		 * unpacklo(r0, z): bytes 0..7  of r0 -> u16 words 0..7  -> acc16[0..7]
-		 * unpackhi(r0, z): bytes 8..15 of r0 -> u16 words 0..7  -> acc16[8..15]
-		 * unpacklo(r1, z): bytes 0..7  of r1 -> u16 words 0..7  -> acc16[16..23]
-		 * unpackhi(r1, z): bytes 8..15 of r1 -> u16 words 0..7  -> acc16[24..31]
-		 */
-		a0 = _mm_add_epi16(a0, _mm_unpacklo_epi8(r0, z));
-		a1 = _mm_add_epi16(a1, _mm_unpackhi_epi8(r0, z));
-		a2 = _mm_add_epi16(a2, _mm_unpacklo_epi8(r1, z));
-		a3 = _mm_add_epi16(a3, _mm_unpackhi_epi8(r1, z));
+		va16 = _mm512_add_epi16(va16, _mm512_cvtepu8_epi16(r));
 
-		_mm_storeu_si128((__m128i *) (acc->acc16 + 0), a0);
-		_mm_storeu_si128((__m128i *) (acc->acc16 + 8), a1);
-		_mm_storeu_si128((__m128i *) (acc->acc16 + 16), a2);
-		_mm_storeu_si128((__m128i *) (acc->acc16 + 24), a3);
-
-		if (++acc->sinceFlush >= TQ_LUT_FLUSH)
-			fs_flush(acc);
+		if (++sinceFlush >= TQ_LUT_FLUSH)
+		{
+			va32lo = _mm512_add_epi32(va32lo,
+									  _mm512_cvtepu16_epi32(_mm512_castsi512_si256(va16)));
+			va32hi = _mm512_add_epi32(va32hi,
+									  _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(va16, 1)));
+			va16 = _mm512_setzero_si512();
+			sinceFlush = 0;
+		}
 	}
+
+	_mm512_storeu_si512((void *) acc->acc16, va16);
+	_mm512_storeu_si512((void *) (acc->acc32), va32lo);
+	_mm512_storeu_si512((void *) (acc->acc32 + 16), va32hi);
+	acc->sinceFlush = sinceFlush;
 }
 #endif							/* USE_DISPATCH */
 

@@ -209,8 +209,9 @@ main(int argc, char **argv)
 		sink += (double) acc;
 	}
 
-	/* ---- A-nibble kernel (the shippable Option A; matches TqScoreBlockRangeAvx512) ---- */
+	/* ---- A-nibble kernel: ORIGINAL 128-bit shuffle (shipped v1) ---- */
 	double		t_Anib = 1e30;
+	uint64_t	chk_128 = 0;
 
 	for (int r = 0; r < reps; r++)
 	{
@@ -244,6 +245,72 @@ main(int argc, char **argv)
 
 		if (t < t_Anib)
 			t_Anib = t;
+		chk_128 = acc;
+		sink += (double) acc;
+	}
+
+	/*
+	 * ---- A-nibble kernel: NEW 256-bit-shuffle / 512-bit-widen, register-
+	 * resident accumulators (mirrors the rewritten TqScoreBlockRangeAvx512).
+	 * One vpshufb (both nibbles) + one vpmovzxbw + one vpaddw per coordinate;
+	 * acc16 held in one zmm, acc32 in two, touched only at block start/end.
+	 */
+	const __m256i mask256 = _mm256_set1_epi8(0x0F);
+	double		t_512 = 1e30;
+	uint64_t	chk_512 = 0;
+
+	for (int r = 0; r < reps; r++)
+	{
+		double		t0 = now_ms();
+		uint64_t	acc = 0;
+
+		for (long b = 0; b < nblocks; b++)
+		{
+			const uint8_t *blk = blockedN + (size_t) b * dc * 16;
+			__m512i		va16 = _mm512_setzero_si512();
+			__m512i		va32lo = _mm512_setzero_si512();
+			__m512i		va32hi = _mm512_setzero_si512();
+			int			sinceFlush = 0;
+
+			for (int i = 0; i < dc; i++)
+			{
+				__m128i		cell = _mm_loadu_si128((const __m128i *) (blk + (size_t) i * 16));
+				__m128i		tbl128 = _mm_loadu_si128((const __m128i *) (lut8 + (size_t) i * NLEVELS));
+				__m256i		bc = _mm256_broadcastsi128_si256(cell);
+				__m256i		sh = _mm256_srli_epi16(bc, 4);
+				__m256i		idx = _mm256_and_si256(_mm256_blend_epi32(bc, sh, 0xF0), mask256);
+				__m256i		tbl = _mm256_broadcastsi128_si256(tbl128);
+				__m256i		rr = _mm256_shuffle_epi8(tbl, idx);
+
+				va16 = _mm512_add_epi16(va16, _mm512_cvtepu8_epi16(rr));
+				if (++sinceFlush >= FLUSH)
+				{
+					va32lo = _mm512_add_epi32(va32lo,
+											  _mm512_cvtepu16_epi32(_mm512_castsi512_si256(va16)));
+					va32hi = _mm512_add_epi32(va32hi,
+											  _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(va16, 1)));
+					va16 = _mm512_setzero_si512();
+					sinceFlush = 0;
+				}
+			}
+			/* finish: fold acc16 -> acc32 */
+			va32lo = _mm512_add_epi32(va32lo,
+									  _mm512_cvtepu16_epi32(_mm512_castsi512_si256(va16)));
+			va32hi = _mm512_add_epi32(va32hi,
+									  _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(va16, 1)));
+
+			uint32_t	acc32[BLOCK];
+
+			_mm512_storeu_si512((void *) acc32, va32lo);
+			_mm512_storeu_si512((void *) (acc32 + 16), va32hi);
+			for (int v = 0; v < BLOCK; v++)
+				acc += acc32[v];
+		}
+		double		t = now_ms() - t0;
+
+		if (t < t_512)
+			t_512 = t;
+		chk_512 = acc;
 		sink += (double) acc;
 	}
 
@@ -252,12 +319,17 @@ main(int argc, char **argv)
 
 	printf("\n  index code bytes: row-major/nibble = %.0f MB,  byte-per-code = %.0f MB\n\n",
 		   szRow, szByte);
-	printf("  scalar (current)         : %8.1f ms\n", t_scalar);
-	printf("  A-byte  (2x size)        : %8.1f ms   (%.1fx vs scalar)\n",
+	printf("  scalar (current)              : %8.1f ms\n", t_scalar);
+	printf("  A-byte  (2x size)             : %8.1f ms   (%.1fx vs scalar)\n",
 		   t_Abyte, t_scalar / t_Abyte);
-	printf("  A-nibble (same size) **  : %8.1f ms   (%.1fx vs scalar)\n",
+	printf("  A-nibble 128-bit (shipped v1) : %8.1f ms   (%.1fx vs scalar)\n",
 		   t_Anib, t_scalar / t_Anib);
-	printf("\n  nibble-split cost (Anib/Abyte): %.2fx\n", t_Anib / t_Abyte);
+	printf("  A-nibble 256/512 (new)     ** : %8.1f ms   (%.1fx vs scalar)\n",
+		   t_512, t_scalar / t_512);
+	printf("\n  new-vs-128bit speedup: %.2fx     checksums: %s (128=%llu 512=%llu)\n",
+		   t_Anib / t_512,
+		   chk_128 == chk_512 ? "MATCH" : "*** MISMATCH ***",
+		   (unsigned long long) chk_128, (unsigned long long) chk_512);
 	printf("  [sink=%g]\n", (double) sink);
-	return 0;
+	return chk_128 == chk_512 ? 0 : 1;
 }
