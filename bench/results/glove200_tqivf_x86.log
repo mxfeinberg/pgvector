@@ -1,0 +1,73 @@
+Loading .hdf5 dataset …
+Capped query set to first 500.
+Dataset: 1,183,514 vectors, dim=200, 500 queries, k=10
+
+Connecting to max@/var/run/postgresql:5432/tqtest …
+Connected.
+  maintenance_work_mem=16GB, max_parallel_maintenance_workers=4
+
+--- Setup ---
+  Loading 1,183,514 vectors (dim=200) … done (112.9s)
+
+========== metric: cosine  (op <=>, opclass vector_cosine_ops) ==========
+
+--- Ground truth (cosine) ---
+  Using pre-computed ground truth (from file).
+
+--- tqflat cosine bits=4 ---
+  Building tqflat vector_cosine_ops bits=4 fast_rotation=true tq_prod=false index … 7.44s
+  Querying rerank=200 … 3 QPS, recall=1.0000
+  Querying rerank=2000 … 3 QPS, recall=1.0000
+
+--- tqivf cosine lists=1087 probes=[10, 30, 99, 200, 400] reranks=[100, 200, 2000] ---
+  Building tqivf index (vector_cosine_ops, lists=1087, fast_rotation=true) … 37.85s
+  Querying probes=10 rerank=100 … 288 QPS, recall=0.7326
+  Querying probes=10 rerank=200 … 176 QPS, recall=0.7326
+  Querying probes=10 rerank=2000 … 112 QPS, recall=0.7326
+  Querying probes=30 rerank=100 … 135 QPS, recall=0.8420
+  Querying probes=30 rerank=200 … 129 QPS, recall=0.8420
+  Querying probes=30 rerank=2000 … 73 QPS, recall=0.8420
+  Querying probes=99 rerank=100 … 46 QPS, recall=0.9330
+  Querying probes=99 rerank=200 … 45 QPS, recall=0.9330
+  Querying probes=99 rerank=2000 … 35 QPS, recall=0.9330
+  Querying probes=200 rerank=100 … 24 QPS, recall=0.9658
+  Querying probes=200 rerank=200 … 24 QPS, recall=0.9658
+  Querying probes=200 rerank=2000 … 20 QPS, recall=0.9658
+  Querying probes=400 rerank=100 … 12 QPS, recall=0.9874
+  Querying probes=400 rerank=200 … 12 QPS, recall=0.9874
+  Querying probes=400 rerank=2000 … 11 QPS, recall=0.9874
+
+--- HNSW (cosine) ---
+  Building hnsw index (vector_cosine_ops, m=32, ef_construction=128) … 436.2s
+
+--- IVFFlat (cosine) ---
+  Building ivfflat index (vector_cosine_ops, lists=1087) … 19.6s
+
+=== Results ===
+
+| Metric | Method                                           | Build (s) | Index size | Recall@10 | QPS   | Avg latency (ms) |
+|--------|--------------------------------------------------|-----------|------------|-----------|-------|------------------|
+| cosine | tqflat (bits=4,rerank=200) [8bit] [fast,noqjl]   | 7.44      | 164.6 MB   | 1.0000    | 3.3   | 299.32           |
+| cosine | tqflat (bits=4,rerank=2000) [8bit] [fast,noqjl]  | 7.44      | 164.6 MB   | 1.0000    | 3.3   | 304.60           |
+| cosine | tqivf (lists=1087,probes=10,rerank=100) [8bit]   | 37.85     | 177.5 MB   | 0.7326    | 288.4 | 3.47             |
+| cosine | tqivf (lists=1087,probes=10,rerank=200) [8bit]   | 37.85     | 177.5 MB   | 0.7326    | 175.8 | 5.69             |
+| cosine | tqivf (lists=1087,probes=10,rerank=2000) [8bit]  | 37.85     | 177.5 MB   | 0.7326    | 112.1 | 8.92             |
+| cosine | tqivf (lists=1087,probes=30,rerank=100) [8bit]   | 37.85     | 177.5 MB   | 0.8420    | 135.0 | 7.41             |
+| cosine | tqivf (lists=1087,probes=30,rerank=200) [8bit]   | 37.85     | 177.5 MB   | 0.8420    | 129.4 | 7.73             |
+| cosine | tqivf (lists=1087,probes=30,rerank=2000) [8bit]  | 37.85     | 177.5 MB   | 0.8420    | 73.3  | 13.64            |
+| cosine | tqivf (lists=1087,probes=99,rerank=100) [8bit]   | 37.85     | 177.5 MB   | 0.9330    | 45.9  | 21.78            |
+| cosine | tqivf (lists=1087,probes=99,rerank=200) [8bit]   | 37.85     | 177.5 MB   | 0.9330    | 45.2  | 22.13            |
+| cosine | tqivf (lists=1087,probes=99,rerank=2000) [8bit]  | 37.85     | 177.5 MB   | 0.9330    | 35.1  | 28.48            |
+| cosine | tqivf (lists=1087,probes=200,rerank=100) [8bit]  | 37.85     | 177.5 MB   | 0.9658    | 23.8  | 42.10            |
+| cosine | tqivf (lists=1087,probes=200,rerank=200) [8bit]  | 37.85     | 177.5 MB   | 0.9658    | 23.6  | 42.38            |
+| cosine | tqivf (lists=1087,probes=200,rerank=2000) [8bit] | 37.85     | 177.5 MB   | 0.9658    | 20.2  | 49.59            |
+| cosine | tqivf (lists=1087,probes=400,rerank=100) [8bit]  | 37.85     | 177.5 MB   | 0.9874    | 12.2  | 82.26            |
+| cosine | tqivf (lists=1087,probes=400,rerank=200) [8bit]  | 37.85     | 177.5 MB   | 0.9874    | 12.1  | 82.80            |
+| cosine | tqivf (lists=1087,probes=400,rerank=2000) [8bit] | 37.85     | 177.5 MB   | 0.9874    | 10.9  | 91.48            |
+| cosine | hnsw (m=32,ef_construction=128,ef_search=100)    | 436.24    | 1541.5 MB  | 0.8386    | 81.7  | 12.24            |
+| cosine | ivfflat (lists=1087,probes=108)                  | 19.62     | 1032.2 MB  | 0.9374    | 17.8  | 56.16            |
+
+Results written to: bench/results/glove200_tqivf_x86.csv
+
+Dropping scratch schema bench_tqflat …
+Done. Connection closed.

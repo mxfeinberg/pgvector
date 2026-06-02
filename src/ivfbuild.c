@@ -129,7 +129,7 @@ SampleCallback(Relation index, ItemPointer tid, Datum *values,
 /*
  * Sample rows with same logic as ANALYZE
  */
-static void
+void
 SampleRows(IvfflatBuildState * buildstate)
 {
 	int			targsamples = buildstate->samples->maxlen;

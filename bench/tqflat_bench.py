@@ -357,6 +357,45 @@ def bench_ivfflat(conn, queries, k, gt, n, op="<->", opclass="vector_l2_ops", ve
     }
 
 
+def bench_tqivf_build(conn, opclass="vector_l2_ops", lists=100, fast_rotation=True):
+    """Build a tqivf index once; return (build_s, idx_bytes). probes/rerank are
+    query-time GUCs, so a single built index is reused across the whole sweep."""
+    fr = "true" if fast_rotation else "false"
+    ddl = (f"CREATE INDEX {INDEX_NAME} ON {TABLE} USING tqivf (v {opclass}) "
+           f"WITH (lists={lists}, fast_rotation={fr})")
+    print(f"  Building tqivf index ({opclass}, lists={lists}, fast_rotation={fr}) …",
+          end="", flush=True)
+    build_s = build_index_and_time(conn, ddl)
+    print(f" {build_s:.2f}s")
+    sz, _ = index_size(conn)
+    return build_s, sz
+
+
+def bench_tqivf_query(conn, queries, k, gt, lists, probes, rerank, build_s, idx_bytes,
+                      op="<->", force_scalar="off", verbose=False):
+    """Query an already-built tqivf index at a given (probes, rerank)."""
+    _execute(conn, f"SET tqivf.probes = {probes}")
+    _execute(conn, f"SET tqivf.rerank = {rerank}")
+    _execute(conn, f"SET tqivf.force_scalar = {force_scalar}")
+    _execute(conn, "SET enable_seqscan = off")
+    results, qps, avg_ms = run_queries(conn, queries, k, op=op, verbose=verbose, explain_first=verbose)
+    _execute(conn, "SET enable_seqscan = on")
+    rec = recall_at_k(results, gt, k)
+
+    kernel = "[float]" if force_scalar == "on" else "[8bit]"
+    label = f"tqivf (lists={lists},probes={probes},rerank={rerank}) {kernel}"
+    return {
+        "method": label,
+        "build_s": build_s,
+        "idx_size": format_bytes(idx_bytes),
+        "recall": rec,
+        "qps": qps,
+        "avg_ms": avg_ms,
+        "_build_s_raw": build_s,
+        "_idx_bytes": idx_bytes,
+    }
+
+
 def bench_tqflat_build(conn, bits, opclass="vector_l2_ops", fast_rotation=True, tq_prod=True):
     """Build tqflat index for a given bits value; return (build_s, idx_bytes)."""
     fr = "true" if fast_rotation else "false"
@@ -533,6 +572,27 @@ def parse_args():
                    help="A/B: score blocked tqflat with the float LUT (on) vs the 8-bit SIMD kernel (off, default)")
     p.add_argument("--no-hnsw", action="store_true", help="Skip hnsw benchmark")
     p.add_argument("--no-ivfflat", action="store_true", help="Skip ivfflat benchmark")
+    # tqivf options
+    p.add_argument("--tqivf-lists", type=int, default=None,
+                   help="tqivf number of IVF lists (default: sqrt(N), same heuristic as ivfflat)")
+    p.add_argument("--tqivf-probes", type=int, default=None,
+                   help="tqivf.probes at query time (default: lists/10, same heuristic as ivfflat)")
+    p.add_argument("--tqivf-rerank", type=int, default=200,
+                   help="tqivf.rerank candidate count at query time (default 200)")
+    p.add_argument("--tqivf-probes-list", type=int, nargs="+", default=None,
+                   help="Sweep these tqivf.probes values (build once, query each). "
+                        "Overrides --tqivf-probes. e.g. --tqivf-probes-list 10 30 99 200 400")
+    p.add_argument("--tqivf-reranks", type=int, nargs="+", default=None,
+                   help="Sweep these tqivf.rerank values (build once, query each). "
+                        "Overrides --tqivf-rerank. e.g. --tqivf-reranks 100 200 2000")
+    p.add_argument("--tqivf-fast-rotation", choices=["on", "off"], default="on",
+                   help="tqivf fast_rotation reloption (default on)")
+    p.add_argument("--tqivf-force-scalar", choices=["on", "off"], default="off",
+                   help="A/B: score tqivf blocks with float LUT (on) vs 8-bit SIMD kernel (off, default)")
+    p.add_argument("--no-tqivf", action="store_true", help="Skip tqivf benchmark")
+    p.add_argument("--methods", default=None,
+                   help="Comma-separated list of methods to run: tqflat,tqivf,hnsw,ivfflat,exact "
+                        "(default: all enabled methods; overrides --no-* flags)")
     p.add_argument("--csv", default="bench/results.csv", help="Output CSV path")
     p.add_argument("--verbose", action="store_true", help="Print EXPLAIN plans")
 
@@ -603,6 +663,25 @@ def main():
     results_rows = []
     multi = len(args.metric) > 1
 
+    # Resolve which methods to run.  --methods overrides the individual --no-* flags.
+    if args.methods is not None:
+        requested = set(m.strip() for m in args.methods.split(","))
+        run_exact = "exact" in requested
+        run_tqflat = "tqflat" in requested
+        run_tqivf = "tqivf" in requested
+        run_hnsw = "hnsw" in requested
+        run_ivfflat = "ivfflat" in requested
+    else:
+        run_exact = not args.no_exact
+        run_tqflat = True
+        run_tqivf = not args.no_tqivf
+        run_hnsw = not args.no_hnsw
+        run_ivfflat = not args.no_ivfflat
+
+    # Resolve tqivf list/probes counts (may depend on n, so compute here).
+    tqivf_lists = args.tqivf_lists if args.tqivf_lists is not None else max(1, int(n ** 0.5))
+    tqivf_probes = args.tqivf_probes if args.tqivf_probes is not None else max(1, tqivf_lists // 10)
+
     for metric in args.metric:
         op, opclass = METRICS[metric]
         print(f"\n========== metric: {metric}  (op {op}, opclass {opclass}) ==========")
@@ -618,32 +697,55 @@ def main():
             gt = compute_exact_ground_truth(conn, queries, op=op, k=k, verbose=args.verbose)
 
         # ---- Exact baseline (skippable; very slow at large N) ----
-        if not args.no_exact:
+        if run_exact:
             print(f"\n--- Exact seqscan ({metric}) ---")
             row = bench_exact(conn, queries, k, gt, op=op, verbose=args.verbose)
             row["metric"] = metric
             results_rows.append(row)
 
         # ---- tqflat: build each (bits) index once, query at each rerank ----
-        for bits in args.tqflat_bits:
-            print(f"\n--- tqflat {metric} bits={bits} ---")
-            fast = args.tqflat_fast_rotation == "on"
-            tqprod = args.tqflat_tq_prod == "on"
-            build_s, idx_bytes = bench_tqflat_build(conn, bits, opclass=opclass,
-                                                    fast_rotation=fast, tq_prod=tqprod)
-            tag = f" [{'fast' if fast else 'dense'}{'' if tqprod else ',noqjl'}]"
-            for rerank in args.tqflat_reranks:
-                print(f"  Querying rerank={rerank} …", end="", flush=True)
-                row = bench_tqflat_query(conn, queries, k, gt, bits, rerank,
-                                         build_s, idx_bytes, op=op, verbose=args.verbose,
-                                         force_scalar=args.tqflat_force_scalar)
-                row["method"] += tag
-                row["metric"] = metric
-                print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
-                results_rows.append(row)
+        if run_tqflat:
+            for bits in args.tqflat_bits:
+                print(f"\n--- tqflat {metric} bits={bits} ---")
+                fast = args.tqflat_fast_rotation == "on"
+                tqprod = args.tqflat_tq_prod == "on"
+                build_s, idx_bytes = bench_tqflat_build(conn, bits, opclass=opclass,
+                                                        fast_rotation=fast, tq_prod=tqprod)
+                tag = f" [{'fast' if fast else 'dense'}{'' if tqprod else ',noqjl'}]"
+                for rerank in args.tqflat_reranks:
+                    print(f"  Querying rerank={rerank} …", end="", flush=True)
+                    row = bench_tqflat_query(conn, queries, k, gt, bits, rerank,
+                                             build_s, idx_bytes, op=op, verbose=args.verbose,
+                                             force_scalar=args.tqflat_force_scalar)
+                    row["method"] += tag
+                    row["metric"] = metric
+                    print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
+                    results_rows.append(row)
+
+        # ---- tqivf: build once, query across the probes × rerank grid ----
+        if run_tqivf:
+            probes_sweep = args.tqivf_probes_list if args.tqivf_probes_list else [tqivf_probes]
+            reranks_sweep = args.tqivf_reranks if args.tqivf_reranks else [args.tqivf_rerank]
+            # probes can't exceed the number of lists
+            probes_sweep = sorted({min(p, tqivf_lists) for p in probes_sweep})
+            print(f"\n--- tqivf {metric} lists={tqivf_lists} "
+                  f"probes={probes_sweep} reranks={reranks_sweep} ---")
+            build_s, idx_bytes = bench_tqivf_build(
+                conn, opclass=opclass, lists=tqivf_lists,
+                fast_rotation=args.tqivf_fast_rotation == "on")
+            for probes in probes_sweep:
+                for rerank in reranks_sweep:
+                    print(f"  Querying probes={probes} rerank={rerank} …", end="", flush=True)
+                    row = bench_tqivf_query(conn, queries, k, gt, tqivf_lists, probes, rerank,
+                                            build_s, idx_bytes, op=op,
+                                            force_scalar=args.tqivf_force_scalar,
+                                            verbose=args.verbose)
+                    row["metric"] = metric
+                    print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
+                    results_rows.append(row)
 
         # ---- hnsw ----
-        if not args.no_hnsw:
+        if run_hnsw:
             print(f"\n--- HNSW ({metric}) ---")
             row = bench_hnsw(conn, queries, k, gt, dim, op=op, opclass=opclass,
                              ef_search=args.hnsw_ef_search, m=args.hnsw_m,
@@ -652,7 +754,7 @@ def main():
             results_rows.append(row)
 
         # ---- ivfflat ----
-        if not args.no_ivfflat:
+        if run_ivfflat:
             print(f"\n--- IVFFlat ({metric}) ---")
             row = bench_ivfflat(conn, queries, k, gt, n, op=op, opclass=opclass, verbose=args.verbose)
             row["metric"] = metric

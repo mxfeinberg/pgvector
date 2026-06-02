@@ -81,7 +81,7 @@ typedef struct TqBuildState
 /*
  * Get a new buffer with an exclusive lock (mirrors IvfflatNewBuffer).
  */
-static Buffer
+Buffer
 TqNewBuffer(Relation index, ForkNumber forkNum)
 {
 	Buffer		buf = ReadBufferExtended(index, forkNum, P_NEW, RBM_NORMAL, NULL);
@@ -91,31 +91,34 @@ TqNewBuffer(Relation index, ForkNumber forkNum)
 }
 
 /*
- * Initialize a tqflat page (mirrors IvfflatInitPage).
+ * Initialize a tqflat/tqivf page (mirrors IvfflatInitPage).
+ * pageId is TQ_PAGE_ID for tqflat pages, TQIVF_PAGE_ID for tqivf pages.
  */
-static void
-TqInitPage(Buffer buf, Page page)
+void
+TqInitPage(Buffer buf, Page page, uint16 pageId)
 {
 	PageInit(page, BufferGetPageSize(buf), sizeof(TqPageOpaqueData));
 	TqPageGetOpaque(page)->nextblkno = InvalidBlockNumber;
-	TqPageGetOpaque(page)->page_id = TQ_PAGE_ID;
+	TqPageGetOpaque(page)->page_id = pageId;
 }
 
 /*
  * Init and register a page within a GenericXLog transaction.
+ * pageId is TQ_PAGE_ID for tqflat pages, TQIVF_PAGE_ID for tqivf pages.
  */
-static void
-TqInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state)
+void
+TqInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state,
+				   uint16 pageId)
 {
 	*state = GenericXLogStart(index);
 	*page = GenericXLogRegisterBuffer(*state, *buf, GENERIC_XLOG_FULL_IMAGE);
-	TqInitPage(*buf, *page);
+	TqInitPage(*buf, *page, pageId);
 }
 
 /*
  * Commit a buffer (finish WAL record + release lock).
  */
-static void
+void
 TqCommitBuffer(Buffer buf, GenericXLogState *state)
 {
 	GenericXLogFinish(state);
@@ -124,11 +127,13 @@ TqCommitBuffer(Buffer buf, GenericXLogState *state)
 
 /*
  * Append a new page after the current one, linking via nextblkno.
+ * pageId is TQ_PAGE_ID for tqflat pages, TQIVF_PAGE_ID for tqivf pages.
  *
  * The order is very important (mirrors IvfflatAppendPage).
  */
-static void
-TqAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum)
+void
+TqAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state,
+			 ForkNumber forkNum, uint16 pageId)
 {
 	/* Get new buffer */
 	Buffer		newbuf = TqNewBuffer(index, forkNum);
@@ -138,7 +143,7 @@ TqAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, 
 	TqPageGetOpaque(*page)->nextblkno = BufferGetBlockNumber(newbuf);
 
 	/* Init new page */
-	TqInitPage(newbuf, newpage);
+	TqInitPage(newbuf, newpage, pageId);
 
 	/* Commit */
 	GenericXLogFinish(*state);
@@ -154,7 +159,7 @@ TqAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, 
 /*
  * Usable bytes on a freshly-initialized tqflat page (after header + special).
  */
-static Size
+Size
 TqPageCapacity(void)
 {
 	return BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(TqPageOpaqueData));
@@ -177,7 +182,7 @@ TqCreateMetaPage(TqBuildState * buildstate)
 
 	buf = TqNewBuffer(index, buildstate->forkNum);
 	Assert(BufferGetBlockNumber(buf) == TQ_METAPAGE_BLKNO);
-	TqInitRegisterPage(index, &buf, &page, &state);
+	TqInitRegisterPage(index, &buf, &page, &state, TQ_PAGE_ID);
 
 	metap = TqPageGetMeta(page);
 	metap->magicNumber = TQ_MAGIC_NUMBER;
@@ -211,11 +216,10 @@ TqCreateMetaPage(TqBuildState * buildstate)
  * Write a raw byte buffer across as many linked pages as needed.
  * Returns the first block number of the chain.
  */
-static BlockNumber
-TqWriteBytes(TqBuildState * buildstate, const char *bytes, Size nbytes)
+BlockNumber
+TqWriteBytes(Relation index, ForkNumber forkNum, const char *bytes, Size nbytes,
+			 uint16 pageId)
 {
-	Relation	index = buildstate->index;
-	ForkNumber	forkNum = buildstate->forkNum;
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
@@ -223,7 +227,7 @@ TqWriteBytes(TqBuildState * buildstate, const char *bytes, Size nbytes)
 	Size		offset = 0;
 
 	buf = TqNewBuffer(index, forkNum);
-	TqInitRegisterPage(index, &buf, &page, &state);
+	TqInitRegisterPage(index, &buf, &page, &state, pageId);
 	startBlock = BufferGetBlockNumber(buf);
 
 	while (offset < nbytes)
@@ -235,7 +239,7 @@ TqWriteBytes(TqBuildState * buildstate, const char *bytes, Size nbytes)
 		/* Reserve space for the item's line pointer + alignment */
 		if (avail <= sizeof(ItemIdData))
 		{
-			TqAppendPage(index, &buf, &page, &state, forkNum);
+			TqAppendPage(index, &buf, &page, &state, forkNum, pageId);
 			continue;
 		}
 
@@ -243,7 +247,7 @@ TqWriteBytes(TqBuildState * buildstate, const char *bytes, Size nbytes)
 		chunk = chunk - (chunk % MAXIMUM_ALIGNOF);	/* keep items aligned */
 		if (chunk == 0)
 		{
-			TqAppendPage(index, &buf, &page, &state, forkNum);
+			TqAppendPage(index, &buf, &page, &state, forkNum, pageId);
 			continue;
 		}
 		if (chunk > nbytes - offset)
@@ -286,7 +290,7 @@ TqCodeAppend(TqBuildState * buildstate, const char *bytes, Size nbytes)
 	{
 		buildstate->codeBuf = TqNewBuffer(index, forkNum);
 		TqInitRegisterPage(index, &buildstate->codeBuf, &buildstate->codePage,
-						   &buildstate->codeState);
+						   &buildstate->codeState, TQ_PAGE_ID);
 		buildstate->codeStart = BufferGetBlockNumber(buildstate->codeBuf);
 	}
 
@@ -300,7 +304,7 @@ TqCodeAppend(TqBuildState * buildstate, const char *bytes, Size nbytes)
 		if (avail <= sizeof(ItemIdData))
 		{
 			TqAppendPage(index, &buildstate->codeBuf, &buildstate->codePage,
-						 &buildstate->codeState, forkNum);
+						 &buildstate->codeState, forkNum, TQ_PAGE_ID);
 			continue;
 		}
 
@@ -309,7 +313,7 @@ TqCodeAppend(TqBuildState * buildstate, const char *bytes, Size nbytes)
 		if (chunk == 0)
 		{
 			TqAppendPage(index, &buildstate->codeBuf, &buildstate->codePage,
-						 &buildstate->codeState, forkNum);
+						 &buildstate->codeState, forkNum, TQ_PAGE_ID);
 			continue;
 		}
 		if (chunk > nbytes - offset)
@@ -364,7 +368,7 @@ TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes)
 	}
 
 	if (offset != nbytes)
-		elog(ERROR, "tqflat index side page chain shorter than expected");
+		elog(ERROR, "index side page chain shorter than expected");
 }
 
 /*
@@ -466,14 +470,17 @@ TqBuildModelAndSidePages(TqBuildState * buildstate, BlockNumber *rotStart,
 		 */
 		buildstate->model.rotation = palloc(rotBytes);
 		TqBuildRotation(dim, TQ_ROTATION_SEED, buildstate->model.rotation);
-		*rotStart = TqWriteBytes(buildstate, (const char *) buildstate->model.rotation, rotBytes);
+		*rotStart = TqWriteBytes(buildstate->index, buildstate->forkNum,
+								 (const char *) buildstate->model.rotation, rotBytes,
+								 TQ_PAGE_ID);
 	}
 
 	/* Write codebook: boundaries followed by centroids, contiguous */
 	cbBuf = palloc(cbBytes);
 	memcpy(cbBuf, buildstate->model.boundaries, sizeof(float) * nBnd);
 	memcpy(cbBuf + sizeof(float) * nBnd, buildstate->model.centroids, sizeof(float) * nLevels);
-	*cbStart = TqWriteBytes(buildstate, cbBuf, cbBytes);
+	*cbStart = TqWriteBytes(buildstate->index, buildstate->forkNum, cbBuf, cbBytes,
+							TQ_PAGE_ID);
 	pfree(cbBuf);
 
 	/*
@@ -497,7 +504,9 @@ TqBuildModelAndSidePages(TqBuildState * buildstate, BlockNumber *rotStart,
 		{
 			buildstate->model.qjl = palloc(rotBytes);
 			TqBuildQjl(dim, TQ_QJL_SEED, buildstate->model.qjl);
-			*qjlStart = TqWriteBytes(buildstate, (const char *) buildstate->model.qjl, rotBytes);
+			*qjlStart = TqWriteBytes(buildstate->index, buildstate->forkNum,
+									 (const char *) buildstate->model.qjl, rotBytes,
+									 TQ_PAGE_ID);
 		}
 		*qjlScale = (float) (sqrt(M_PI / 2.0) / (double) dimPadded);
 		buildstate->model.qjlScale = *qjlScale;
@@ -519,7 +528,7 @@ TqAppendEntry(TqBuildState * buildstate)
 	OffsetNumber offno;
 
 	if (PageGetFreeSpace(buildstate->page) < buildstate->entrySize)
-		TqAppendPage(index, &buildstate->buf, &buildstate->page, &buildstate->state, buildstate->forkNum);
+		TqAppendPage(index, &buildstate->buf, &buildstate->page, &buildstate->state, buildstate->forkNum, TQ_PAGE_ID);
 
 	offno = PageAddItem(buildstate->page, (Item) buildstate->entry, buildstate->entrySize,
 						InvalidOffsetNumber, false, false);
@@ -544,13 +553,13 @@ TqAppendSideRec(TqBuildState * buildstate, BlockNumber *sideStart,
 	{
 		buildstate->sideBuf = TqNewBuffer(index, buildstate->forkNum);
 		TqInitRegisterPage(index, &buildstate->sideBuf, &buildstate->sidePage,
-						   &buildstate->sideState);
+						   &buildstate->sideState, TQ_PAGE_ID);
 		*sideStart = BufferGetBlockNumber(buildstate->sideBuf);
 	}
 
 	if (PageGetFreeSpace(buildstate->sidePage) < sizeof(TqBlockSideRec))
 		TqAppendPage(index, &buildstate->sideBuf, &buildstate->sidePage,
-					 &buildstate->sideState, buildstate->forkNum);
+					 &buildstate->sideState, buildstate->forkNum, TQ_PAGE_ID);
 
 	offno = PageAddItem(buildstate->sidePage, (Item) rec, sizeof(TqBlockSideRec),
 						InvalidOffsetNumber, false, false);
@@ -987,7 +996,7 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		newblk = BufferGetBlockNumber(newbuf);
 		newstate = GenericXLogStart(index);
 		newpage = GenericXLogRegisterBuffer(newstate, newbuf, GENERIC_XLOG_FULL_IMAGE);
-		TqInitPage(newbuf, newpage);
+		TqInitPage(newbuf, newpage, TQ_PAGE_ID);
 		TqPageGetOpaque(newpage)->nextblkno = InvalidBlockNumber;
 		offno = PageAddItem(newpage, (Item) entry, entrySize,
 							InvalidOffsetNumber, false, false);
@@ -1113,7 +1122,7 @@ append_entry:
 			UnlockRelationForExtension(index, ExclusiveLock);
 
 			newpage = GenericXLogRegisterBuffer(state, newbuf, GENERIC_XLOG_FULL_IMAGE);
-			TqInitPage(newbuf, newpage);
+			TqInitPage(newbuf, newpage, TQ_PAGE_ID);
 
 			newblkno = BufferGetBlockNumber(newbuf);
 			TqPageGetOpaque(page)->nextblkno = newblkno;

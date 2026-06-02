@@ -324,6 +324,19 @@ extern bool tqinsert(Relation index, Datum *values, bool *isnull,
 extern TqModel *TqGetCachedModel(Relation index);
 extern void TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes);
 
+/*
+ * Build-time page helpers, exported for reuse by the tqivf access method.
+ * These operate on a (Relation, ForkNumber) page chain and are independent of
+ * any AM-specific build state.
+ */
+extern Buffer TqNewBuffer(Relation index, ForkNumber forkNum);
+extern void TqInitPage(Buffer buf, Page page, uint16 pageId);
+extern void TqInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, uint16 pageId);
+extern void TqCommitBuffer(Buffer buf, GenericXLogState *state);
+extern void TqAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state, ForkNumber forkNum, uint16 pageId);
+extern Size TqPageCapacity(void);
+extern BlockNumber TqWriteBytes(Relation index, ForkNumber forkNum, const char *bytes, Size nbytes, uint16 pageId);
+
 /* ---- tqscan.c ---- */
 extern IndexScanDesc tqbeginscan(Relation index, int nkeys, int norderbys);
 extern void tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);

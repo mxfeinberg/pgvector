@@ -1,0 +1,24 @@
+SET enable_seqscan = off;
+
+CREATE TABLE tqivf_b (id int, v vector(8));
+INSERT INTO tqivf_b SELECT g, ARRAY[g,g+1,g+2,g+3,g+4,g+5,g+6,g+7]::real[]::vector
+  FROM generate_series(1, 500) g;
+CREATE INDEX tqivf_b_idx ON tqivf_b USING tqivf (v vector_l2_ops) WITH (lists = 10);
+
+SELECT tqivf_test_meta('tqivf_b_idx');
+SELECT sum(c) FROM unnest(tqivf_test_list_counts('tqivf_b_idx')) AS c;
+SELECT cardinality(tqivf_test_list_counts('tqivf_b_idx'));
+
+CREATE INDEX ON tqivf_b USING tqivf (v vector_l2_ops) WITH (lists = 0);   -- ERROR: out of range
+CREATE INDEX ON tqivf_b USING tqivf (v vector_l2_ops) WITH (bits = 2);    -- ERROR: unrecognized parameter
+
+DROP TABLE tqivf_b;
+
+-- Multi-block-per-list: 100 identical vectors land in one list (lists=1),
+-- forcing ceil(100/32)=4 blocks in that list's code chain.
+CREATE TABLE tqivf_mb (id int, v vector(4));
+INSERT INTO tqivf_mb SELECT g, '[1,0,0,0]'::vector FROM generate_series(1, 100) g;
+CREATE INDEX tqivf_mb_idx ON tqivf_mb USING tqivf (v vector_l2_ops) WITH (lists = 1);
+SELECT tqivf_test_meta('tqivf_mb_idx');
+SELECT max(c) FROM unnest(tqivf_test_list_counts('tqivf_mb_idx')) AS c;
+DROP TABLE tqivf_mb;

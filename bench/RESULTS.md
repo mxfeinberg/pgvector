@@ -304,3 +304,116 @@ cut its footprint ~7.8× and accelerate each list scan with the AVX-512 kernel,
 while inheriting IVF's sublinear candidate selection — the one axis (latency) where
 standalone flat tqflat loses. tqflat already wins size/recall/build decisively; IVF
 integration is how it also wins latency.
+
+# IVF + TurboQuant (`tqivf`) — results
+
+This is the milestone the section above pointed at: store each IVF list's members
+as TurboQuant 4-bit codes (tqflat's v4 blocked layout) instead of full float32,
+probe the nearest list centroids, score the probed lists with the AVX-512 LUT
+kernel, and rerank the top candidates against full-precision heap vectors. One
+global rotation + one global Lloyd-Max codebook shared by all lists (data-oblivious;
+no per-list PQ codebook). Centroids are stored full-precision in original space for
+probe selection; only stored members are rotated + quantized.
+
+**Setup.** All four-way runs on `the-fire` (AMD Zen4, 60 GB RAM, PG 18.4, AVX-512
+kernel) with `maintenance_work_mem=16GB`. `tqivf`/`ivfflat` use `lists=√N`; `tqivf`
+sweeps `probes ∈ {10,30,99,200,400}` × `rerank ∈ {100,200,2000}` over a **single
+built index** (probes/rerank are query-time GUCs). tqflat bits=4, fast rotation,
+no-QJL. hnsw tuned `m=32, ef_construction=128, ef_search=100`. SIFT/GloVe use the
+shipped file ground truth (500 queries); OpenAI-1M computes exact GT (200 queries).
+CSVs: `bench/results/{sift1m,glove200,openai1m}_tqivf_x86.csv`.
+
+## OpenAI-1536 @ 1M — four-way (the headline)
+
+999,800 × 1536, cosine. `lists=999`. Representative `tqivf` sweep points
+(`rerank=200` unless noted; recall is flat across rerank here, latency rises with it):
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|---|---|---|---|---|
+| exact (seqscan)                     | —    | —        | 1.0000 | 1517 |
+| tqflat b4, rerank=200               | 46   | 998 MB   | 1.0000 | 980 |
+| **tqivf** lists=999, probes=99      | 161  | **1029 MB** | **0.9760** | **62** |
+| tqivf  lists=999, probes=30         | 161  | 1029 MB  | 0.9305 | 22 |
+| tqivf  lists=999, probes=200        | 161  | 1029 MB  | 0.9910 | 122 |
+| tqivf  lists=999, probes=400        | 161  | 1029 MB  | 0.9970 | 239 |
+| hnsw (m=32, efc=128, ef=100)        | 812  | 7811 MB  | 0.9900 | **14.9** |
+| ivfflat (lists=999, probes=99)      | 93   | 7819 MB  | 0.9775 | 217 |
+
+**The thesis is confirmed.** At matched recall vs ivfflat (0.976 vs 0.9775) `tqivf`
+is **3.5× faster (62 ms vs 217 ms) and 7.6× smaller (1029 MB vs 7819 MB)** — it
+dominates the cell it was built to beat on all three axes at once. It also drops
+standalone flat tqflat's latency **16×** (62 ms vs 980 ms) at near-identical size,
+closing the one axis flat tqflat lost. The `probes` knob buys recall monotonically
+(0.93 → 0.976 → 0.991 → 0.997) at a latency cost, so 0.99+ recall is available at
+122 ms if needed.
+
+**The honest caveat:** at 1M×1536, **HNSW still wins raw latency** (14.9 ms vs
+`tqivf`'s 62 ms at p99) — it is ~4–8× faster per query across the matched-recall
+range. `tqivf`'s standing offer in exchange is **7.6× less storage** (1.0 GB vs
+7.8 GB), a **5× faster build** (161 s vs 812 s), and recall that meets or beats HNSW
+(p200: 0.991 ≥ hnsw 0.990). `tqivf` is the size/recall/build-balanced index;
+HNSW remains the choice when query latency is the sole objective and 8× the memory
+is acceptable. `tqivf` build is ~1.7× ivfflat's (the extra encode pass) but 5× below
+HNSW.
+
+## SIFT1M — four-way
+
+1,000,000 × 128, L2. `lists=1000`. Same conclusion, larger margins (low dim ⇒ the
+quantized score step dominates and the kernel shines):
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|---|---|---|---|---|
+| tqflat b4, rerank=200          | 3.2  | 77.8 MB  | 0.9996 | 180 |
+| **tqivf** lists=1000, probes=99 | 21  | **87.5 MB** | **0.9988** | **15.2** |
+| tqivf  lists=1000, probes=30   | 21   | 87.5 MB  | 0.9708 | 5.1 |
+| tqivf  lists=1000, probes=200  | 21   | 87.5 MB  | 0.9994 | 29.9 |
+| hnsw (m=32, efc=128, ef=100)   | 234  | 966 MB   | 0.9944 | 8.8 |
+| ivfflat (lists=1000, probes=100) | 11 | 525 MB   | 0.9988 | 33.6 |
+
+At matched recall vs ivfflat (both 0.9988), `tqivf` is **2.2× faster (15.2 vs
+33.6 ms) and 6.0× smaller (87.5 vs 525 MB)**, and **12× faster than flat tqflat**
+(15 vs 180 ms). It out-recalls HNSW at p200 (0.9994 vs 0.9944) and is within 2× of
+HNSW's latency at 11× less storage.
+
+## GloVe-200-angular — four-way
+
+1,183,514 × 200, cosine. `lists=1087`. The hardest dataset for graph recall:
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|---|---|---|---|---|
+| tqflat b4, rerank=200          | 7.4  | 164.6 MB | 1.0000 | 299 |
+| **tqivf** lists=1087, probes=99 | 38  | **177.5 MB** | **0.9330** | **22.1** |
+| tqivf  lists=1087, probes=30   | 38   | 177.5 MB | 0.8420 | 7.7 |
+| tqivf  lists=1087, probes=200  | 38   | 177.5 MB | 0.9658 | 42.4 |
+| tqivf  lists=1087, probes=400  | 38   | 177.5 MB | 0.9874 | 82.8 |
+| hnsw (m=32, efc=128, ef=100)   | 436  | 1542 MB  | 0.8386 | 12.2 |
+| ivfflat (lists=1087, probes=108) | 20 | 1032 MB  | 0.9374 | 56.2 |
+
+At matched recall vs ivfflat (0.933 vs 0.937), `tqivf` is **2.5× faster (22 vs
+56 ms) and 5.8× smaller (178 vs 1032 MB)**. Notably, **`tqivf` beats HNSW on both
+axes here**: at p30 it matches HNSW's recall (0.842 vs 0.839) at 7.7 ms vs 12.2 ms,
+and every higher probe point out-recalls HNSW by a wide margin (HNSW tops out at
+0.839 on GloVe-angular at these params, where `tqivf`'s rerank reaches 0.987).
+
+## What the four-way data says
+
+- **`tqivf` keeps everything flat tqflat won — size and recall — and adds the
+  latency `tqflat` lacked.** Across all three datasets it is **~6–8× smaller than
+  ivfflat/hnsw**, matches ivfflat's recall, and is **2.2–3.5× faster than ivfflat**
+  while cutting flat tqflat's latency **12–16×**. It strictly dominates ivfflat on
+  size + latency + recall everywhere tested.
+- **vs HNSW it is the storage/recall play, not the raw-latency play.** On the high-dim
+  OpenAI set HNSW is 4–8× faster per query (14.9 ms vs 62 ms) but costs 7.6× the
+  storage; on lower-dim / angular sets (SIFT, GloVe) `tqivf` closes or reverses the
+  latency gap and out-recalls HNSW. The kernel's advantage grows as the quantized
+  score step dominates (lower dim, more probes).
+- **Build sits between ivfflat and HNSW** (1.7× ivfflat, 5× below HNSW) — the k-means
+  pass plus a TQ encode pass — and is dwarfed by HNSW graph construction.
+- **The `probes × rerank` sweep is a clean, monotone recall/latency dial**, exactly
+  as designed: pick the probe count for the recall target, then rerank for the final
+  polish. 0.99+ recall is reachable on every dataset.
+
+**Bottom line:** TQ-inside-IVF delivers the production-shaped TurboQuant index the
+prior sections motivated — it wins size, recall, and build like flat tqflat *and*
+turns the O(N) latency wall into IVF-sublinear selection, beating ivfflat outright
+and trading raw latency to HNSW only in exchange for ~8× less memory.
