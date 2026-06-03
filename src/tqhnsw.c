@@ -332,7 +332,8 @@ TqhnswGetCachedModel(Relation index)
 void
 TqhnswGetMetaInfo(Relation index, int *dim, TqMetric *metric, int *m,
 				  BlockNumber *entryBlkno, OffsetNumber *entryOffno,
-				  int *entryLevel)
+				  int *entryLevel, int *efConstruction,
+				  BlockNumber *firstElementPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -369,6 +370,10 @@ TqhnswGetMetaInfo(Relation index, int *dim, TqMetric *metric, int *m,
 		*entryOffno = metap->entryOffno;
 	if (entryLevel != NULL)
 		*entryLevel = metap->entryLevel;
+	if (efConstruction != NULL)
+		*efConstruction = metap->efConstruction;
+	if (firstElementPage != NULL)
+		*firstElementPage = metap->firstElementPage;
 
 	UnlockReleaseBuffer(buf);
 }
@@ -409,6 +414,15 @@ tqhnsw_test_meta(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 		index_close(index, AccessShareLock);
 		elog(ERROR, "tqhnsw index is not valid");
+	}
+
+	if (unlikely(metap->version != TQHNSW_VERSION))
+	{
+		uint32		v = metap->version;
+
+		UnlockReleaseBuffer(buf);
+		index_close(index, AccessShareLock);
+		elog(ERROR, "tqhnsw index version %u is unsupported; REINDEX required", v);
 	}
 
 	dim = metap->dimensions;
@@ -473,6 +487,15 @@ tqhnsw_test_graph(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 		index_close(index, AccessShareLock);
 		elog(ERROR, "tqhnsw index is not valid");
+	}
+
+	if (unlikely(metap->version != TQHNSW_VERSION))
+	{
+		uint32		v = metap->version;
+
+		UnlockReleaseBuffer(buf);
+		index_close(index, AccessShareLock);
+		elog(ERROR, "tqhnsw index version %u is unsupported; REINDEX required", v);
 	}
 
 	entryBlkno = metap->entryBlkno;

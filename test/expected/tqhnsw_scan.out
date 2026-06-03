@@ -43,6 +43,26 @@ SELECT id FROM tqhnsw_ip ORDER BY v <#> '[10,0,0,0]' LIMIT 3;  -- 300,299,298
  298
 (3 rows)
 
+-- block-vs-scalar exact agreement: both paths must return identical top-3 for IP
+SET tqhnsw.force_scalar = off;
+SELECT id FROM tqhnsw_ip ORDER BY v <#> '[10,0,0,0]' LIMIT 3;
+ id  
+-----
+ 300
+ 299
+ 298
+(3 rows)
+
+SET tqhnsw.force_scalar = on;
+SELECT id FROM tqhnsw_ip ORDER BY v <#> '[10,0,0,0]' LIMIT 3;
+ id  
+-----
+ 300
+ 299
+ 298
+(3 rows)
+
+RESET tqhnsw.force_scalar;
 DROP TABLE tqhnsw_ip;
 -- Cosine: all collinear -> ties; just confirms 3 rows, no error.
 CREATE TABLE tqhnsw_cos (id int, v vector(4));
@@ -82,4 +102,61 @@ SELECT id FROM (
 
 -- expect: 3,4,6,7 (id 5 absent)
 DROP TABLE tqhnsw_v;
+-- block-vs-scalar exact agreement checks: block (force_scalar=off) and scalar
+-- (force_scalar=on) must return identical results for each metric.
+-- L2: tqhnsw_s has vectors [g,0,0,0]; nearest to [5,0,0,0] are ids 3-7.
+-- Wrap in ORDER BY id to neutralize tie order (dist-1 tie at 4,6; dist-4 tie at 3,7).
+SET tqhnsw.ef_search = 100;
+SET tqhnsw.rerank = 100;
+SET tqhnsw.force_scalar = off;
+SELECT id FROM (SELECT id FROM tqhnsw_s ORDER BY v <-> '[5,0,0,0]' LIMIT 5) q ORDER BY id;
+ id 
+----
+  3
+  4
+  5
+  6
+  7
+(5 rows)
+
+SET tqhnsw.force_scalar = on;
+SELECT id FROM (SELECT id FROM tqhnsw_s ORDER BY v <-> '[5,0,0,0]' LIMIT 5) q ORDER BY id;
+ id 
+----
+  3
+  4
+  5
+  6
+  7
+(5 rows)
+
+RESET tqhnsw.force_scalar;
+-- Cosine: use a table with distinct directions so there are no distance ties.
+-- v = [g, 301-g, 0, 0] for g=1..300 gives each id a unique angle.
+-- Nearest to [1,0,0,0] (cosine) are ids 300,299,298 (highest ratio of dim-1 to dim-2).
+CREATE TABLE tqhnsw_cos2 (id int, v vector(4));
+INSERT INTO tqhnsw_cos2 SELECT g, ARRAY[g, 301-g, 0, 0]::real[]::vector FROM generate_series(1, 300) g;
+CREATE INDEX ON tqhnsw_cos2 USING tqhnsw (v vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+SET tqhnsw.ef_search = 200;
+SET tqhnsw.rerank = 200;
+SET tqhnsw.force_scalar = off;
+SELECT id FROM tqhnsw_cos2 ORDER BY v <=> '[1,0,0,0]' LIMIT 3;
+ id  
+-----
+ 300
+ 299
+ 298
+(3 rows)
+
+SET tqhnsw.force_scalar = on;
+SELECT id FROM tqhnsw_cos2 ORDER BY v <=> '[1,0,0,0]' LIMIT 3;
+ id  
+-----
+ 300
+ 299
+ 298
+(3 rows)
+
+RESET tqhnsw.force_scalar;
+DROP TABLE tqhnsw_cos2;
 DROP TABLE tqhnsw_s, tqhnsw_empty;

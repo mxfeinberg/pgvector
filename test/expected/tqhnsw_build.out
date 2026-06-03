@@ -37,4 +37,24 @@ SELECT tqhnsw_test_graph('tqhnsw_b_idx');
  nodes=500 entry_level_ge_0=t entry_has_neighbors=t
 (1 row)
 
+-- Post-build insert: verify that inserting after a real build does not corrupt the
+-- codebook page (element tuples must land on element pages, not block 1).
+INSERT INTO tqhnsw_b VALUES (501, ARRAY[1,1,1,1,1,1,1,1]::real[]::vector);
+-- The nearest neighbor of [1,1,...] is id=501 (exact match; distance=0).
+-- With seqscan off the planner must use the tqhnsw index.
+SET enable_seqscan = off;
+SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LIMIT 1;
+ id  
+-----
+ 501
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LIMIT 1;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Index Scan using tqhnsw_b_idx on tqhnsw_b
+         Order By: (v <-> '[1,1,1,1,1,1,1,1]'::vector)
+(3 rows)
+
 DROP TABLE tqhnsw_b;

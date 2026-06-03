@@ -540,3 +540,20 @@ ivfflat** (was 3.5×) at the same 7.6× size advantage. The tiny low-probe point
 (p10, 10–13 ms, dominated by fixed per-query overhead) are too small/variable to read
 as a kernel signal. CSVs: `bench/results/{sift1m,glove200,openai1m}_tqivf_x86.csv`
 (new) vs `*_oldkernel.csv` (v1 baseline).
+
+# TQ-HNSW (`tqhnsw`) vs HNSW — results
+
+This section will hold a direct head-to-head comparison of `tqhnsw` (TurboQuant-quantized
+HNSW: the HNSW graph topology with TQ 4-bit codes replacing the stored full-precision
+vectors at each node) against stock `hnsw` across the three standard ANN datasets
+(SIFT1M / GloVe-200-angular / OpenAI-1M×1536). The key axes are: **recall@10**,
+**QPS / avg latency (ms)**, **index size**, and **build time**. An `ef_search × rerank`
+sweep is run over a single built `tqhnsw` index (both are query-time GUCs, so one build
+covers the full grid). The `--tqhnsw-force-scalar` A/B flag (off = 8-bit SIMD block
+kernel, on = float LUT path) will also be reported to confirm the kernel label in the
+method string matches the measured latency. Expected benefit vs stock HNSW: smaller index
+(TQ 4-bit codes instead of float32 vectors stored at each node) with recall and QPS
+competitive across the `ef_search` sweep; `rerank` provides a final precision polish
+against full heap vectors.
+
+(numbers pending the sweep on `the-fire`)

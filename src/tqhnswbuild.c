@@ -48,6 +48,7 @@ typedef struct TqhnswBuildState
 	TqhnswElement *head;		/* in-memory build list */
 	TqhnswElement *entryPoint;
 	int64		nVectors;
+	BlockNumber firstElementPage;	/* first element page written during flush */
 
 	MemoryContext graphCtx;		/* owns all in-memory graph nodes */
 	MemoryContext tmpCtx;		/* per-tuple scratch */
@@ -160,6 +161,7 @@ TqhnswWriteModelAndMeta(Relation index, ForkNumber forkNum, int dim, TqMetric me
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+	metap->firstElementPage = InvalidBlockNumber;
 
 	TqCommitBuffer(metabuf, state);
 }
@@ -363,7 +365,7 @@ TqhnswBuildCallback(Relation index, ItemPointer tid, Datum *values,
 							CurrentMemoryContext /* ctx (unused on build path) */,
 							element, buildstate->entryPoint, buildstate->m,
 							buildstate->efConstruction, buildstate->dimCodes,
-							buildstate->metric);
+							buildstate->metric, false /* existing */);
 
 		if (element->level > buildstate->entryPoint->level)
 			buildstate->entryPoint = element;
@@ -409,6 +411,7 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 	/* Pass 1: write element tuples + neighbor-tuple placeholders. */
 	buf = TqNewBuffer(index, MAIN_FORKNUM);
 	TqInitRegisterPage(index, &buf, &page, &state, TQHNSW_PAGE_ID);
+	buildstate->firstElementPage = BufferGetBlockNumber(buf);
 
 	for (iter = buildstate->head; iter != NULL; iter = iter->next)
 	{
@@ -530,6 +533,8 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 		TqhnswMetaPage metap = TqhnswPageGetMeta(page);
 
 		metap->nVectors = (uint32) buildstate->nVectors;
+		metap->firstElementPage = buildstate->firstElementPage;
+		metap->insertPage = buildstate->firstElementPage;
 		if (buildstate->entryPoint != NULL)
 		{
 			metap->entryBlkno = buildstate->entryPoint->blkno;

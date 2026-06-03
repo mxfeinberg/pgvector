@@ -132,6 +132,28 @@ TqhnswInitSearchCandidate(TqhnswElement *element, double distance)
 }
 
 /*
+ * Whether element e counts toward ef during search.  Mirrors hnswutils.c
+ * CountElement: when skipElement is non-NULL (vacuum repair), elements being
+ * deleted (invalid heaptid) do NOT count toward ef, so the beam is sized over
+ * survivors.  For build/insert (skipElement == NULL) every element counts.
+ *
+ * Two intentional divergences from hnswutils.c CountElement:
+ *   1. Live-ness check uses ItemPointerIsValid(&e->heaptid) (single heaptid)
+ *      rather than heaptidsLength > 0, because tqhnsw stores exactly one heap
+ *      TID per element (no multi-TID deduplication).
+ *   2. The pg_memory_barrier() that hnswutils.c places here is omitted: tqhnsw
+ *      has no concurrent shared-memory in-memory build phase (single writer),
+ *      so no barrier is needed to order visibility of heaptid writes.
+ */
+static inline bool
+TqhnswCountElement(TqhnswElement *skipElement, TqhnswElement *e)
+{
+	if (skipElement == NULL)
+		return true;
+	return ItemPointerIsValid(&e->heaptid);
+}
+
+/*
  * Algorithm 2 from the paper (in-memory branch of HnswSearchLayer).
  *
  * ep is a List of TqhnswSearchCandidate * entry points (already distance-scored).
@@ -141,7 +163,7 @@ TqhnswInitSearchCandidate(TqhnswElement *element, double distance)
 static List *
 TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 				  MemoryContext ctx, TqhnswElement *query, List *ep, int ef, int lc,
-				  int m, int dc, TqMetric metric)
+				  int m, int dc, TqMetric metric, TqhnswElement *skipElement)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -158,7 +180,8 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 		sc->element->visitedGeneration = gen;
 		pairingheap_add(C, &sc->c_node);
 		pairingheap_add(W, &sc->w_node);
-		wlen++;
+		if (TqhnswCountElement(skipElement, sc->element))
+			wlen++;
 	}
 
 	while (!pairingheap_is_empty(C))
@@ -213,12 +236,25 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 				e = TqhnswInitSearchCandidate(eElement, eDistance);
 				pairingheap_add(C, &e->c_node);
 				pairingheap_add(W, &e->w_node);
-				wlen++;
-
-				if (wlen > ef)
+				if (TqhnswCountElement(skipElement, eElement))
 				{
-					pairingheap_remove_first(W);
-					wlen--;
+					wlen++;
+
+					/*
+					 * tqhnsw keeps the textbook Alg-2 invariant wlen == |W|
+					 * (decrement on eviction).  This intentionally differs from
+					 * hnswutils.c, which never decrements wlen because it tracks
+					 * "admitted-live-elements" for its discarded-heap /
+					 * iterative-scan path, which tqhnsw lacks.  For build/insert
+					 * (skipElement==NULL) the two are equivalent; on the vacuum
+					 * repair path (skipElement!=NULL) repaired-node recall is
+					 * validated separately by the vacuum recall TAP test.
+					 */
+					if (wlen > ef)
+					{
+						pairingheap_remove_first(W);
+						wlen--;
+					}
 				}
 			}
 		}
@@ -532,23 +568,65 @@ TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 }
 
 /*
+ * Remove self (skipElement, matched by block/offset) and any elements being
+ * deleted (invalid heaptid) from a candidate list before neighbor selection.
+ * Mirrors hnswutils.c RemoveElements.  Disk path only.
+ *
+ * As with TqhnswCountElement, live-ness is checked via a single heaptid
+ * (ItemPointerIsValid) rather than heaptidsLength, and no pg_memory_barrier()
+ * is needed (single-writer build; no concurrent in-memory graph).
+ */
+static List *
+TqhnswRemoveElements(List *w, TqhnswElement *skipElement)
+{
+	ListCell   *lc2;
+	List	   *w2 = NIL;
+
+	foreach(lc2, w)
+	{
+		TqhnswCandidate *hc = (TqhnswCandidate *) lfirst(lc2);
+		TqhnswElement *hce = TqhnswPtrAccess(NULL, hc->element);
+
+		if (skipElement != NULL &&
+			hce->blkno == skipElement->blkno && hce->offno == skipElement->offno)
+			continue;
+
+		if (ItemPointerIsValid(&hce->heaptid))
+			w2 = lappend(w2, hc);
+	}
+	return w2;
+}
+
+/*
  * Algorithm 1 from the paper (HnswFindElementNeighbors): greedy descent then
  * per-layer search + select + reciprocal connect.  element already has its level,
  * rhat, codes, and zero-initialized neighbor arrays.
  *
  * build path: base=NULL, index=NULL, model=NULL, cache=NULL.
+ * existing=true is used by vacuum repair: element is already in the graph and
+ * needs its neighbors re-selected (skip self, widen beam, no inline reciprocal).
  */
 void
 TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cache,
 					MemoryContext ctx, TqhnswElement *element,
 					TqhnswElement *entryPoint, int m,
-					int efConstruction, int dc, TqMetric metric)
+					int efConstruction, int dc, TqMetric metric, bool existing)
 {
 	List	   *ep;
 	List	   *w;
 	int			level = element->level;
-	int			entryLevel = entryPoint->level;
+	int			entryLevel;
 	int			lc;
+	TqhnswElement *skipElement = existing ? element : NULL;
+
+	/* No neighbors to select if there is no entry point (mirrors
+	 * HnswFindElementNeighbors).  Repair may pass NULL when the graph's entry
+	 * point was deleted with no surviving replacement; the element then gets an
+	 * empty neighbor list, consistent with HNSW. */
+	if (entryPoint == NULL)
+		return;
+
+	entryLevel = entryPoint->level;
 
 	/* Entry point candidate. */
 	ep = list_make1(TqhnswInitSearchCandidate(entryPoint,
@@ -559,12 +637,17 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 	/* 1st phase: greedy descent (ef=1) down to the element's level + 1. */
 	for (lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = TqhnswSearchLayer(base, index, model, cache, ctx, element, ep, 1, lc, m, dc, metric);
+		w = TqhnswSearchLayer(base, index, model, cache, ctx, element, ep, 1, lc, m, dc, metric,
+							  skipElement);
 		ep = w;
 	}
 
 	if (level > entryLevel)
 		level = entryLevel;
+
+	/* Add one for existing element (it will be filtered from its own candidate set). */
+	if (existing)
+		efConstruction++;
 
 	/* 2nd phase: per-layer search + select + connect. */
 	for (lc = level; lc >= 0; lc--)
@@ -575,7 +658,7 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 		ListCell   *lc2;
 
 		w = TqhnswSearchLayer(base, index, model, cache, ctx, element, ep, efConstruction,
-							  lc, m, dc, metric);
+							  lc, m, dc, metric, skipElement);
 
 		/* Convert search candidates to plain candidates. */
 		foreach(lc2, w)
@@ -587,6 +670,10 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 			hc->distance = sc->distance;
 			lw = lappend(lw, hc);
 		}
+
+		/* Disk path: drop self + deleted elements before selecting neighbors. */
+		if (index != NULL)
+			lw = TqhnswRemoveElements(lw, skipElement);
 
 		selected = TqhnswSelectNeighbors(base, lw, lm, dc, metric);
 
@@ -601,8 +688,11 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 			na->items[na->count].distance = hc->distance;
 			na->count++;
 
-			TqhnswUpdateConnection(base, neighbor, element, hc->distance, lm, lc,
-								   dc, metric);
+			/* Build + insert keep the in-memory reciprocal; repair (existing) does
+			 * not -- its reciprocity goes to disk via TqhnswUpdateNeighborsOnDisk. */
+			if (!existing)
+				TqhnswUpdateConnection(base, neighbor, element, hc->distance, lm, lc,
+									   dc, metric);
 		}
 
 		ep = w;

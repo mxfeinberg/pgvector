@@ -73,10 +73,18 @@ struct TqhnswNeighborArray
  */
 #define TQHNSW_UPDATE_LOCK 0
 
+/*
+ * Page-lock id used to drain in-flight scans before vacuum's MarkDeleted pass
+ * reclaims tuple slots, mirroring HNSW's HNSW_SCAN_LOCK.  Scans hold it ShareLock
+ * while loading graph candidates; MarkDeleted (a future task) takes it ExclusiveLock
+ * to drain.
+ */
+#define TQHNSW_SCAN_LOCK 1
+
 /* Page layout */
 #define TQHNSW_METAPAGE_BLKNO 0
 #define TQHNSW_MAGIC_NUMBER 0x71685451	/* distinct from tqflat 0x71665451 / tqivf 0x71715451 */
-#define TQHNSW_VERSION 1
+#define TQHNSW_VERSION 2
 #define TQHNSW_PAGE_ID 0xFF94			/* distinct from tqflat 0xFF92 / tqivf 0xFF93 */
 
 /* Tuple type tags */
@@ -148,7 +156,10 @@ typedef struct TqhnswMetaPageData
 	BlockNumber entryBlkno;		/* graph entry point element tuple */
 	OffsetNumber entryOffno;
 	int16		entryLevel;		/* -1 when empty */
-	BlockNumber insertPage;		/* reserved; unused in MVP */
+	BlockNumber insertPage;		/* element-page hint for inserts */
+	BlockNumber firstElementPage;	/* head of the element-page nextblkno chain
+									 * (after meta + codebook/rotation side pages);
+									 * vacuum walks this chain */
 }			TqhnswMetaPageData;
 
 typedef TqhnswMetaPageData * TqhnswMetaPage;
@@ -164,8 +175,8 @@ typedef struct TqhnswElementTupleData
 {
 	uint8		type;			/* TQHNSW_ELEMENT_TUPLE_TYPE */
 	uint8		level;
-	uint8		deleted;		/* reserved; MVP never sets (heap visibility handles deletes) */
-	uint8		version;
+	uint8		deleted;		/* tombstone: set by vacuum MarkDeleted; slot reusable by insert */
+	uint8		version;		/* bumped on tombstone (1..15 wrap); carried on slot reuse */
 	ItemPointerData heaptid;	/* the indexed heap row (single; no dup-merge in MVP) */
 	ItemPointerData neighbortid;
 	float		norm;			/* stripped L2 length */
@@ -202,7 +213,8 @@ extern TqModel *TqhnswLoadModel(Relation index, MemoryContext ctx);
 extern TqModel *TqhnswGetCachedModel(Relation index);
 extern void TqhnswGetMetaInfo(Relation index, int *dim, TqMetric *metric, int *m,
 							  BlockNumber *entryBlkno, OffsetNumber *entryOffno,
-							  int *entryLevel);
+							  int *entryLevel, int *efConstruction,
+							  BlockNumber *firstElementPage);
 
 /*
  * In-memory graph node used during the serial build (absolute pointers; no
@@ -254,11 +266,14 @@ extern void TqhnswUpdateConnection(char *base, TqhnswElement *target,
 								   TqhnswElement *element, double distance,
 								   int lm, int lc, int dc, TqMetric metric);
 
-/* Insert element into the graph (paper Alg 1).  build path: base=NULL, index=NULL. */
+/* Insert element into the graph (paper Alg 1).  build path: base=NULL, index=NULL.
+ * existing=true is used by vacuum repair: element is already in the graph and needs
+ * its neighbors re-selected (skip self, widen beam, no inline reciprocal connect). */
 extern void TqhnswInsertElement(char *base, Relation index, const TqModel *model,
 								HTAB *cache, MemoryContext ctx,
 								TqhnswElement *element, TqhnswElement *entryPoint,
-								int m, int efConstruction, int dc, TqMetric metric);
+								int m, int efConstruction, int dc, TqMetric metric,
+								bool existing);
 
 /*
  * Per-insert element cache entry: TID -> materialized graph node. The key
@@ -301,8 +316,56 @@ extern bool tqhnswgettuple(IndexScanDesc scan, ScanDirection dir);
 extern void tqhnswendscan(IndexScanDesc scan);
 
 /* ---- tqhnswvacuum.c ---- */
+
+/*
+ * Shared state threaded through the three vacuum passes (RemoveHeapTids ->
+ * RepairGraph -> MarkDeleted).  Mirrors HnswVacuumState; the single-heaptid
+ * element layout means there is no heaptids[] array to compact, and highestPoint
+ * is tracked as a (blkno, offno, level) triple rather than an HnswElement.
+ */
+typedef struct TqhnswVacuumState
+{
+	Relation	index;
+	IndexBulkDeleteResult *stats;
+	IndexBulkDeleteCallback callback;
+	void	   *callback_state;
+	const TqModel *model;
+	TqMetric	metric;
+	int			m;
+	int			efConstruction;
+	int			dimCodes;
+	BlockNumber firstElementPage;
+	HTAB	   *deleted;			/* set of dead element TIDs (key = ItemPointerData) */
+	BlockNumber highestBlkno;		/* highest live non-entry-point element; Invalid when none */
+	OffsetNumber highestOffno;
+	int			highestLevel;
+	MemoryContext tmpCtx;
+	BufferAccessStrategy bas;
+}			TqhnswVacuumState;
+
 extern IndexBulkDeleteResult *tqhnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 											   IndexBulkDeleteCallback callback, void *callback_state);
 extern IndexBulkDeleteResult *tqhnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+
+/* ---- tqhnswinsert.c (exposed for vacuum repair) ---- */
+
+typedef enum TqhnswEntryUpdate
+{
+	TQHNSW_ENTRY_NO_UPDATE = 0,	/* leave entry point unchanged */
+	TQHNSW_ENTRY_GREATER,		/* set only if newElement->level > current entry level */
+	TQHNSW_ENTRY_ALWAYS			/* force entry point to newElement (may be NULL -> empty) */
+}			TqhnswEntryUpdate;
+
+/* exposed for vacuum repair (full neighbor-tuple overwrite) */
+extern void TqhnswSetNeighborTuple(TqhnswNeighborTuple ntup, TqhnswElement *e, int m);
+
+/* exposed for vacuum repair (writes reciprocal edges back to the element) */
+extern void TqhnswUpdateNeighborsOnDisk(Relation index, const TqModel *model,
+										TqMetric metric, HTAB *cache, MemoryContext ctx,
+										TqhnswElement *newElement, int m, int dc);
+
+/* extended meta-update used by insert + vacuum */
+extern void TqhnswUpdateMetaPage(Relation index, TqhnswElement *newElement,
+								 TqhnswEntryUpdate entryUpdate, BlockNumber newInsertPage);
 
 #endif							/* TQHNSW_H */

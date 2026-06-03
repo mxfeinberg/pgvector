@@ -14,6 +14,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "tqhnsw.h"
 #include "utils/float.h"
 #include "utils/hsearch.h"
@@ -41,6 +42,17 @@ typedef struct TqhnswScanResult
 	OffsetNumber offno;
 }			TqhnswScanResult;
 
+/* One scored neighbor produced by TqhnswExpandNode (block path, sub-project #5). */
+typedef struct TqhnswNeighborScore
+{
+	double		dist;			/* value to MINIMIZE (quantized estimate) */
+	ItemPointerData heaptid;
+	BlockNumber blkno;
+	OffsetNumber offno;
+	uint8		level;
+	ItemPointerData neighbortid;
+}			TqhnswNeighborScore;
+
 /*
  * Scan state.  Combines tqscan.c's LUT/rerank fields with HNSW scan state (the
  * graph entry point + m).
@@ -64,6 +76,16 @@ typedef struct TqhnswScanOpaqueData
 	float	   *lut;			/* dimCodes * nLevels */
 	Vector	   *queryVec;		/* normalized query (for rerank / cosine) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
+
+	/* 8-bit query LUT for the block kernel (built each rescan, mirrors tqivf). */
+	uint8	   *lut8;			/* dimCodes * nLevels */
+	float		lutBias;
+	float		lutScale;
+
+	/* Block-expansion scratch, allocated once per rescan, reused per node. */
+	TqhnswNeighborScore *expandOut;	/* >= TQHNSW_MAX_M*2 entries */
+	char	   *expandCodes;	/* codesBytes * TQHNSW_MAX_M*2 (gathered row-major codes) */
+	uint8	   *expandPlane;	/* TQ_BLOCK_CODE_BYTES(dimCodes) */
 
 	/* Results + rerank. */
 	TqhnswScanResult *results;
@@ -93,6 +115,7 @@ typedef struct TqhnswScanCandidate
 	BlockNumber blkno;
 	OffsetNumber offno;
 	ItemPointerData heaptid;
+	ItemPointerData neighbortid;	/* the candidate's neighbor-tuple location */
 }			TqhnswScanCandidate;
 
 #define TqhnswGetCandidate(membername, ptr) \
@@ -248,6 +271,121 @@ TqhnswLoadNeighborTids(Relation index, BlockNumber neighborPage,
 }
 
 /*
+ * Score a node's neighbor slice (indextids[0..lm), stopping at the first invalid
+ * TID) with the 8-bit block kernel.  Gathers each neighbor's codes page-by-page
+ * (one SHARE lock at a time, codes copied out), scatters them into a transient
+ * coordinate-strided plane in chunks of TQ_BLOCK_WIDTH, runs TqScoreBlockRange,
+ * and converts each lane sum to a distance.  Writes one TqhnswNeighborScore per
+ * valid neighbor into so->expandOut and returns the count.
+ */
+static int
+TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
+				 const ItemPointerData *indextids, int lm)
+{
+	TqModel    *model = so->model;
+	int			dc = model->dimCodes;
+	int			codesBytes = TQ_CODES_BYTES(dc, model->bits);
+	Size		planeBytes = TQ_BLOCK_CODE_BYTES(dc);
+	TqhnswNeighborScore *out = so->expandOut;
+	float		norms[TQHNSW_MAX_M * 2];
+	float		scales[TQHNSW_MAX_M * 2];
+	int			order[TQHNSW_MAX_M * 2];
+	int			nv = 0;
+	int			i,
+				k,
+				chunk;
+
+	/* 1. Collect valid TIDs (stop at first invalid, matching the scalar loops). */
+	for (i = 0; i < lm; i++)
+	{
+		if (!ItemPointerIsValid(&indextids[i]))
+			break;
+		order[nv++] = i;
+	}
+	if (nv == 0)
+		return 0;
+
+	/* 2. Sort the collected indices by block number (insertion sort; nv is small). */
+	for (i = 1; i < nv; i++)
+	{
+		int			key = order[i];
+		BlockNumber kb = ItemPointerGetBlockNumber(&indextids[key]);
+		int			j = i - 1;
+
+		while (j >= 0 && ItemPointerGetBlockNumber(&indextids[order[j]]) > kb)
+		{
+			order[j + 1] = order[j];
+			j--;
+		}
+		order[j + 1] = key;
+	}
+
+	/* 3. Page-grouped gather: one buffer SHARE lock per distinct page at a time. */
+	k = 0;
+	while (k < nv)
+	{
+		BlockNumber blk = ItemPointerGetBlockNumber(&indextids[order[k]]);
+		Buffer		buf = ReadBuffer(index, blk);
+		Page		page;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		while (k < nv && ItemPointerGetBlockNumber(&indextids[order[k]]) == blk)
+		{
+			int			orig = order[k];
+			OffsetNumber off = ItemPointerGetOffsetNumber(&indextids[orig]);
+			TqhnswElementTuple etup =
+				(TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, off));
+			TqhnswNeighborScore *o = &out[orig];
+
+			memcpy(so->expandCodes + (Size) orig * codesBytes, etup->codes, codesBytes);
+			norms[orig] = etup->norm;
+			scales[orig] = etup->scale;
+			o->heaptid = etup->heaptid;
+			o->blkno = blk;
+			o->offno = off;
+			o->level = etup->level;
+			o->neighbortid = etup->neighbortid;
+			k++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+
+	/* 4. Scatter + score in chunks of TQ_BLOCK_WIDTH; convert lane -> est -> dist. */
+	for (chunk = 0; chunk < nv; chunk += TQ_BLOCK_WIDTH)
+	{
+		int			n = Min(TQ_BLOCK_WIDTH, nv - chunk);
+		TqBlockAccum acc;
+		int			lane;
+
+		memset(so->expandPlane, 0, planeBytes);
+		for (lane = 0; lane < n; lane++)
+			TqScatterCodes(model,
+						   so->expandCodes + (Size) (chunk + lane) * codesBytes,
+						   lane, so->expandPlane);
+
+		TqBlockAccumInit(&acc);
+		TqScoreBlockRange(so->lut8, so->expandPlane, 0, dc, &acc);
+		TqBlockAccumFinish(&acc);
+
+		for (lane = 0; lane < n; lane++)
+		{
+			int			idx = chunk + lane;
+			double		mse = (double) so->lutScale * acc.acc32[lane]
+				+ (double) dc * so->lutBias;
+			float		est = (float) ((double) scales[idx] * mse);
+
+			out[idx].dist = TqhnswEstToDist(so->metric, so->qNormSq, norms[idx], est);
+		}
+	}
+
+	/* expandOut[i] corresponds to indextids[i] (original neighbor order), so the
+	 * block beam admits neighbors in the same order as the scalar path. */
+	return nv;
+}
+
+/*
  * Run the quantized graph traversal: greedy ef=1 descent through the upper
  * levels, then a level-0 ef beam.  Fills so->results with up to ef_search
  * candidates scored by the ADC LUT.  Mirrors GetScanItems + HnswSearchLayer's
@@ -309,33 +447,54 @@ TqhnswSearchGraph(IndexScanDesc scan)
 			changed = false;
 			lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, lc, indextids);
 
-			for (i = 0; i < lm; i++)
+			if (tqhnsw_force_scalar)
 			{
-				ItemPointer indextid = &indextids[i];
-				BlockNumber nblk;
-				OffsetNumber noff;
-				ItemPointerData nheaptid;
-				ItemPointerData nneighbortid;
-				uint8		nlevel;
-				double		ndist;
-
-				if (!ItemPointerIsValid(indextid))
-					break;
-
-				nblk = ItemPointerGetBlockNumber(indextid);
-				noff = ItemPointerGetOffsetNumber(indextid);
-				ndist = TqhnswScoreElement(so, index, nblk, noff,
-										   &nheaptid, &nlevel, &nneighbortid);
-
-				if (ndist < curDist)
+				for (i = 0; i < lm; i++)
 				{
-					curDist = ndist;
-					curBlkno = nblk;
-					curOffno = noff;
-					curHeaptid = nheaptid;
-					curNeighbortid = nneighbortid;
-					curLevel = nlevel;
-					changed = true;
+					ItemPointer indextid = &indextids[i];
+					BlockNumber nblk;
+					OffsetNumber noff;
+					ItemPointerData nheaptid;
+					ItemPointerData nneighbortid;
+					uint8		nlevel;
+					double		ndist;
+
+					if (!ItemPointerIsValid(indextid))
+						break;
+
+					nblk = ItemPointerGetBlockNumber(indextid);
+					noff = ItemPointerGetOffsetNumber(indextid);
+					ndist = TqhnswScoreElement(so, index, nblk, noff,
+											   &nheaptid, &nlevel, &nneighbortid);
+
+					if (ndist < curDist)
+					{
+						curDist = ndist;
+						curBlkno = nblk;
+						curOffno = noff;
+						curHeaptid = nheaptid;
+						curNeighbortid = nneighbortid;
+						curLevel = nlevel;
+						changed = true;
+					}
+				}
+			}
+			else
+			{
+				int			nv = TqhnswExpandNode(so, index, indextids, lm);
+
+				for (i = 0; i < nv; i++)
+				{
+					if (so->expandOut[i].dist < curDist)
+					{
+						curDist = so->expandOut[i].dist;
+						curBlkno = so->expandOut[i].blkno;
+						curOffno = so->expandOut[i].offno;
+						curHeaptid = so->expandOut[i].heaptid;
+						curNeighbortid = so->expandOut[i].neighbortid;
+						curLevel = so->expandOut[i].level;
+						changed = true;
+					}
 				}
 			}
 		}
@@ -358,6 +517,7 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	entry->blkno = curBlkno;
 	entry->offno = curOffno;
 	entry->heaptid = curHeaptid;
+	entry->neighbortid = curNeighbortid;
 	pairingheap_add(C, &entry->c_node);
 	pairingheap_add(W, &entry->w_node);
 	wlen = 1;
@@ -371,69 +531,106 @@ TqhnswSearchGraph(IndexScanDesc scan)
 		TqhnswScanCandidate *c = TqhnswGetCandidate(c_node, pairingheap_remove_first(C));
 		TqhnswScanCandidate *f = TqhnswGetCandidate(w_node, pairingheap_first(W));
 		ItemPointerData indextids[TQHNSW_MAX_M * 2];
-		ItemPointerData cNeighbortid;
 		BlockNumber nbrPage;
 		OffsetNumber nbrOffno;
 		int			lm;
 		int			i;
+		int			nv;
 
 		CHECK_FOR_INTERRUPTS();
 
 		if (c->distance > f->distance)
 			break;
 
-		/* Reread c's element to obtain its neighbor tuple location. */
-		(void) TqhnswScoreElement(so, index, c->blkno, c->offno, NULL, NULL,
-								  &cNeighbortid);
-
-		nbrPage = ItemPointerGetBlockNumber(&cNeighbortid);
-		nbrOffno = ItemPointerGetOffsetNumber(&cNeighbortid);
+		nbrPage = ItemPointerGetBlockNumber(&c->neighbortid);
+		nbrOffno = ItemPointerGetOffsetNumber(&c->neighbortid);
 		lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, 0, indextids);
 
-		for (i = 0; i < lm; i++)
+		if (tqhnsw_force_scalar)
 		{
-			ItemPointer indextid = &indextids[i];
-			BlockNumber nblk;
-			OffsetNumber noff;
-			ItemPointerData nheaptid;
-			uint8		nlevel;
-			double		ndist;
-			bool		alwaysAdd = wlen < ef;
-			TqhnswScanCandidate *e;
-
-			if (!ItemPointerIsValid(indextid))
-				break;
-
-			nblk = ItemPointerGetBlockNumber(indextid);
-			noff = ItemPointerGetOffsetNumber(indextid);
-
-			key.blkno = nblk;
-			key.offno = noff;
-			hash_search(visited, &key, HASH_ENTER, &found);
-			if (found)
-				continue;
-
-			f = TqhnswGetCandidate(w_node, pairingheap_first(W));
-
-			ndist = TqhnswScoreElement(so, index, nblk, noff, &nheaptid,
-									   &nlevel, NULL);
-
-			if (!(ndist < f->distance || alwaysAdd))
-				continue;
-
-			e = palloc(sizeof(TqhnswScanCandidate));
-			e->distance = ndist;
-			e->blkno = nblk;
-			e->offno = noff;
-			e->heaptid = nheaptid;
-			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
-			wlen++;
-
-			if (wlen > ef)
+			for (i = 0; i < lm; i++)
 			{
-				(void) pairingheap_remove_first(W);
-				wlen--;
+				ItemPointer indextid = &indextids[i];
+				BlockNumber nblk;
+				OffsetNumber noff;
+				ItemPointerData nheaptid;
+				ItemPointerData nneighbortid;
+				uint8		nlevel;
+				double		ndist;
+				bool		alwaysAdd = wlen < ef;
+				TqhnswScanCandidate *e;
+
+				if (!ItemPointerIsValid(indextid))
+					break;
+
+				nblk = ItemPointerGetBlockNumber(indextid);
+				noff = ItemPointerGetOffsetNumber(indextid);
+
+				key.blkno = nblk;
+				key.offno = noff;
+				hash_search(visited, &key, HASH_ENTER, &found);
+				if (found)
+					continue;
+
+				f = TqhnswGetCandidate(w_node, pairingheap_first(W));
+
+				ndist = TqhnswScoreElement(so, index, nblk, noff, &nheaptid,
+										   &nlevel, &nneighbortid);
+
+				if (!(ndist < f->distance || alwaysAdd))
+					continue;
+
+				e = palloc(sizeof(TqhnswScanCandidate));
+				e->distance = ndist;
+				e->blkno = nblk;
+				e->offno = noff;
+				e->heaptid = nheaptid;
+				e->neighbortid = nneighbortid;
+				pairingheap_add(C, &e->c_node);
+				pairingheap_add(W, &e->w_node);
+				wlen++;
+
+				if (wlen > ef)
+				{
+					(void) pairingheap_remove_first(W);
+					wlen--;
+				}
+			}
+		}
+		else
+		{
+			nv = TqhnswExpandNode(so, index, indextids, lm);
+
+			for (i = 0; i < nv; i++)
+			{
+				TqhnswNeighborScore *o = &so->expandOut[i];
+				bool		alwaysAdd = wlen < ef;
+				TqhnswScanCandidate *e;
+
+				key.blkno = o->blkno;
+				key.offno = o->offno;
+				hash_search(visited, &key, HASH_ENTER, &found);
+				if (found)
+					continue;
+
+				f = TqhnswGetCandidate(w_node, pairingheap_first(W));
+				if (!(o->dist < f->distance || alwaysAdd))
+					continue;
+
+				e = palloc(sizeof(TqhnswScanCandidate));
+				e->distance = o->dist;
+				e->blkno = o->blkno;
+				e->offno = o->offno;
+				e->heaptid = o->heaptid;
+				e->neighbortid = o->neighbortid;
+				pairingheap_add(C, &e->c_node);
+				pairingheap_add(W, &e->w_node);
+				wlen++;
+				if (wlen > ef)
+				{
+					(void) pairingheap_remove_first(W);
+					wlen--;
+				}
 			}
 		}
 	}
@@ -537,7 +734,8 @@ tqhnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	/* Entry point + m from the meta page. */
 	TqhnswGetMetaInfo(index, &dim, &so->metric, &so->m,
-					  &so->entryBlkno, &so->entryOffno, &so->entryLevel);
+					  &so->entryBlkno, &so->entryOffno, &so->entryLevel,
+					  NULL, NULL);
 
 	scan->opaque = so;
 
@@ -584,6 +782,10 @@ tqhnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->lut = NULL;
 	so->queryVec = NULL;
 	so->results = NULL;
+	so->lut8 = NULL;
+	so->expandOut = NULL;
+	so->expandCodes = NULL;
+	so->expandPlane = NULL;
 
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 	if (scan->orderByData != NULL &&
@@ -613,6 +815,18 @@ tqhnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 		so->lut = palloc(sizeof(float) * model->dimCodes * model->nLevels);
 		TqBuildQueryLut(model, q->x, so->lut, NULL);
+
+		so->lut8 = palloc(model->dimCodes * model->nLevels);
+		TqBuildLut8(model, so->lut, so->lut8, &so->lutBias, &so->lutScale);
+
+		{
+			int			codesBytes = TQ_CODES_BYTES(model->dimCodes, model->bits);
+			int			maxNbr = TQHNSW_MAX_M * 2;
+
+			so->expandOut = palloc(sizeof(TqhnswNeighborScore) * maxNbr);
+			so->expandCodes = palloc((Size) codesBytes * maxNbr);
+			so->expandPlane = palloc(TQ_BLOCK_CODE_BYTES(model->dimCodes));
+		}
 	}
 
 	MemoryContextSwitchTo(oldCtx);
@@ -649,8 +863,24 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
+		/*
+		 * Acquire a shared scan lock before reading the index graph.  This
+		 * allows a future vacuum MarkDeleted pass to take ExclusiveLock and
+		 * drain all in-flight scans before reclaiming tuple slots, preventing
+		 * a concurrent scan from resolving a neighbor TID to a slot-reused
+		 * element.  Mirrors HNSW's HNSW_SCAN_LOCK pattern.
+		 *
+		 * The lock is released immediately after graph traversal, before any
+		 * heap fetches, to avoid holding it across heap buffer locks (which
+		 * could deadlock).
+		 */
+		LockPage(scan->indexRelation, TQHNSW_SCAN_LOCK, ShareLock);
+
 		/* Quantized graph traversal. */
 		TqhnswSearchGraph(scan);
+
+		/* Release the scan lock; heap rerank fetches happen outside it. */
+		UnlockPage(scan->indexRelation, TQHNSW_SCAN_LOCK, ShareLock);
 
 		/*
 		 * Rerank the top candidates against full-precision heap vectors.  Rows

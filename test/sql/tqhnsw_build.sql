@@ -21,4 +21,14 @@ CREATE INDEX tqhnsw_b_idx ON tqhnsw_b USING tqhnsw (v vector_l2_ops) WITH (m = 8
 SELECT regexp_replace(tqhnsw_test_meta('tqhnsw_b_idx'), ' entry_level=.*', '');
 -- entry node has >0 level-0 neighbors and the graph has 500 nodes (stable predicates):
 SELECT tqhnsw_test_graph('tqhnsw_b_idx');
+
+-- Post-build insert: verify that inserting after a real build does not corrupt the
+-- codebook page (element tuples must land on element pages, not block 1).
+INSERT INTO tqhnsw_b VALUES (501, ARRAY[1,1,1,1,1,1,1,1]::real[]::vector);
+-- The nearest neighbor of [1,1,...] is id=501 (exact match; distance=0).
+-- With seqscan off the planner must use the tqhnsw index.
+SET enable_seqscan = off;
+SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LIMIT 1;
+EXPLAIN (COSTS OFF) SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LIMIT 1;
+
 DROP TABLE tqhnsw_b;

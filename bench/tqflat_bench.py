@@ -396,6 +396,45 @@ def bench_tqivf_query(conn, queries, k, gt, lists, probes, rerank, build_s, idx_
     }
 
 
+def bench_tqhnsw_build(conn, opclass="vector_l2_ops", m=16, ef_construction=64, fast_rotation=True):
+    """Build a tqhnsw index once; return (build_s, idx_bytes). ef_search/rerank are
+    query-time GUCs, so a single built index is reused across the whole sweep."""
+    fr = "true" if fast_rotation else "false"
+    ddl = (f"CREATE INDEX {INDEX_NAME} ON {TABLE} USING tqhnsw (v {opclass}) "
+           f"WITH (m={m}, ef_construction={ef_construction}, fast_rotation={fr})")
+    print(f"  Building tqhnsw index ({opclass}, m={m}, ef_construction={ef_construction}, fast_rotation={fr}) …",
+          end="", flush=True)
+    build_s = build_index_and_time(conn, ddl)
+    print(f" {build_s:.2f}s")
+    sz, _ = index_size(conn)
+    return build_s, sz
+
+
+def bench_tqhnsw_query(conn, queries, k, gt, m, ef_construction, ef_search, rerank, build_s, idx_bytes,
+                       op="<->", force_scalar="off", verbose=False):
+    """Query an already-built tqhnsw index at a given (ef_search, rerank)."""
+    _execute(conn, f"SET tqhnsw.ef_search = {ef_search}")
+    _execute(conn, f"SET tqhnsw.rerank = {rerank}")
+    _execute(conn, f"SET tqhnsw.force_scalar = {force_scalar}")
+    _execute(conn, "SET enable_seqscan = off")
+    results, qps, avg_ms = run_queries(conn, queries, k, op=op, verbose=verbose, explain_first=verbose)
+    _execute(conn, "SET enable_seqscan = on")
+    rec = recall_at_k(results, gt, k)
+
+    kernel = "[float]" if force_scalar == "on" else "[8bit]"
+    label = f"tqhnsw (m={m},ef_construction={ef_construction},ef_search={ef_search},rerank={rerank}) {kernel}"
+    return {
+        "method": label,
+        "build_s": build_s,
+        "idx_size": format_bytes(idx_bytes),
+        "recall": rec,
+        "qps": qps,
+        "avg_ms": avg_ms,
+        "_build_s_raw": build_s,
+        "_idx_bytes": idx_bytes,
+    }
+
+
 def bench_tqflat_build(conn, bits, opclass="vector_l2_ops", fast_rotation=True, tq_prod=True):
     """Build tqflat index for a given bits value; return (build_s, idx_bytes)."""
     fr = "true" if fast_rotation else "false"
@@ -590,8 +629,21 @@ def parse_args():
     p.add_argument("--tqivf-force-scalar", choices=["on", "off"], default="off",
                    help="A/B: score tqivf blocks with float LUT (on) vs 8-bit SIMD kernel (off, default)")
     p.add_argument("--no-tqivf", action="store_true", help="Skip tqivf benchmark")
+    # tqhnsw options
+    p.add_argument("--tqhnsw-m", type=int, default=16, help="tqhnsw m reloption (default 16)")
+    p.add_argument("--tqhnsw-ef-construction", type=int, default=64, help="tqhnsw ef_construction reloption (default 64)")
+    p.add_argument("--tqhnsw-ef-search", type=int, default=100, help="tqhnsw.ef_search at query time (default 100)")
+    p.add_argument("--tqhnsw-ef-search-list", type=int, nargs="+", default=None,
+                   help="Sweep these tqhnsw.ef_search values (build once, query each). Overrides --tqhnsw-ef-search.")
+    p.add_argument("--tqhnsw-rerank", type=int, default=100, help="tqhnsw.rerank at query time (default 100)")
+    p.add_argument("--tqhnsw-reranks", type=int, nargs="+", default=None,
+                   help="Sweep these tqhnsw.rerank values. Overrides --tqhnsw-rerank.")
+    p.add_argument("--tqhnsw-fast-rotation", choices=["on", "off"], default="on", help="tqhnsw fast_rotation reloption (default on)")
+    p.add_argument("--tqhnsw-force-scalar", choices=["on", "off"], default="off",
+                   help="A/B: score tqhnsw blocks with the float LUT (on) vs the 8-bit SIMD kernel (off, default)")
+    p.add_argument("--no-tqhnsw", action="store_true", help="Skip tqhnsw benchmark")
     p.add_argument("--methods", default=None,
-                   help="Comma-separated list of methods to run: tqflat,tqivf,hnsw,ivfflat,exact "
+                   help="Comma-separated list of methods to run: tqflat,tqivf,tqhnsw,hnsw,ivfflat,exact "
                         "(default: all enabled methods; overrides --no-* flags)")
     p.add_argument("--csv", default="bench/results.csv", help="Output CSV path")
     p.add_argument("--verbose", action="store_true", help="Print EXPLAIN plans")
@@ -669,12 +721,14 @@ def main():
         run_exact = "exact" in requested
         run_tqflat = "tqflat" in requested
         run_tqivf = "tqivf" in requested
+        run_tqhnsw = "tqhnsw" in requested
         run_hnsw = "hnsw" in requested
         run_ivfflat = "ivfflat" in requested
     else:
         run_exact = not args.no_exact
         run_tqflat = True
         run_tqivf = not args.no_tqivf
+        run_tqhnsw = not args.no_tqhnsw
         run_hnsw = not args.no_hnsw
         run_ivfflat = not args.no_ivfflat
 
@@ -740,6 +794,28 @@ def main():
                                             build_s, idx_bytes, op=op,
                                             force_scalar=args.tqivf_force_scalar,
                                             verbose=args.verbose)
+                    row["metric"] = metric
+                    print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
+                    results_rows.append(row)
+
+        # ---- tqhnsw: build once, query across the ef_search × rerank grid ----
+        if run_tqhnsw:
+            ef_sweep = args.tqhnsw_ef_search_list if args.tqhnsw_ef_search_list else [args.tqhnsw_ef_search]
+            reranks_sweep = args.tqhnsw_reranks if args.tqhnsw_reranks else [args.tqhnsw_rerank]
+            print(f"\n--- tqhnsw {metric} m={args.tqhnsw_m} ef_construction={args.tqhnsw_ef_construction} "
+                  f"ef_search={ef_sweep} reranks={reranks_sweep} ---")
+            build_s, idx_bytes = bench_tqhnsw_build(
+                conn, opclass=opclass, m=args.tqhnsw_m,
+                ef_construction=args.tqhnsw_ef_construction,
+                fast_rotation=args.tqhnsw_fast_rotation == "on")
+            for ef_search in ef_sweep:
+                for rerank in reranks_sweep:
+                    print(f"  Querying ef_search={ef_search} rerank={rerank} …", end="", flush=True)
+                    row = bench_tqhnsw_query(conn, queries, k, gt, args.tqhnsw_m,
+                                             args.tqhnsw_ef_construction, ef_search, rerank,
+                                             build_s, idx_bytes, op=op,
+                                             force_scalar=args.tqhnsw_force_scalar,
+                                             verbose=args.verbose)
                     row["metric"] = metric
                     print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
                     results_rows.append(row)

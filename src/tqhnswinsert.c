@@ -16,31 +16,6 @@
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
 
 /*
- * Get the insert page (mirrors hnswinsert.c GetInsertPage).  Read under a SHARE
- * lock on the meta page; the field is advisory (a hint for where a new element
- * tuple is likely to fit), so a stale value only costs an extra page scan.
- */
-static BlockNumber
-GetInsertPage(Relation index)
-{
-	Buffer		buf;
-	Page		page;
-	TqhnswMetaPage metap;
-	BlockNumber insertPage;
-
-	buf = ReadBuffer(index, TQHNSW_METAPAGE_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	metap = TqhnswPageGetMeta(page);
-
-	insertPage = metap->insertPage;
-
-	UnlockReleaseBuffer(buf);
-
-	return insertPage;
-}
-
-/*
  * Quantize a heap value into a fresh in-memory element (codes + rhat), drawing a
  * random level.  Mirrors TqhnswBuildCallback's encode block exactly (detoast ->
  * cosine l2_normalize -> TqEncode -> reconstruct rhat -> cosine unit-normalize
@@ -148,7 +123,7 @@ TqhnswSetElementTuple(TqhnswElementTuple etup, TqhnswElement *e, int codesBytes)
  * pass-2 fill in TqhnswFlushGraph).  Slots beyond the selected count are set
  * invalid; reciprocal edges are written separately by UpdateNeighborsOnDisk.
  */
-static void
+void
 TqhnswSetNeighborTuple(TqhnswNeighborTuple ntup, TqhnswElement *e, int m)
 {
 	int			idx = 0;
@@ -181,6 +156,99 @@ TqhnswSetNeighborTuple(TqhnswNeighborTuple ntup, TqhnswElement *e, int m)
 }
 
 /*
+ * Look for a deleted element tuple on `page` whose slot (and its paired neighbor
+ * slot) can be reused for element e.  Mirrors hnswinsert.c HnswFreeOffset.  On
+ * success sets *freeOffno / *freeNeighborOffno, fills *nbuf / *npage for the neighbor
+ * page (which may differ from buf), carries the deleted tuple's version into
+ * *tupleVersion, and returns true.  Element tuples are fixed-size in tqhnsw so
+ * the element-slot check is a simple length comparison.
+ *
+ * Neighbor-slot check is deliberately slot-only (conservative): we require that
+ * the deleted neighbor slot alone — ItemIdGetLength(nitemid) >= ntupSize — is
+ * large enough for the new neighbor tuple.  HnswFreeOffset is more permissive:
+ * it adds PageGetExactFreeSpace to the slot length, so it can reuse a slot that
+ * grows into adjacent free space.  tqhnsw omits that because the neighbor tuple
+ * size varies with the new element's level; if the new element has a higher level
+ * than the deleted occupant, the neighbor tuple is larger and the extra free-space
+ * accounting would be needed to safely reclaim the slot.  Skipping it is safe —
+ * we may leave some hnsw-reusable slots un-reused, but we never overwrite a slot
+ * that is too small.
+ *
+ * The neighbor page (when different from buf) is locked EXCLUSIVE and returned
+ * unlocked-on-failure / locked-on-success; the caller registers it into the
+ * GenericXLogState and releases it.  No GenericXLogState is needed here — mirrors
+ * HnswFreeOffset which also avoids xlog in the probe phase.
+ */
+static bool
+TqhnswFreeOffset(Relation index, Buffer buf, Page page, TqhnswElement *e,
+				 Size etupSize, Size ntupSize,
+				 Buffer *nbuf, Page *npage,
+				 OffsetNumber *freeOffno, OffsetNumber *freeNeighborOffno,
+				 uint8 *tupleVersion)
+{
+	OffsetNumber offno;
+	OffsetNumber maxoffno = PageGetMaxOffsetNumber(page);
+
+	/* Sizes must be aligned for the ItemIdGetLength >= size comparisons to be exact. */
+	Assert(etupSize == MAXALIGN(etupSize));
+	Assert(ntupSize == MAXALIGN(ntupSize));
+
+	for (offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+	{
+		ItemId		eitemid = PageGetItemId(page, offno);
+		TqhnswElementTuple etup = (TqhnswElementTuple) PageGetItem(page, eitemid);
+		BlockNumber neighborPage;
+		OffsetNumber neighborOffno;
+		ItemId		nitemid;
+
+		/* Skip neighbor tuples and live element tuples. */
+		if (etup->type != TQHNSW_ELEMENT_TUPLE_TYPE || !etup->deleted)
+			continue;
+
+		/* Reused element slot must be large enough for the new tuple. */
+		if (ItemIdGetLength(eitemid) < etupSize)
+			continue;
+
+		neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
+		neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
+
+		/* Resolve the neighbor page. */
+		if (neighborPage == BufferGetBlockNumber(buf))
+		{
+			*nbuf = buf;
+			*npage = page;
+		}
+		else
+		{
+			*nbuf = ReadBuffer(index, neighborPage);
+			LockBuffer(*nbuf, BUFFER_LOCK_EXCLUSIVE);
+			*npage = BufferGetPage(*nbuf);
+		}
+
+		nitemid = PageGetItemId(*npage, neighborOffno);
+
+		/*
+		 * Deleted neighbor slot alone must fit the new neighbor tuple (slot-only /
+		 * conservative check — see function comment above for why we do not add
+		 * PageGetExactFreeSpace as HnswFreeOffset does).
+		 */
+		if (ItemIdGetLength(nitemid) < ntupSize)
+		{
+			if (*nbuf != buf)
+				UnlockReleaseBuffer(*nbuf);
+			*nbuf = InvalidBuffer;
+			continue;
+		}
+
+		*freeOffno = offno;
+		*freeNeighborOffno = neighborOffno;
+		*tupleVersion = etup->version;	/* carry version for iterative-scan correctness */
+		return true;
+	}
+	return false;
+}
+
+/*
  * Append a new page after the current one within a GenericXLog transaction
  * (mirrors hnswinsert.c HnswInsertAppendPage; on-disk path only).
  */
@@ -201,15 +269,19 @@ TqhnswAppendInsertPage(Relation index, Buffer *nbuf, Page *npage,
 
 /*
  * Add an element + its neighbor tuple to disk (mirrors hnswinsert.c
- * AddElementOnDisk, simplified: tqhnsw never sets the deleted flag, so there is
- * no deleted-tuple reuse path).  Walks the element-page chain from insertPage for
- * a page with room, appending pages as needed, and assigns e->blkno/offno/
- * neighborPage/neighborOffno.  Returns the (possibly updated) insert-page hint in
+ * AddElementOnDisk).  Walks the element-page chain from insertPage looking first
+ * for a deleted-slot reuse opportunity (TqhnswFreeOffset), then for free space to
+ * append, adding new pages as needed.  Assigns e->blkno/offno/neighborPage/
+ * neighborOffno.  Returns the (possibly updated) insert-page hint in
  * *updatedInsertPage.
+ *
+ * Deleted-slot reuse (TqhnswFreeOffset) is a no-op while no tuple has deleted=1;
+ * it becomes live once tqhnsw vacuum lands.
  */
 static void
 TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
-					   BlockNumber insertPage, BlockNumber *updatedInsertPage)
+					   BlockNumber insertPage, BlockNumber firstElementPage,
+					   BlockNumber *updatedInsertPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -225,6 +297,9 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 	Page		npage;
 	BlockNumber currentPage = insertPage;
 	BlockNumber newInsertPage = InvalidBlockNumber;
+	OffsetNumber freeOffno = InvalidOffsetNumber;
+	OffsetNumber freeNeighborOffno = InvalidOffsetNumber;
+	uint8		tupleVersion = 0;
 
 	/* Prepare tuples. */
 	etup = palloc0(etupSize);
@@ -233,71 +308,137 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 	TqhnswSetNeighborTuple(ntup, e, m);
 
 	if (!BlockNumberIsValid(currentPage))
-		currentPage = TQHNSW_METAPAGE_BLKNO + 1;	/* first non-meta page */
+		currentPage = firstElementPage;	/* may still be Invalid for an empty index */
 
-	/* Find a page (or two if needed) to insert the tuples. */
-	for (;;)
+	if (!BlockNumberIsValid(currentPage))
 	{
-		buf = ReadBuffer(index, currentPage);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		/*
+		 * Empty index: allocate the first element page.  Never reuse block 1
+		 * (the codebook page).  Record the new block so the caller can persist
+		 * firstElementPage and insertPage in the meta.
+		 */
+		LockRelationForExtension(index, ExclusiveLock);
+		buf = TqNewBuffer(index, MAIN_FORKNUM);
+		UnlockRelationForExtension(index, ExclusiveLock);
 		state = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(state, buf, 0);
+		page = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		TqInitPage(buf, page, TQHNSW_PAGE_ID);
+		currentPage = BufferGetBlockNumber(buf);
+		*updatedInsertPage = currentPage;
 
-		/* First page where a level-0 element can fit -> next insert hint. */
-		if (!BlockNumberIsValid(newInsertPage) && PageGetFreeSpace(page) >= minCombinedSize)
+		/*
+		 * A freshly-initialized page is always empty; run the same size
+		 * checks as the loop body below (handles the rare oversized-element
+		 * case where etup+ntup don't share a page).
+		 */
+		if (PageGetFreeSpace(page) >= minCombinedSize)
 			newInsertPage = currentPage;
 
-		/* Fast path: both tuples fit on the current page. */
 		if (PageGetFreeSpace(page) >= combinedSize)
 		{
 			nbuf = buf;
 			npage = page;
-			break;
 		}
-
-		/* Element only, if both can't share a page and this is the last page. */
-		if (combinedSize > maxSize && PageGetFreeSpace(page) >= etupSize &&
-			!BlockNumberIsValid(TqhnswPageGetOpaque(page)->nextblkno))
+		else if (combinedSize > maxSize && PageGetFreeSpace(page) >= etupSize)
 		{
 			TqhnswAppendInsertPage(index, &nbuf, &npage, state, page);
-			break;
-		}
-
-		currentPage = TqhnswPageGetOpaque(page)->nextblkno;
-
-		if (BlockNumberIsValid(currentPage))
-		{
-			/* Move to the next page. */
-			GenericXLogAbort(state);
-			UnlockReleaseBuffer(buf);
 		}
 		else
 		{
-			Buffer		newbuf;
-			Page		newpage;
-
-			/* Append a fresh page after the last and commit the link. */
-			TqhnswAppendInsertPage(index, &newbuf, &newpage, state, page);
-			GenericXLogFinish(state);
+			/*
+			 * Should never happen: a fresh page should always fit at least
+			 * etupSize.  Fail loudly rather than looping.
+			 */
+			GenericXLogAbort(state);
 			UnlockReleaseBuffer(buf);
-
-			/* Continue on the new page. */
-			buf = newbuf;
+			elog(ERROR, "tqhnsw element tuple too large for a fresh page in \"%s\"",
+				 RelationGetRelationName(index));
+		}
+	}
+	else
+	{
+		/* Find a page (or two if needed) to insert the tuples. */
+		for (;;)
+		{
+			buf = ReadBuffer(index, currentPage);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 			state = GenericXLogStart(index);
 			page = GenericXLogRegisterBuffer(state, buf, 0);
 
-			/* Add a second page for the neighbor tuple if needed. */
-			if (PageGetFreeSpace(page) < combinedSize)
-				TqhnswAppendInsertPage(index, &nbuf, &npage, state, page);
-			else
+			/* First page where a level-0 element can fit -> next insert hint. */
+			if (!BlockNumberIsValid(newInsertPage) && PageGetFreeSpace(page) >= minCombinedSize)
+				newInsertPage = currentPage;
+
+			/* Fast path: both tuples fit on the current page. */
+			if (PageGetFreeSpace(page) >= combinedSize)
 			{
 				nbuf = buf;
 				npage = page;
+				break;
 			}
 
-			break;
+			/*
+			 * Try to reuse a deleted element slot on this page.  Since no tuple
+			 * currently has deleted=1 this always returns false; it becomes live
+			 * once tqhnsw vacuum lands.
+			 */
+			if (TqhnswFreeOffset(index, buf, page, e, etupSize, ntupSize,
+								 &nbuf, &npage,
+								 &freeOffno, &freeNeighborOffno, &tupleVersion))
+			{
+				/*
+				 * nbuf is locked; register it in the current state so the
+				 * GenericXLogFinish below covers both pages.
+				 */
+				if (nbuf != buf)
+					npage = GenericXLogRegisterBuffer(state, nbuf, 0);
+				break;
+			}
+
+			/* Element only, if both can't share a page and this is the last page. */
+			if (combinedSize > maxSize && PageGetFreeSpace(page) >= etupSize &&
+				!BlockNumberIsValid(TqhnswPageGetOpaque(page)->nextblkno))
+			{
+				TqhnswAppendInsertPage(index, &nbuf, &npage, state, page);
+				break;
+			}
+
+			currentPage = TqhnswPageGetOpaque(page)->nextblkno;
+
+			if (BlockNumberIsValid(currentPage))
+			{
+				/* Move to the next page. */
+				GenericXLogAbort(state);
+				UnlockReleaseBuffer(buf);
+			}
+			else
+			{
+				Buffer		newbuf;
+				Page		newpage;
+
+				/* Append a fresh page after the last and commit the link. */
+				TqhnswAppendInsertPage(index, &newbuf, &newpage, state, page);
+				GenericXLogFinish(state);
+				UnlockReleaseBuffer(buf);
+
+				/* Continue on the new page. */
+				buf = newbuf;
+				state = GenericXLogStart(index);
+				page = GenericXLogRegisterBuffer(state, buf, 0);
+
+				/* Add a second page for the neighbor tuple if needed. */
+				if (PageGetFreeSpace(page) < combinedSize)
+					TqhnswAppendInsertPage(index, &nbuf, &npage, state, page);
+				else
+				{
+					nbuf = buf;
+					npage = page;
+				}
+
+				break;
+			}
 		}
-	}
+	}	/* end if/else empty-index vs normal page walk */
 
 	e->blkno = BufferGetBlockNumber(buf);
 	e->neighborPage = BufferGetBlockNumber(nbuf);
@@ -306,19 +447,45 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 	if (!BlockNumberIsValid(newInsertPage))
 		newInsertPage = e->neighborPage;
 
-	e->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-	if (nbuf == buf)
-		e->neighborOffno = OffsetNumberNext(e->offno);
+	if (OffsetNumberIsValid(freeOffno))
+	{
+		/* Reuse path: overwrite the deleted slot and its neighbor slot. */
+		e->offno = freeOffno;
+		e->neighborOffno = freeNeighborOffno;
+
+		/* Carry the deleted tuple's version so iterative-scan cursors stay valid. */
+		etup->version = tupleVersion;
+		ntup->version = tupleVersion;
+	}
 	else
-		e->neighborOffno = FirstOffsetNumber;
+	{
+		/* Append path: assign the next offset on each page. */
+		e->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+		if (nbuf == buf)
+			e->neighborOffno = OffsetNumberNext(e->offno);
+		else
+			e->neighborOffno = FirstOffsetNumber;
+	}
 
 	ItemPointerSet(&etup->neighbortid, e->neighborPage, e->neighborOffno);
 
-	if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != e->offno)
-		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	if (OffsetNumberIsValid(freeOffno))
+	{
+		/* Overwrite the previously-deleted slots. */
+		if (!PageIndexTupleOverwrite(page, e->offno, (Item) etup, etupSize))
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
-	if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != e->neighborOffno)
-		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		if (!PageIndexTupleOverwrite(npage, e->neighborOffno, (Item) ntup, ntupSize))
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	}
+	else
+	{
+		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != e->offno)
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != e->neighborOffno)
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	}
 
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
@@ -528,7 +695,7 @@ TqhnswUpdateNeighborOnDisk(Relation index, TqhnswElement *neighborElement,
  * TqhnswInsertElement; each target's authoritative on-disk neighbor tuple is
  * re-read under EXCLUSIVE lock here.
  */
-static void
+void
 TqhnswUpdateNeighborsOnDisk(Relation index, const TqModel *model, TqMetric metric,
 							HTAB *cache, MemoryContext ctx, TqhnswElement *newElement,
 							int m, int dc)
@@ -571,13 +738,14 @@ TqhnswUpdateNeighborsOnDisk(Relation index, const TqModel *model, TqMetric metri
 
 /*
  * Set the meta-page entry point + insertPage hint + bump nVectors, under an
- * EXCLUSIVE lock on the meta page.  When updateEntry is true the entry point is
- * overwritten only if the (re-read-under-lock) entry level is still below
- * newElement's level.  newInsertPage (if valid) advances the insert-page hint.
+ * EXCLUSIVE lock on the meta page.  entryUpdate controls whether/how the entry
+ * point is updated; newInsertPage (if valid) advances the insert-page hint.
+ * nVectors is incremented only when newElement is non-NULL (i.e. a real node
+ * is being added).
  */
-static void
-TqhnswUpdateMetaPage(Relation index, TqhnswElement *newElement, bool updateEntry,
-					 BlockNumber newInsertPage)
+void
+TqhnswUpdateMetaPage(Relation index, TqhnswElement *newElement,
+					 TqhnswEntryUpdate entryUpdate, BlockNumber newInsertPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -590,17 +758,38 @@ TqhnswUpdateMetaPage(Relation index, TqhnswElement *newElement, bool updateEntry
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	metap = TqhnswPageGetMeta(page);
 
-	if (updateEntry && (metap->entryLevel < 0 || newElement->level > metap->entryLevel))
+	if (entryUpdate == TQHNSW_ENTRY_ALWAYS)
+	{
+		if (newElement != NULL)
+		{
+			metap->entryBlkno = newElement->blkno;
+			metap->entryOffno = newElement->offno;
+			metap->entryLevel = (int16) newElement->level;
+		}
+		else
+		{
+			metap->entryBlkno = InvalidBlockNumber;
+			metap->entryOffno = InvalidOffsetNumber;
+			metap->entryLevel = -1;
+		}
+	}
+	else if (entryUpdate == TQHNSW_ENTRY_GREATER && newElement != NULL &&
+			 (metap->entryLevel < 0 || newElement->level > metap->entryLevel))
 	{
 		metap->entryBlkno = newElement->blkno;
 		metap->entryOffno = newElement->offno;
 		metap->entryLevel = (int16) newElement->level;
 	}
 
+	/* Record the element-page chain head the first time one exists. */
+	if (newElement != NULL && !BlockNumberIsValid(metap->firstElementPage))
+		metap->firstElementPage = newElement->blkno;
+
 	if (BlockNumberIsValid(newInsertPage))
 		metap->insertPage = newInsertPage;
 
-	metap->nVectors += 1;
+	if (newElement != NULL)
+		metap->nVectors += 1;
 
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
@@ -608,10 +797,12 @@ TqhnswUpdateMetaPage(Relation index, TqhnswElement *newElement, bool updateEntry
 
 /*
  * Read efConstruction and the current entry point from the meta page (SHARE).
+ * Also reads insertPage (advisory hint) and firstElementPage (chain head).
  */
 static void
 TqhnswGetInsertMeta(Relation index, int *m, int *efConstruction,
-					BlockNumber *entryBlkno, OffsetNumber *entryOffno, int *entryLevel)
+					BlockNumber *entryBlkno, OffsetNumber *entryOffno, int *entryLevel,
+					BlockNumber *insertPage, BlockNumber *firstElementPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -628,11 +819,21 @@ TqhnswGetInsertMeta(Relation index, int *m, int *efConstruction,
 		elog(ERROR, "tqhnsw index is not valid");
 	}
 
+	if (unlikely(metap->version != TQHNSW_VERSION))
+	{
+		uint32		v = metap->version;
+
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "tqhnsw index version %u is unsupported; REINDEX required", v);
+	}
+
 	*m = metap->m;
 	*efConstruction = metap->efConstruction;
 	*entryBlkno = metap->entryBlkno;
 	*entryOffno = metap->entryOffno;
 	*entryLevel = metap->entryLevel;
+	*insertPage = metap->insertPage;
+	*firstElementPage = metap->firstElementPage;
 
 	UnlockReleaseBuffer(buf);
 }
@@ -649,6 +850,8 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	BlockNumber entryBlkno;
 	OffsetNumber entryOffno;
 	int			entryLevel;
+	BlockNumber insertPage;
+	BlockNumber firstElementPage;
 	int			dimCodes = model->dimCodes;
 	int			codesBytes = TQ_CODES_BYTES(dimCodes, model->bits);
 	HTAB	   *cache;
@@ -665,7 +868,8 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	 */
 	LockPage(index, TQHNSW_UPDATE_LOCK, lockmode);
 
-	TqhnswGetInsertMeta(index, &m, &efConstruction, &entryBlkno, &entryOffno, &entryLevel);
+	TqhnswGetInsertMeta(index, &m, &efConstruction, &entryBlkno, &entryOffno, &entryLevel,
+						&insertPage, &firstElementPage);
 
 	cache = TqhnswCreateElementCache(insertCtx);
 	newElement = TqhnswQuantizeElement(index, model, metric, m, dimCodes,
@@ -684,7 +888,8 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 		lockmode = ExclusiveLock;
 		LockPage(index, TQHNSW_UPDATE_LOCK, lockmode);
 
-		TqhnswGetInsertMeta(index, &m, &efConstruction, &entryBlkno, &entryOffno, &entryLevel);
+		TqhnswGetInsertMeta(index, &m, &efConstruction, &entryBlkno, &entryOffno, &entryLevel,
+							&insertPage, &firstElementPage);
 	}
 
 	if (!BlockNumberIsValid(entryBlkno) || entryLevel < 0)
@@ -694,8 +899,8 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 		 * Its neighbor tuple is all-invalid (no forward links to write).
 		 */
 		TqhnswAddElementOnDisk(index, newElement, m, codesBytes,
-							   GetInsertPage(index), &updatedInsertPage);
-		TqhnswUpdateMetaPage(index, newElement, true, updatedInsertPage);
+							   insertPage, firstElementPage, &updatedInsertPage);
+		TqhnswUpdateMetaPage(index, newElement, TQHNSW_ENTRY_ALWAYS, updatedInsertPage);
 
 		UnlockPage(index, TQHNSW_UPDATE_LOCK, lockmode);
 		return;
@@ -712,18 +917,19 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 
 		TqhnswInsertElement(NULL /* base */, index, model, cache, insertCtx,
 							newElement, entryPoint, m, efConstruction, dimCodes,
-							metric);
+							metric, false /* existing */);
 	}
 
 	/* Write the new element (forward links from newElement->neighbors). */
 	TqhnswAddElementOnDisk(index, newElement, m, codesBytes,
-						   GetInsertPage(index), &updatedInsertPage);
+						   insertPage, firstElementPage, &updatedInsertPage);
 
 	/* Persist reciprocal edges under per-neighbor EXCLUSIVE locks. */
 	TqhnswUpdateNeighborsOnDisk(index, model, metric, cache, insertCtx, newElement, m, dimCodes);
 
 	/* Entry-point update (if higher) + insert-page hint + nVectors bump. */
-	TqhnswUpdateMetaPage(index, newElement, newElement->level > entryLevel,
+	TqhnswUpdateMetaPage(index, newElement,
+						 newElement->level > entryLevel ? TQHNSW_ENTRY_GREATER : TQHNSW_ENTRY_NO_UPDATE,
 						 updatedInsertPage);
 
 	/* Release the page-level update lock. */
