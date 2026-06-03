@@ -363,8 +363,9 @@ range. `tqivf`'s standing offer in exchange is **7.6× less storage** (1.0 GB vs
 7.8 GB), a **5× faster build** (161 s vs 812 s), and recall that meets or beats HNSW
 (p200: 0.991 ≥ hnsw 0.990). `tqivf` is the size/recall/build-balanced index;
 HNSW remains the choice when query latency is the sole objective and 8× the memory
-is acceptable. `tqivf` build is ~1.7× ivfflat's (the extra encode pass) but 5× below
-HNSW.
+is acceptable. `tqivf` build here is ~1.7× ivfflat's, but that compares serial-tqivf
+(no parallel build at measurement time) to 4-way-parallel-ivfflat; with `tqivf`'s own
+parallel build it is **0.9–1.0× ivfflat** — see *Parallel build* below — and 5× below HNSW.
 
 ## SIFT1M — four-way
 
@@ -417,8 +418,10 @@ and every higher probe point out-recalls HNSW by a wide margin (HNSW tops out at
   storage; on lower-dim / angular sets (SIFT, GloVe) `tqivf` closes or reverses the
   latency gap and out-recalls HNSW. The kernel's advantage grows as the quantized
   score step dominates (lower dim, more probes).
-- **Build sits between ivfflat and HNSW** (1.7× ivfflat, 5× below HNSW) — the k-means
-  pass plus a TQ encode pass — and is dwarfed by HNSW graph construction.
+- **Build sits between ivfflat and HNSW** — the k-means pass plus a TQ encode pass,
+  dwarfed by HNSW graph construction. The 1.7× shown here is serial-tqivf vs
+  parallel-ivfflat; with `tqivf`'s parallel build (added since) it is **0.9–1.0× ivfflat**
+  and 5× below HNSW (see *Parallel build*).
 - **The `probes × rerank` sweep is a clean, monotone recall/latency dial**, exactly
   as designed: pick the probe count for the recall target, then rerank for the final
   polish. 0.99+ recall is reachable on every dataset.
@@ -427,6 +430,52 @@ and every higher probe point out-recalls HNSW by a wide margin (HNSW tops out at
 prior sections motivated — it wins size, recall, and build like flat tqflat *and*
 turns the O(N) latency wall into IVF-sublinear selection, beating ivfflat outright
 and trading raw latency to HNSW only in exchange for ~8× less memory.
+
+## Parallel build — serial vs parallel, tqivf vs ivfflat (the-fire)
+
+`tqivf` now supports the standard Postgres parallel index build (`amcanbuildparallel`):
+the k-means + codebook are computed serially by the leader, then nearest-center
+assignment **and** the TurboQuant encode run in the per-tuple callback across worker
+backends, broadcasting the centers + the (few-KB, fast-rotation) model through shared
+memory. The on-disk format is byte-equivalent to a serial build, so recall, latency,
+and size are unchanged — **build wall-clock is the only thing that moves.**
+
+**Setup.** `the-fire` (Zen4, 16 cores, PG 18.4), `maintenance_work_mem=16GB`,
+`lists=√N`, fast rotation. *Serial* = `max_parallel_maintenance_workers=0`; *parallel*
+requests 8 (the box's `max_worker_processes`/`max_parallel_workers` ceiling) and the
+planner grants what its main-heap-page heuristic allows. Each dataset is loaded once
+and both methods are timed on the identical table.
+CSV: `bench/results/tqivf_build_time_x86.csv`.
+
+| Dataset | dim | tqivf serial | tqivf parallel | tqivf speedup | ivfflat serial | ivfflat parallel | ivfflat speedup | workers | **par tqivf / par ivfflat** |
+|---|---|---|---|---|---|---|---|---|---|
+| SIFT1M      | 128  | 20.3 s  | **9.2 s**  | 2.19× | 17.0 s  | 10.2 s | 1.67× | 4 | **0.91×** |
+| GloVe-200   | 200  | 36.6 s  | **16.4 s** | 2.23× | 33.2 s  | 17.6 s | 1.89× | 5 | **0.94×** |
+| OpenAI-1M   | 1536 | 163.6 s | **87.1 s** | 1.88× | 135.6 s | 85.4 s | 1.59× | 2 | **1.02×** |
+
+**The ~1.7× build gap to ivfflat was an artifact and is now gone.** The four-way tables
+above report `tqivf` build *serial* (parallel build did not exist when they were
+measured — note `tqivf` serial 20.3/36.6/163.6 s ≈ the four-way 21/38/161 s) against
+`ivfflat` build *already 4-way parallel* (the suite ran at the harness default of 4
+maintenance workers — note `ivfflat` parallel ≈ the four-way 11/20/93 s). That compared
+serial-tqivf to parallel-ivfflat. Measured apples-to-apples — **both parallel** —
+`tqivf` build is **0.91–1.02× ivfflat's**: equal at high dim, slightly *faster* at low/mid
+dim (its 4-bit codes sort ~8× smaller than ivfflat's raw float vectors, offsetting the
+extra encode). `tqivf` parallel build itself runs **1.9–2.2× faster than its serial path**.
+
+**Worker grant scales with main-heap pages, not vector dimension.** High-dim vectors
+(OpenAI 1536-d) exceed the TOAST threshold, so the *main* heap holds only TOAST pointers
+— few pages → the planner grants fewer workers (2) than for inline low-dim vectors
+(SIFT 4, GloVe 5). Both AMs get the same grant on the same table, so the comparison
+stays fair; it does mean the parallel speedup is largest where the main heap is biggest.
+
+**Correctness/recall preserved on silicon.** `make installcheck` is 22/22 on `the-fire`
+(including the forced-worker `tqivf_build` case asserting per-list sum=2000 /
+cardinality=20). A parallel-built SIFT1M index queries identically to the committed
+serial baseline: recall@10 **0.9984** (serial 0.9988 — within unseeded-k-means sampling
+noise), **15.3 ms** (serial 15.2), **87.6 MB** (serial 87.5). The end-to-end TAP recall
+variant (config E) runs in CI only — `PostgreSQL::Test::*` is absent from the apt PG on
+`the-fire`.
 
 # AVX-512 fast-scan kernel widening (256/512-bit) — throughput + end-to-end
 

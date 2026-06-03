@@ -16,25 +16,25 @@ my $dim = 32;
 my $array_sql = join(",", ("random() - 0.5") x $dim);
 
 # ---------------------------------------------------------------------------
-# test_recall -- run all queries against the tqivf index, compute recall@K.
+# test_recall -- run all queries against the tqhnsw index, compute recall@K.
 #
-# $probes   -- value to SET tqivf.probes = N before each query
-# $rerank   -- value to SET tqivf.rerank = N before each query
+# $ef       -- value to SET tqhnsw.ef_search = N before each query
+# $rerank   -- value to SET tqhnsw.rerank = N before each query
 # $min      -- minimum acceptable recall fraction
 # $operator -- distance operator (<->, <#>, <=>)
 # $label    -- descriptive label for the cmp_ok message
 # ---------------------------------------------------------------------------
 sub test_recall
 {
-	my ($probes, $rerank, $min, $operator, $label) = @_;
+	my ($ef, $rerank, $min, $operator, $label) = @_;
 	my $correct = 0;
 	my $total = 0;
 
 	# Verify the planner actually uses the index.
 	my $explain = $node->safe_psql("postgres", qq(
 		SET enable_seqscan = off;
-		SET tqivf.probes = $probes;
-		SET tqivf.rerank = $rerank;
+		SET tqhnsw.ef_search = $ef;
+		SET tqhnsw.rerank = $rerank;
 		EXPLAIN ANALYZE SELECT i FROM tst ORDER BY v $operator '$queries[0]' LIMIT $limit;
 	));
 	like($explain, qr/Index Scan using idx on tst/, "index scan used for $label");
@@ -43,8 +43,8 @@ sub test_recall
 	{
 		my $actual = $node->safe_psql("postgres", qq(
 			SET enable_seqscan = off;
-			SET tqivf.probes = $probes;
-			SET tqivf.rerank = $rerank;
+			SET tqhnsw.ef_search = $ef;
+			SET tqhnsw.rerank = $rerank;
 			SELECT i FROM tst ORDER BY v $operator '$queries[$i]' LIMIT $limit;
 		));
 		my @actual_ids = split("\n", $actual);
@@ -97,12 +97,9 @@ for (1 .. 20)
 	push(@queries, "[" . join(",", @coords) . "]");
 }
 
-# lists = 55 ~ sqrt(3000); keeps CI cost low while giving meaningful probes knob.
-my $lists = 55;
-
 # ===========================================================================
-# Test configuration A: L2, probes=lists (full coverage), rerank=200
-#   → expect recall ≥ 0.95  (mirrors tqflat bits=4 rerank=200 bound)
+# Test configuration A: L2, high ef + high rerank (full coverage)
+#   → expect recall ≥ 0.95  (mirrors the spike-GREEN quantized HNSW bound)
 # ===========================================================================
 {
 	my $opclass  = "vector_l2_ops";
@@ -120,23 +117,23 @@ my $lists = 55;
 	}
 
 	$node->safe_psql("postgres",
-		"CREATE INDEX idx ON tst USING tqivf (v $opclass) WITH (lists = $lists);");
+		"CREATE INDEX idx ON tst USING tqhnsw (v $opclass) WITH (m = 16, ef_construction = 64);");
 
-	# High probes + high rerank: near-exact recovery.
-	test_recall($lists, 200, 0.95, $operator, "L2 probes=lists rerank=200");
+	# High ef + high rerank: near-exact recovery.
+	test_recall(100, 200, 0.95, $operator, "L2 ef=100 rerank=200");
 
-	# Moderate probes: reduced recall but still reasonable.
-	test_recall(10, 100, 0.70, $operator, "L2 probes=10 rerank=100");
+	# Moderate ef: reduced recall but still reasonable.
+	test_recall(40, 100, 0.80, $operator, "L2 ef=40 rerank=100");
 
-	# Low probes: exercises the code path; loose lower bound.
-	test_recall(1, 100, 0.20, $operator, "L2 probes=1 rerank=100 (low probes path)");
+	# Low ef, no rerank: exercises the unreranked quantized path; loose bound.
+	test_recall(10, 0, 0.20, $operator, "L2 ef=10 rerank=0 (low-ef unreranked path)");
 
 	$node->safe_psql("postgres", "DROP INDEX idx;");
 }
 
 # ===========================================================================
-# Test configuration B: cosine (<=>), probes=lists, rerank=200
-#   → expect recall ≥ 0.90  (mirrors tqflat bits=4 cosine bound)
+# Test configuration B: cosine (<=>), high ef + high rerank
+#   → expect recall ≥ 0.90  (mirrors the spike-GREEN cosine bound)
 # ===========================================================================
 {
 	my $opclass  = "vector_cosine_ops";
@@ -154,20 +151,20 @@ my $lists = 55;
 	}
 
 	$node->safe_psql("postgres",
-		"CREATE INDEX idx ON tst USING tqivf (v $opclass) WITH (lists = $lists);");
+		"CREATE INDEX idx ON tst USING tqhnsw (v $opclass) WITH (m = 16, ef_construction = 64);");
 
-	# High probes + high rerank.
-	test_recall($lists, 200, 0.90, $operator, "cosine probes=lists rerank=200");
+	# High ef + high rerank.
+	test_recall(100, 200, 0.90, $operator, "cosine ef=100 rerank=200");
 
-	# Low probes: just exercise the path.
-	test_recall(1, 100, 0.20, $operator, "cosine probes=1 rerank=100 (low probes path)");
+	# Low ef: just exercise the path.
+	test_recall(10, 100, 0.20, $operator, "cosine ef=10 rerank=100 (low-ef path)");
 
 	$node->safe_psql("postgres", "DROP INDEX idx;");
 }
 
 # ===========================================================================
-# Test configuration C: inner product (<#>), probes=lists, rerank=200
-#   → expect recall ≥ 0.90  (mirrors tqflat bits=4 inner product bound)
+# Test configuration C: inner product (<#>), high ef + high rerank
+#   → expect recall ≥ 0.90  (mirrors the spike-GREEN inner product bound)
 # ===========================================================================
 {
 	my $opclass  = "vector_ip_ops";
@@ -185,77 +182,13 @@ my $lists = 55;
 	}
 
 	$node->safe_psql("postgres",
-		"CREATE INDEX idx ON tst USING tqivf (v $opclass) WITH (lists = $lists);");
+		"CREATE INDEX idx ON tst USING tqhnsw (v $opclass) WITH (m = 16, ef_construction = 64);");
 
-	# High probes + high rerank.
-	test_recall($lists, 200, 0.90, $operator, "inner product probes=lists rerank=200");
+	# High ef + high rerank.
+	test_recall(100, 200, 0.90, $operator, "inner product ef=100 rerank=200");
 
-	# Low probes: just exercise the path.
-	test_recall(1, 100, 0.20, $operator, "inner product probes=1 rerank=100 (low probes path)");
-
-	$node->safe_psql("postgres", "DROP INDEX idx;");
-}
-
-# ===========================================================================
-# Test configuration D: L2, rerank=0 (unreranked / quantized-only path)
-#   → loose bound (≥0.30), just proves the quantized path executes and returns
-#     plausible results; mirrors tqflat's "rerank=0" coverage.
-# ===========================================================================
-{
-	my $opclass  = "vector_l2_ops";
-	my $operator = "<->";
-
-	# Exact ground truth.
-	@expected = ();
-	foreach my $q (@queries)
-	{
-		my $res = $node->safe_psql("postgres", qq(
-			SET enable_indexscan = off;
-			SELECT i FROM tst ORDER BY v $operator '$q' LIMIT $limit;
-		));
-		push(@expected, $res);
-	}
-
-	$node->safe_psql("postgres",
-		"CREATE INDEX idx ON tst USING tqivf (v $opclass) WITH (lists = $lists);");
-
-	# Full probes but no rerank: quantized scoring only.
-	test_recall($lists, 0, 0.30, $operator, "L2 probes=lists rerank=0 (unreranked path)");
-
-	$node->safe_psql("postgres", "DROP INDEX idx;");
-}
-
-# ===========================================================================
-# Test configuration E: parallel build (L2) must engage workers and match the
-# serial recall bound.  Verifies the parallel build path end-to-end.
-# ===========================================================================
-{
-	my $opclass  = "vector_l2_ops";
-	my $operator = "<->";
-
-	# Exact ground truth (seqscan).
-	@expected = ();
-	foreach my $q (@queries)
-	{
-		my $res = $node->safe_psql("postgres", qq(
-			SET enable_indexscan = off;
-			SELECT i FROM tst ORDER BY v $operator '$q' LIMIT $limit;
-		));
-		push(@expected, $res);
-	}
-
-	# Build in parallel; force workers and capture the DEBUG line.
-	my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
-		SET client_min_messages = DEBUG1;
-		SET min_parallel_table_scan_size = 1;
-		SET max_parallel_maintenance_workers = 2;
-		CREATE INDEX idx ON tst USING tqivf (v $opclass) WITH (lists = $lists);
-	));
-	is($ret, 0, "parallel tqivf build succeeded: $stderr");
-	like($stderr, qr/using \d+ parallel workers/, "parallel tqivf build engaged workers");
-
-	# Same recall bound as the serial L2 config A.
-	test_recall($lists, 200, 0.95, $operator, "parallel build L2 probes=lists rerank=200");
+	# Low ef: just exercise the path.
+	test_recall(10, 100, 0.20, $operator, "inner product ef=10 rerank=100 (low-ef path)");
 
 	$node->safe_psql("postgres", "DROP INDEX idx;");
 }

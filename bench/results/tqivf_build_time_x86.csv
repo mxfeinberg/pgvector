@@ -1,0 +1,13 @@
+dataset,metric,n,dim,lists,method,mode,req_workers,launched_workers,build_s,index_bytes
+sift1m,l2,1000000,128,1000,tqivf,serial,0,0,20.256,92028928
+sift1m,l2,1000000,128,1000,tqivf,parallel,8,4,9.24,92127232
+sift1m,l2,1000000,128,1000,ivfflat,serial,0,0,17.034,550404096
+sift1m,l2,1000000,128,1000,ivfflat,parallel,8,4,10.199,550559744
+glove200,cosine,1183514,200,1087,tqivf,serial,0,0,36.555,186089472
+glove200,cosine,1183514,200,1087,tqivf,parallel,8,5,16.426,186015744
+glove200,cosine,1183514,200,1087,ivfflat,serial,0,0,33.228,1082187776
+glove200,cosine,1183514,200,1087,ivfflat,parallel,8,5,17.552,1082220544
+openai1m,cosine,999800,1536,999,tqivf,serial,0,0,163.564,1077960704
+openai1m,cosine,999800,1536,999,tqivf,parallel,8,2,87.1,1078534144
+openai1m,cosine,999800,1536,999,ivfflat,serial,0,0,135.619,8198553600
+openai1m,cosine,999800,1536,999,ivfflat,parallel,8,2,85.4,8198553600

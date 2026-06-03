@@ -77,6 +77,44 @@ CREATE OPERATOR CLASS vector_cosine_ops
 	FUNCTION 4 vector_norm(vector),
 	FUNCTION 6 tqivf_cosine_support(internal);
 
+-- tqhnsw access method
+
+CREATE FUNCTION tqhnswhandler(internal) RETURNS index_am_handler
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE ACCESS METHOD tqhnsw TYPE INDEX HANDLER tqhnswhandler;
+
+COMMENT ON ACCESS METHOD tqhnsw IS 'tqhnsw index access method';
+
+CREATE FUNCTION tqhnsw_l2_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION tqhnsw_ip_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION tqhnsw_cosine_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE OPERATOR CLASS vector_l2_ops
+	DEFAULT FOR TYPE vector USING tqhnsw AS
+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_l2_squared_distance(vector, vector),
+	FUNCTION 3 tqhnsw_l2_support(internal);
+
+CREATE OPERATOR CLASS vector_ip_ops
+	FOR TYPE vector USING tqhnsw AS
+	OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_negative_inner_product(vector, vector),
+	FUNCTION 2 vector_norm(vector),
+	FUNCTION 3 tqhnsw_ip_support(internal);
+
+CREATE OPERATOR CLASS vector_cosine_ops
+	FOR TYPE vector USING tqhnsw AS
+	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_negative_inner_product(vector, vector),
+	FUNCTION 2 vector_norm(vector),
+	FUNCTION 3 tqhnsw_cosine_support(internal);
+
 -- tqflat internal test wrappers (prototype/test-only; drop before upstreaming)
 CREATE FUNCTION tqflat_test_codebook(int, int) RETURNS float8[]
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT;
@@ -119,4 +157,9 @@ CREATE FUNCTION tqflat_test_active_kernel() RETURNS text
 CREATE FUNCTION tqivf_test_meta(regclass) RETURNS text
 	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
 CREATE FUNCTION tqivf_test_list_counts(regclass) RETURNS int[]
+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
+CREATE FUNCTION tqhnsw_test_meta(regclass) RETURNS text
+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;
+
+CREATE FUNCTION tqhnsw_test_graph(regclass) RETURNS text
 	AS 'MODULE_PATHNAME' LANGUAGE C STABLE;

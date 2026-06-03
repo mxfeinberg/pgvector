@@ -5,6 +5,7 @@
 
 #include "access/amapi.h"
 #include "access/generic_xlog.h"
+#include "access/parallel.h"		/* dsm_segment, shm_toc */
 #include "access/reloptions.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
@@ -129,6 +130,8 @@ extern void TqivfGetMetaInfo(Relation index, int *dim, TqMetric *metric,
 /* ---- tqivfbuild.c ---- */
 extern IndexBuildResult *tqivfbuild(Relation heap, Relation index, struct IndexInfo *indexInfo);
 extern void tqivfbuildempty(Relation index);
+/* Parallel build worker entry point (looked up by name via CreateParallelContext) */
+PGDLLEXPORT void TqivfParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 extern bool tqivfinsert(Relation index, Datum *values, bool *isnull,
 						ItemPointer heap_tid, Relation heap,
 						IndexUniqueCheck checkUnique,

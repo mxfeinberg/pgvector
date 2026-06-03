@@ -22,3 +22,17 @@ CREATE INDEX tqivf_mb_idx ON tqivf_mb USING tqivf (v vector_l2_ops) WITH (lists 
 SELECT tqivf_test_meta('tqivf_mb_idx');
 SELECT max(c) FROM unnest(tqivf_test_list_counts('tqivf_mb_idx')) AS c;
 DROP TABLE tqivf_mb;
+
+-- Parallel build: forcing workers must produce the same membership + per-list
+-- counts as a serial build (intra-list block grouping may differ; sums do not).
+SET max_parallel_maintenance_workers = 2;
+SET min_parallel_table_scan_size = 1;
+CREATE TABLE tqivf_par (id int, v vector(8));
+INSERT INTO tqivf_par SELECT g, ARRAY[g%7,g%5,g%3,g%11,g%13,g%2,g%17,g%19]::real[]::vector
+  FROM generate_series(1, 2000) g;
+CREATE INDEX tqivf_par_idx ON tqivf_par USING tqivf (v vector_l2_ops) WITH (lists = 20);
+SELECT sum(c) FROM unnest(tqivf_test_list_counts('tqivf_par_idx')) AS c;
+SELECT cardinality(tqivf_test_list_counts('tqivf_par_idx'));
+RESET max_parallel_maintenance_workers;
+RESET min_parallel_table_scan_size;
+DROP TABLE tqivf_par;

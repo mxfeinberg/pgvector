@@ -4,19 +4,37 @@
 #include <math.h>
 
 #include "access/generic_xlog.h"
+#include "access/parallel.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"		/* plan_create_index_workers */
+#include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/lmgr.h"
+#include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "tqivf.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplesort.h"
+#include "utils/wait_event.h"
 #include "vector.h"
+
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
+
+#define PARALLEL_KEY_TQIVF_SHARED		UINT64CONST(0xB000000000000001)
+#define PARALLEL_KEY_TUPLESORT			UINT64CONST(0xB000000000000002)
+#define PARALLEL_KEY_TQIVF_CENTERS		UINT64CONST(0xB000000000000003)
+#define PARALLEL_KEY_TQIVF_MODEL		UINT64CONST(0xB000000000000004)
+#define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xB000000000000005)
 
 /*
  * Per-list streaming cursor for emitting one list's TurboQuant v4 block stream.
@@ -50,6 +68,51 @@ typedef struct TqivfListCursor
 	uint32		blockCount;
 	uint32		nvectors;
 }			TqivfListCursor;
+
+/*
+ * Shared state for a parallel tqivf build (mirror IvfflatShared).  Lives in the
+ * DSM segment; the embedded ParallelTableScanDesc follows this struct.
+ */
+typedef struct TqivfShared
+{
+	/* Immutable state */
+	Oid			heaprelid;
+	Oid			indexrelid;
+	bool		isconcurrent;
+	int			scantuplesortstates;
+
+	/* Worker progress */
+	ConditionVariable workersdonecv;
+
+	/* Mutex for mutable state */
+	slock_t		mutex;
+
+	/* Mutable state */
+	int			nparticipantsdone;
+	double		reltuples;
+	double		indtuples;
+}			TqivfShared;
+
+#define ParallelTableScanFromTqivfShared(shared) \
+	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(TqivfShared)))
+
+typedef struct TqivfSpool
+{
+	Relation	heap;
+	Relation	index;
+	Tuplesortstate *sortstate;
+}			TqivfSpool;
+
+typedef struct TqivfLeader
+{
+	ParallelContext *pcxt;
+	int			nparticipanttuplesorts;
+	TqivfShared *tqivfshared;
+	Sharedsort *sharedsort;
+	Snapshot	snapshot;
+	char	   *tqivfcenters;
+	char	   *tqivfmodel;
+}			TqivfLeader;
 
 typedef struct TqivfBuildState
 {
@@ -87,6 +150,9 @@ typedef struct TqivfBuildState
 	/* Counters */
 	double		reltuples;
 	double		indtuples;
+
+	/* Set only during a parallel build (NULL for serial). */
+	TqivfLeader *tqivfleader;
 
 	MemoryContext tmpCtx;
 }			TqivfBuildState;
@@ -194,6 +260,445 @@ TqIvfFlushBlock(TqivfBuildState * buildstate, TqivfListCursor * cur)
 	cur->slot = 0;
 	cur->blockCount++;
 	MemSet(&cur->sideStage, 0, sizeof(cur->sideStage));
+}
+
+/*
+ * Serialized TurboQuant model header for broadcasting to parallel workers.
+ * Followed by float boundaries[nLevels-1], float centroids[nLevels], and (only
+ * when !fastRotation) float rotation[dim*dim].
+ */
+typedef struct TqivfModelHeader
+{
+	int			dim;
+	int			bits;
+	int			nLevels;
+	int			metric;			/* TqMetric */
+	int			fastRotation;	/* bool */
+	int			dimPadded;
+	int			dimCodes;
+	uint64		rotSeed;
+	uint64		qjlSeed;
+}			TqivfModelHeader;
+
+/* Size of the serialized model for the given model. */
+static Size
+TqivfModelSerializedSize(const TqModel *model)
+{
+	Size		sz = MAXALIGN(sizeof(TqivfModelHeader));
+
+	sz += (Size) sizeof(float) * ((model->nLevels - 1) + model->nLevels);
+	if (!model->fastRotation)
+		sz += (Size) sizeof(float) * model->dim * model->dim;
+	return sz;
+}
+
+/* Serialize model into buf (must be >= TqivfModelSerializedSize). */
+static void
+TqivfSerializeModel(const TqModel *model, char *buf)
+{
+	TqivfModelHeader *hdr = (TqivfModelHeader *) buf;
+	char	   *p = buf + MAXALIGN(sizeof(TqivfModelHeader));
+
+	hdr->dim = model->dim;
+	hdr->bits = model->bits;
+	hdr->nLevels = model->nLevels;
+	hdr->metric = (int) model->metric;
+	hdr->fastRotation = model->fastRotation ? 1 : 0;
+	hdr->dimPadded = model->dimPadded;
+	hdr->dimCodes = model->dimCodes;
+	hdr->rotSeed = model->rotSeed;
+	hdr->qjlSeed = model->qjlSeed;
+
+	memcpy(p, model->boundaries, sizeof(float) * (model->nLevels - 1));
+	p += sizeof(float) * (model->nLevels - 1);
+	memcpy(p, model->centroids, sizeof(float) * model->nLevels);
+	p += sizeof(float) * model->nLevels;
+	if (!model->fastRotation)
+		memcpy(p, model->rotation, (Size) sizeof(float) * model->dim * model->dim);
+}
+
+/*
+ * Reconstruct a TqModel from a serialized buffer into model-> fields, palloc'ing
+ * boundaries/centroids/rotation in the current memory context.  Sets tqProd off
+ * and qjl NULL (tqivf v4 layout).
+ */
+static void
+TqivfDeserializeModel(const char *buf, TqModel *model)
+{
+	const TqivfModelHeader *hdr = (const TqivfModelHeader *) buf;
+	const char *p = buf + MAXALIGN(sizeof(TqivfModelHeader));
+
+	model->dim = hdr->dim;
+	model->bits = hdr->bits;
+	model->nLevels = hdr->nLevels;
+	model->metric = (TqMetric) hdr->metric;
+	model->tqProd = false;
+	model->fastRotation = hdr->fastRotation != 0;
+	model->dimPadded = hdr->dimPadded;
+	model->dimCodes = hdr->dimCodes;
+	model->rotSeed = hdr->rotSeed;
+	model->qjlSeed = hdr->qjlSeed;
+	model->qjl = NULL;
+	model->qjlScale = 0.0f;
+
+	model->boundaries = palloc(sizeof(float) * (model->nLevels - 1));
+	memcpy(model->boundaries, p, sizeof(float) * (model->nLevels - 1));
+	p += sizeof(float) * (model->nLevels - 1);
+	model->centroids = palloc(sizeof(float) * model->nLevels);
+	memcpy(model->centroids, p, sizeof(float) * model->nLevels);
+	p += sizeof(float) * model->nLevels;
+	if (!model->fastRotation)
+	{
+		model->rotation = palloc((Size) sizeof(float) * model->dim * model->dim);
+		memcpy(model->rotation, p, (Size) sizeof(float) * model->dim * model->dim);
+	}
+	else
+		model->rotation = NULL;
+}
+
+/* Forward declarations for static helpers used by the parallel functions. */
+static void TqivfInitBuildState(TqivfBuildState *buildstate, Relation heap,
+								Relation index, IndexInfo *indexInfo,
+								ForkNumber forkNum);
+static void TqivfFreeBuildState(TqivfBuildState *buildstate);
+static void TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
+							   bool *isnull, bool tupleIsAlive, void *state);
+
+/* Size of shared memory for the parallel build (shared struct + parallel scan). */
+static Size
+ParallelEstimateShared(Relation heap, Snapshot snapshot)
+{
+	return add_size(BUFFERALIGN(sizeof(TqivfShared)),
+					table_parallelscan_estimate(heap, snapshot));
+}
+
+/*
+ * Within the leader, wait until all participants finish their scan+sort, then
+ * collect the tuple counts.  Mirrors ivfbuild.c's ParallelHeapScan.
+ */
+static double
+ParallelHeapScan(TqivfBuildState * buildstate)
+{
+	TqivfShared *tqivfshared = buildstate->tqivfleader->tqivfshared;
+	int			nparticipanttuplesorts;
+	double		reltuples;
+
+	nparticipanttuplesorts = buildstate->tqivfleader->nparticipanttuplesorts;
+	for (;;)
+	{
+		SpinLockAcquire(&tqivfshared->mutex);
+		if (tqivfshared->nparticipantsdone == nparticipanttuplesorts)
+		{
+			buildstate->indtuples = tqivfshared->indtuples;
+			reltuples = tqivfshared->reltuples;
+			SpinLockRelease(&tqivfshared->mutex);
+			break;
+		}
+		SpinLockRelease(&tqivfshared->mutex);
+
+		ConditionVariableSleep(&tqivfshared->workersdonecv,
+							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+	}
+	ConditionVariableCancelSleep();
+
+	return reltuples;
+}
+
+/*
+ * Perform one participant's portion of the parallel scan + sort.  Used by both
+ * the real workers and the leader-as-worker.  Reconstructs a local build state,
+ * overrides centers + model from shared memory (so no side-page reads and no
+ * model rebuild happen here), then runs the shared TqivfBuildCallback.
+ */
+static void
+TqivfParallelScanAndSort(TqivfSpool * spool, TqivfShared * tqivfshared,
+						 Sharedsort *sharedsort, char *tqivfcenters,
+						 char *tqivfmodel, int sortmem, bool progress)
+{
+	SortCoordinate coordinate;
+	TqivfBuildState buildstate;
+	TableScanDesc scan;
+	double		reltuples;
+	IndexInfo  *indexInfo;
+	AttrNumber	attNums[] = {1};
+	Oid			sortOperators[] = {Int4LessOperator};
+	Oid			sortCollations[] = {InvalidOid};
+	bool		nullsFirstFlags[] = {false};
+
+	/* Local tuplesort coordination state (this participant is a worker). */
+	coordinate = palloc0(sizeof(SortCoordinateData));
+	coordinate->isWorker = true;
+	coordinate->nParticipants = -1;
+	coordinate->sharedsort = sharedsort;
+
+	indexInfo = BuildIndexInfo(spool->index);
+	indexInfo->ii_Concurrent = tqivfshared->isconcurrent;
+
+	MemSet(&buildstate, 0, sizeof(buildstate));
+	TqivfInitBuildState(&buildstate, spool->heap, spool->index, indexInfo, MAIN_FORKNUM);
+
+	/* Override centers from shared memory (no k-means in the worker). */
+	memcpy(buildstate.centers->items, tqivfcenters,
+		   buildstate.centers->itemsize * buildstate.centers->maxlen);
+	buildstate.centers->length = buildstate.centers->maxlen;
+
+	/* Populate the model from shared memory (no rebuild, no side-page reads). */
+	TqivfDeserializeModel(tqivfmodel, &buildstate.model);
+	buildstate.dimPadded = buildstate.model.dimPadded;
+	buildstate.dimCodes = buildstate.model.dimCodes;
+
+	spool->sortstate = tuplesort_begin_heap(buildstate.sortdesc, 1, attNums,
+											sortOperators, sortCollations,
+											nullsFirstFlags, sortmem, coordinate, false);
+	buildstate.sortstate = spool->sortstate;
+
+	scan = table_beginscan_parallel(spool->heap,
+									ParallelTableScanFromTqivfShared(tqivfshared)
+#if PG_VERSION_NUM >= 190000
+									,SO_NONE
+#endif
+		);
+	reltuples = table_index_build_scan(spool->heap, spool->index, indexInfo,
+									   true, progress, TqivfBuildCallback,
+									   (void *) &buildstate, scan);
+
+	tuplesort_performsort(spool->sortstate);
+
+	SpinLockAcquire(&tqivfshared->mutex);
+	tqivfshared->nparticipantsdone++;
+	tqivfshared->reltuples += reltuples;
+	tqivfshared->indtuples += buildstate.indtuples;
+	SpinLockRelease(&tqivfshared->mutex);
+
+	ConditionVariableSignal(&tqivfshared->workersdonecv);
+
+	tuplesort_end(spool->sortstate);
+
+	TqivfFreeBuildState(&buildstate);
+}
+
+/*
+ * Entry point for a parallel build worker.  Looked up by name via
+ * CreateParallelContext("vector", "TqivfParallelBuildMain", ...).
+ */
+void
+TqivfParallelBuildMain(dsm_segment *seg, shm_toc *toc)
+{
+	char	   *sharedquery;
+	TqivfSpool *spool;
+	TqivfShared *tqivfshared;
+	Sharedsort *sharedsort;
+	char	   *tqivfcenters;
+	char	   *tqivfmodel;
+	Relation	heapRel;
+	Relation	indexRel;
+	LOCKMODE	heapLockmode;
+	LOCKMODE	indexLockmode;
+	int			sortmem;
+
+	sharedquery = shm_toc_lookup(toc, PARALLEL_KEY_QUERY_TEXT, true);
+	debug_query_string = sharedquery;
+	pgstat_report_activity(STATE_RUNNING, debug_query_string);
+
+	tqivfshared = shm_toc_lookup(toc, PARALLEL_KEY_TQIVF_SHARED, false);
+
+	if (!tqivfshared->isconcurrent)
+	{
+		heapLockmode = ShareLock;
+		indexLockmode = AccessExclusiveLock;
+	}
+	else
+	{
+		heapLockmode = ShareUpdateExclusiveLock;
+		indexLockmode = RowExclusiveLock;
+	}
+
+	heapRel = table_open(tqivfshared->heaprelid, heapLockmode);
+	indexRel = index_open(tqivfshared->indexrelid, indexLockmode);
+
+	spool = (TqivfSpool *) palloc0(sizeof(TqivfSpool));
+	spool->heap = heapRel;
+	spool->index = indexRel;
+
+	sharedsort = shm_toc_lookup(toc, PARALLEL_KEY_TUPLESORT, false);
+	tuplesort_attach_shared(sharedsort, seg);
+
+	tqivfcenters = shm_toc_lookup(toc, PARALLEL_KEY_TQIVF_CENTERS, false);
+	tqivfmodel = shm_toc_lookup(toc, PARALLEL_KEY_TQIVF_MODEL, false);
+
+	sortmem = maintenance_work_mem / tqivfshared->scantuplesortstates;
+	TqivfParallelScanAndSort(spool, tqivfshared, sharedsort, tqivfcenters,
+							 tqivfmodel, sortmem, false);
+
+	index_close(indexRel, indexLockmode);
+	table_close(heapRel, heapLockmode);
+}
+
+/* Leader runs one participant's share of the scan + sort. */
+static void
+TqivfLeaderParticipateAsWorker(TqivfBuildState * buildstate)
+{
+	TqivfLeader *leader = buildstate->tqivfleader;
+	TqivfSpool *leaderworker;
+	int			sortmem;
+
+	leaderworker = (TqivfSpool *) palloc0(sizeof(TqivfSpool));
+	leaderworker->heap = buildstate->heap;
+	leaderworker->index = buildstate->index;
+
+	sortmem = maintenance_work_mem / leader->nparticipanttuplesorts;
+	TqivfParallelScanAndSort(leaderworker, leader->tqivfshared, leader->sharedsort,
+							 leader->tqivfcenters, leader->tqivfmodel, sortmem, true);
+}
+
+/* Tear down the parallel context. */
+static void
+TqivfEndParallel(TqivfLeader * leader)
+{
+	WaitForParallelWorkersToFinish(leader->pcxt);
+	if (IsMVCCSnapshot(leader->snapshot))
+		UnregisterSnapshot(leader->snapshot);
+	DestroyParallelContext(leader->pcxt);
+	ExitParallelMode();
+}
+
+/*
+ * Begin a parallel build: create the parallel context, broadcast shared state,
+ * centers, and the TurboQuant model, launch workers, and have the leader join.
+ * Leaves buildstate->tqivfleader NULL if no workers could be launched.
+ */
+static void
+TqivfBeginParallel(TqivfBuildState * buildstate, bool isconcurrent, int request)
+{
+	ParallelContext *pcxt;
+	int			scantuplesortstates;
+	Snapshot	snapshot;
+	Size		estshared;
+	Size		estsort;
+	Size		estcenters;
+	Size		estmodel;
+	TqivfShared *tqivfshared;
+	Sharedsort *sharedsort;
+	char	   *tqivfcenters;
+	char	   *tqivfmodel;
+	TqivfLeader *leader = (TqivfLeader *) palloc0(sizeof(TqivfLeader));
+	bool		leaderparticipates = true;
+	int			querylen;
+
+	EnterParallelMode();
+	Assert(request > 0);
+	pcxt = CreateParallelContext("vector", "TqivfParallelBuildMain", request);
+
+	scantuplesortstates = leaderparticipates ? request + 1 : request;
+
+	if (!isconcurrent)
+		snapshot = SnapshotAny;
+	else
+		snapshot = RegisterSnapshot(GetTransactionSnapshot());
+
+	/* Estimate DSM space: shared+scan, tuplesort, centers, model, query text. */
+	estshared = ParallelEstimateShared(buildstate->heap, snapshot);
+	shm_toc_estimate_chunk(&pcxt->estimator, estshared);
+	estsort = tuplesort_estimate_shared(scantuplesortstates);
+	shm_toc_estimate_chunk(&pcxt->estimator, estsort);
+	estcenters = buildstate->centers->itemsize * buildstate->centers->maxlen;
+	shm_toc_estimate_chunk(&pcxt->estimator, estcenters);
+	estmodel = TqivfModelSerializedSize(&buildstate->model);
+	shm_toc_estimate_chunk(&pcxt->estimator, estmodel);
+	shm_toc_estimate_keys(&pcxt->estimator, 4);
+
+	if (debug_query_string)
+	{
+		querylen = strlen(debug_query_string);
+		shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+	else
+		querylen = 0;
+
+	InitializeParallelDSM(pcxt);
+
+	/* No DSM available: back out, run serial. */
+	if (pcxt->seg == NULL)
+	{
+		if (IsMVCCSnapshot(snapshot))
+			UnregisterSnapshot(snapshot);
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return;
+	}
+
+	tqivfshared = (TqivfShared *) shm_toc_allocate(pcxt->toc, estshared);
+	tqivfshared->heaprelid = RelationGetRelid(buildstate->heap);
+	tqivfshared->indexrelid = RelationGetRelid(buildstate->index);
+	tqivfshared->isconcurrent = isconcurrent;
+	tqivfshared->scantuplesortstates = scantuplesortstates;
+	ConditionVariableInit(&tqivfshared->workersdonecv);
+	SpinLockInit(&tqivfshared->mutex);
+	tqivfshared->nparticipantsdone = 0;
+	tqivfshared->reltuples = 0;
+	tqivfshared->indtuples = 0;
+	table_parallelscan_initialize(buildstate->heap,
+								  ParallelTableScanFromTqivfShared(tqivfshared),
+								  snapshot);
+
+	sharedsort = (Sharedsort *) shm_toc_allocate(pcxt->toc, estsort);
+	tuplesort_initialize_shared(sharedsort, scantuplesortstates, pcxt->seg);
+
+	tqivfcenters = shm_toc_allocate(pcxt->toc, estcenters);
+	memcpy(tqivfcenters, buildstate->centers->items, estcenters);
+
+	tqivfmodel = shm_toc_allocate(pcxt->toc, estmodel);
+	TqivfSerializeModel(&buildstate->model, tqivfmodel);
+
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_TQIVF_SHARED, tqivfshared);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLESORT, sharedsort);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_TQIVF_CENTERS, tqivfcenters);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_TQIVF_MODEL, tqivfmodel);
+
+	if (debug_query_string)
+	{
+		char	   *sharedquery;
+
+		sharedquery = (char *) shm_toc_allocate(pcxt->toc, querylen + 1);
+		memcpy(sharedquery, debug_query_string, querylen + 1);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_QUERY_TEXT, sharedquery);
+	}
+
+	LaunchParallelWorkers(pcxt);
+
+	/*
+	 * If no workers launched, back out and run serial.  No
+	 * WaitForParallelWorkersToFinish is needed (none were launched); leaving
+	 * buildstate->tqivfleader NULL signals the caller to fall back to serial.
+	 */
+	if (pcxt->nworkers_launched == 0)
+	{
+		if (IsMVCCSnapshot(snapshot))
+			UnregisterSnapshot(snapshot);
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return;
+	}
+
+	ereport(DEBUG1, (errmsg("using %d parallel workers", pcxt->nworkers_launched)));
+
+	leader->pcxt = pcxt;
+	leader->nparticipanttuplesorts = pcxt->nworkers_launched;
+	if (leaderparticipates)
+		leader->nparticipanttuplesorts++;
+	leader->tqivfshared = tqivfshared;
+	leader->sharedsort = sharedsort;
+	leader->snapshot = snapshot;
+	leader->tqivfcenters = tqivfcenters;
+	leader->tqivfmodel = tqivfmodel;
+
+	buildstate->tqivfleader = leader;
+
+	if (leaderparticipates)
+		TqivfLeaderParticipateAsWorker(buildstate);
+
+	WaitForParallelWorkersToAttach(pcxt);
 }
 
 /*
@@ -325,13 +830,17 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 										  typeInfo->itemSize(buildstate->dim));
 	buildstate->listInfo = palloc(sizeof(ListInfo) * buildstate->lists);
 
-	/* Sort tuple descriptor: (list int4, tid tid, vector) keyed by list */
+	/*
+	 * Sort tuple descriptor: (list int4, entry bytea) keyed by list.  The
+	 * callback encodes each vector into a row-major TqEntry and carries it as a
+	 * bytea payload; TqivfEmitLists unwraps it and packs blocks (no encode).
+	 * The 4-bit codes are far smaller than the source float vector, so the sort
+	 * volume is much smaller than ivfflat's (which sorts the raw vectors).
+	 */
 	buildstate->tupdesc = RelationGetDescr(index);
-	buildstate->sortdesc = CreateTemplateTupleDesc(3);
+	buildstate->sortdesc = CreateTemplateTupleDesc(2);
 	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 1, "list", INT4OID, -1, 0);
-	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 2, "tid", TIDOID, -1, 0);
-	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 3, "vector",
-					   TupleDescAttr(buildstate->tupdesc, 0)->atttypid, -1, 0);
+	TupleDescInitEntry(buildstate->sortdesc, (AttrNumber) 2, "entry", BYTEAOID, -1, 0);
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(buildstate->sortdesc);
 #endif
@@ -511,18 +1020,30 @@ TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
 		}
 	}
 
-	ExecClearTuple(slot);
-	slot->tts_values[0] = Int32GetDatum(closestCenter);
-	slot->tts_isnull[0] = false;
-	slot->tts_values[1] = PointerGetDatum(tid);
-	slot->tts_isnull[1] = false;
-	slot->tts_values[2] = value;
-	slot->tts_isnull[2] = false;
-	ExecStoreVirtualTuple(slot);
+	{
+		Vector	   *vec = DatumGetVector(value);
+		Size		entrySize = TqEntrySize(buildstate->model.dimCodes,
+										   buildstate->model.bits, false);
+		Size		byteaSize = VARHDRSZ + entrySize;
+		bytea	   *payload = (bytea *) palloc0(byteaSize);
+		TqEntry    *entry = (TqEntry *) VARDATA(payload);
 
-	tuplesort_puttupleslot(buildstate->sortstate, slot);
+		SET_VARSIZE(payload, byteaSize);
+		entry->heaptid = *tid;
+		entry->deleted = 0;
+		TqEncode(&buildstate->model, vec->x, entry);
 
-	buildstate->indtuples++;
+		ExecClearTuple(slot);
+		slot->tts_values[0] = Int32GetDatum(closestCenter);
+		slot->tts_isnull[0] = false;
+		slot->tts_values[1] = PointerGetDatum(payload);
+		slot->tts_isnull[1] = false;
+		ExecStoreVirtualTuple(slot);
+
+		tuplesort_puttupleslot(buildstate->sortstate, slot);
+
+		buildstate->indtuples++;
+	}
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
@@ -540,17 +1061,17 @@ TqivfEmitLists(TqivfBuildState * buildstate)
 	int			dc = buildstate->dimCodes;
 	TupleTableSlot *sortSlot = MakeSingleTupleTableSlot(buildstate->sortdesc, &TTSOpsMinimalTuple);
 	TqivfListCursor cur;
-	TqEntry    *entry;
-	Size		entrySize;
 	int			list;
 	bool		haveTuple;
 	bool		isnull;
-
-	/* Scratch entry sized over dimCodes (mirror tqflat) */
-	entrySize = TqEntrySize(buildstate->dimCodes, buildstate->bits, false);
-	entry = palloc0(entrySize);
+	TqEntry    *rdEntry;
+	Size		rdEntrySize;
 
 	cur.codeStage = palloc0(TQ_BLOCK_CODE_BYTES(dc));
+
+	/* Aligned scratch entry for reading sorted bytea payloads (see memcpy below). */
+	rdEntrySize = TqEntrySize(buildstate->model.dimCodes, buildstate->model.bits, false);
+	rdEntry = palloc(rdEntrySize);
 
 	/* Prime the first sorted tuple */
 	haveTuple = tuplesort_gettupleslot(buildstate->sortstate, true, false, sortSlot, NULL);
@@ -580,19 +1101,22 @@ TqivfEmitLists(TqivfBuildState * buildstate)
 
 		while (haveTuple && list == i)
 		{
-			Datum		value = slot_getattr(sortSlot, 3, &isnull);
-			Vector	   *vec = DatumGetVector(value);
-			ItemPointer tidp = (ItemPointer) DatumGetPointer(slot_getattr(sortSlot, 2, &isnull));
+			bytea	   *payload = DatumGetByteaPP(slot_getattr(sortSlot, 2, &isnull));
 			int			lane;
 
-			memset(entry, 0, entrySize);
-			TqEncode(&buildstate->model, vec->x, entry);
+			/*
+			 * Copy into an aligned scratch entry first: the tuplesort may return
+			 * the bytea with a 1-byte short varlena header, so VARDATA_ANY can
+			 * point at an unaligned address -- dereferencing the float/tid fields
+			 * in place would be unaligned access (UB on strict-alignment targets).
+			 */
+			memcpy(rdEntry, VARDATA_ANY(payload), rdEntrySize);
 
 			lane = cur.slot;
-			TqScatterCodes(&buildstate->model, entry->data, lane, cur.codeStage);
-			cur.sideStage.side[lane].heaptid = *tidp;
-			cur.sideStage.side[lane].norm = entry->norm;
-			cur.sideStage.side[lane].scale = entry->scale;
+			TqScatterCodes(&buildstate->model, rdEntry->data, lane, cur.codeStage);
+			cur.sideStage.side[lane].heaptid = rdEntry->heaptid;
+			cur.sideStage.side[lane].norm = rdEntry->norm;
+			cur.sideStage.side[lane].scale = rdEntry->scale;
 			cur.slot++;
 			cur.nvectors++;
 
@@ -641,7 +1165,7 @@ TqivfEmitLists(TqivfBuildState * buildstate)
 	}
 
 	pfree(cur.codeStage);
-	pfree(entry);
+	pfree(rdEntry);
 	ExecDropSingleTupleTableSlot(sortSlot);
 }
 
@@ -748,23 +1272,61 @@ TqivfBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	/* List directory up front; record its head for the meta page */
 	listStart = TqivfCreateListPages(buildstate);
 
-	/* Assign + sort by list id */
-	buildstate->sortstate = tuplesort_begin_heap(buildstate->sortdesc, 1, attNums,
-												 sortOperators, sortCollations,
-												 nullsFirstFlags, maintenance_work_mem,
-												 NULL, false);
+	/*
+	 * Assign + sort by list id, in parallel when the planner grants workers.
+	 * The leader computes the model + centers serially (above); workers receive
+	 * both via shared memory and encode + assign in parallel.
+	 */
+	{
+		int			parallel_workers = 0;
+		SortCoordinate coordinate = NULL;
 
-	if (heap != NULL)
-		buildstate->reltuples = table_index_build_scan(heap, index, indexInfo,
-													   true, true, TqivfBuildCallback,
-													   (void *) buildstate, NULL);
+		/*
+		 * Only plan workers for a non-empty, multi-list build: a single list
+		 * has no per-list parallelism to gain (the leader still emits serially),
+		 * and tqivfbuildempty (heap == NULL) is always serial.
+		 */
+		if (heap != NULL && buildstate->lists > 1)
+			parallel_workers = plan_create_index_workers(RelationGetRelid(heap),
+														 RelationGetRelid(index));
 
-	tuplesort_performsort(buildstate->sortstate);
+		if (parallel_workers > 0)
+			TqivfBeginParallel(buildstate, indexInfo->ii_Concurrent, parallel_workers);
 
-	/* Per-list block emit + directory back-patch */
-	TqivfEmitLists(buildstate);
+		/* Set up coordination state if at least one worker launched. */
+		if (buildstate->tqivfleader != NULL)
+		{
+			coordinate = (SortCoordinate) palloc0(sizeof(SortCoordinateData));
+			coordinate->isWorker = false;
+			coordinate->nParticipants = buildstate->tqivfleader->nparticipanttuplesorts;
+			coordinate->sharedsort = buildstate->tqivfleader->sharedsort;
+		}
 
-	tuplesort_end(buildstate->sortstate);
+		buildstate->sortstate = tuplesort_begin_heap(buildstate->sortdesc, 1, attNums,
+													 sortOperators, sortCollations,
+													 nullsFirstFlags, maintenance_work_mem,
+													 coordinate, false);
+
+		if (heap != NULL)
+		{
+			if (buildstate->tqivfleader != NULL)
+				buildstate->reltuples = ParallelHeapScan(buildstate);
+			else
+				buildstate->reltuples = table_index_build_scan(heap, index, indexInfo,
+															   true, true, TqivfBuildCallback,
+															   (void *) buildstate, NULL);
+		}
+
+		tuplesort_performsort(buildstate->sortstate);
+
+		/* Per-list block emit + directory back-patch (leader, serial). */
+		TqivfEmitLists(buildstate);
+
+		tuplesort_end(buildstate->sortstate);
+
+		if (buildstate->tqivfleader != NULL)
+			TqivfEndParallel(buildstate->tqivfleader);
+	}
 
 	/* Finalize the meta page */
 	TqivfUpdateMeta(buildstate, listStart, cbStart, rotStart,
@@ -961,9 +1523,11 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 	/*
 	 * Encode: allocate a row-major TqEntry (same format TqScoreEntry reads in
-	 * the tail scan path).  bits=4, tqProd=false (tqivf v4 layout).
+	 * the tail scan path).  bits is fixed at 4 and tqProd is off in the tqivf v4
+	 * layout; take them from the model so the size tracks the model if that ever
+	 * changes.
 	 */
-	entrySize = MAXALIGN(TqEntrySize(model->dimCodes, 4, false));
+	entrySize = MAXALIGN(TqEntrySize(model->dimCodes, model->bits, false));
 	entry = palloc0(entrySize);
 	entry->heaptid = *heap_tid;
 	entry->deleted = 0;

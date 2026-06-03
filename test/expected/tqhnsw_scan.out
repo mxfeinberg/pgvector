@@ -1,0 +1,85 @@
+SET enable_seqscan = off;
+CREATE TABLE tqhnsw_s (id int, v vector(4));
+INSERT INTO tqhnsw_s SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1, 300) g;
+CREATE INDEX tqhnsw_s_idx ON tqhnsw_s USING tqhnsw (v vector_l2_ops) WITH (m = 16, ef_construction = 64);
+SET tqhnsw.ef_search = 100;
+SET tqhnsw.rerank = 100;
+-- The 5 nearest to [5,0,0,0] are {5,4,6,3,7} (distances 0,1,1,4,4 -> two
+-- exact-distance ties).  Re-sort the index-scan output by id so the tie order is
+-- deterministic; this still proves the index returned exactly the planted top-5.
+SELECT id FROM (
+  SELECT id FROM tqhnsw_s ORDER BY v <-> '[5,0,0,0]' LIMIT 5
+) q ORDER BY id;
+ id 
+----
+  3
+  4
+  5
+  6
+  7
+(5 rows)
+
+-- expect the 5 nearest on the planted line: 3,4,5,6,7
+-- Empty index returns nothing.
+CREATE TABLE tqhnsw_empty (v vector(4));
+CREATE INDEX tqhnsw_empty_idx ON tqhnsw_empty USING tqhnsw (v vector_l2_ops);
+SELECT count(*) FROM (SELECT v FROM tqhnsw_empty ORDER BY v <-> '[1,1,1,1]' LIMIT 5) q;  -- 0
+ count 
+-------
+     0
+(1 row)
+
+-- Inner product: larger projection on [10,0,0,0] = larger g.
+CREATE TABLE tqhnsw_ip (id int, v vector(4));
+INSERT INTO tqhnsw_ip SELECT g, ARRAY[g,1,0,0]::real[]::vector FROM generate_series(1, 300) g;
+CREATE INDEX ON tqhnsw_ip USING tqhnsw (v vector_ip_ops) WITH (m = 16, ef_construction = 64);
+SET tqhnsw.ef_search = 200;
+SET tqhnsw.rerank = 200;
+SELECT id FROM tqhnsw_ip ORDER BY v <#> '[10,0,0,0]' LIMIT 3;  -- 300,299,298
+ id  
+-----
+ 300
+ 299
+ 298
+(3 rows)
+
+DROP TABLE tqhnsw_ip;
+-- Cosine: all collinear -> ties; just confirms 3 rows, no error.
+CREATE TABLE tqhnsw_cos (id int, v vector(4));
+INSERT INTO tqhnsw_cos SELECT g, ARRAY[g,g,0,0]::real[]::vector FROM generate_series(1, 300) g;
+CREATE INDEX ON tqhnsw_cos USING tqhnsw (v vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+SET tqhnsw.ef_search = 200;
+SELECT count(*) FROM (SELECT id FROM tqhnsw_cos ORDER BY v <=> '[1,1,0,0]' LIMIT 3) q;  -- 3
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE tqhnsw_cos;
+-- Delete + vacuum must not error, and the deleted row drops from results.
+CREATE TABLE tqhnsw_v (id int, v vector(4));
+INSERT INTO tqhnsw_v SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1, 200) g;
+CREATE INDEX ON tqhnsw_v USING tqhnsw (v vector_l2_ops) WITH (m = 16, ef_construction = 64);
+SET tqhnsw.ef_search = 100;
+SET tqhnsw.rerank = 100;
+DELETE FROM tqhnsw_v WHERE id = 5;
+VACUUM tqhnsw_v;
+-- After deleting id 5, the nearest to [5,0,0,0] are 4,6 (dist 1) then a dist-4
+-- tie between 3 and 7.  Take LIMIT 4 (captures both tie members so the tie does
+-- not straddle the cutoff) and re-sort by id for determinism.  This proves id 5
+-- is ABSENT (dropped at rerank via heap visibility) and the planted set {3,4,6,7}
+-- is returned by the index.
+SELECT id FROM (
+  SELECT id FROM tqhnsw_v ORDER BY v <-> '[5,0,0,0]' LIMIT 4
+) q ORDER BY id;
+ id 
+----
+  3
+  4
+  6
+  7
+(4 rows)
+
+-- expect: 3,4,6,7 (id 5 absent)
+DROP TABLE tqhnsw_v;
+DROP TABLE tqhnsw_s, tqhnsw_empty;

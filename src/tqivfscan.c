@@ -515,6 +515,7 @@ TqivfLoadBatch(IndexScanDesc scan)
 {
 	TqivfScanOpaque so = (TqivfScanOpaque) scan->opaque;
 	int			capacity;
+	uint64		capacity64;
 	int			n = 0;
 	int			batchEnd;
 	int			i;
@@ -523,13 +524,23 @@ TqivfLoadBatch(IndexScanDesc scan)
 
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
-	/* Estimate capacity from the lists in this batch (nvectors is a hint). */
+	/*
+	 * Estimate the initial capacity from the lists in this batch (nvectors is a
+	 * hint; the array grows by doubling in TqivfScoreList as needed).  Each
+	 * nvectors is a uint32 and the per-index cap is ~4.29B, so accumulate into a
+	 * uint64 to avoid signed-int overflow when many large lists are probed, then
+	 * clamp to INT_MAX so the (int) cast is well-defined.  The doubling repalloc
+	 * recovers any under-estimate.
+	 */
 	batchEnd = Min(so->listIndex + so->probes, so->nProbeLists);
-	capacity = 0;
+	capacity64 = 0;
 	for (i = so->listIndex; i < batchEnd; i++)
-		capacity += (int) so->probeLists[i].nvectors;
-	if (capacity < 1)
-		capacity = 1;
+		capacity64 += so->probeLists[i].nvectors;
+	if (capacity64 < 1)
+		capacity64 = 1;
+	if (capacity64 > INT_MAX)
+		capacity64 = INT_MAX;
+	capacity = (int) capacity64;
 	results = palloc(sizeof(TqivfScanResult) * capacity);
 
 	for (i = so->listIndex; i < batchEnd; i++)
@@ -541,6 +552,17 @@ TqivfLoadBatch(IndexScanDesc scan)
 	 * Rerank: for the top-K candidates by estimate, fetch the original vector
 	 * and replace the estimate with the exact FUNCTION 1 distance.  Mirrors
 	 * tqscan's rerank block.
+	 *
+	 * Documented prototype tradeoff (inherited from tqflat): the reranked subset
+	 * carries an exact FUNCTION 1 distance while the rest carry the quantized
+	 * estimate, and the two are not on a perfectly comparable scale -- most
+	 * visibly for cosine, where the exact value is -cos(q, x) (range [-1, 1])
+	 * while the estimate-based distance is 1 - cos(q, x) (range [0, 2]).  The two
+	 * are monotone in cos(q, x) and the reranked (exact) values dominate the
+	 * front of the array, which is what matters for the returned neighbors when
+	 * rerank >= LIMIT.  Distances are never surfaced to the caller (the AM does
+	 * not set xs_orderbyvals), so the scale difference affects only internal
+	 * ordering.
 	 */
 	if (tqivf_rerank > 0 && n > 0 && so->queryVec != NULL)
 	{
