@@ -2,12 +2,89 @@
 
 #include <math.h>
 
+#include "common/hashfn.h"
 #include "common/pg_prng.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
 #include "tqhnsw.h"
+
+/* murmurhash64 became public in common/hashfn.h in PG17; shim for older. */
+#if PG_VERSION_NUM < 170000
+static inline uint64
+murmurhash64(uint64 data)
+{
+	uint64		h = data;
+
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccd;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53;
+	h ^= h >> 33;
+
+	return h;
+}
+#endif
+
+typedef struct TqhnswPointerHashEntry
+{
+	uintptr_t	ptr;
+	char		status;
+}			TqhnswPointerHashEntry;
+typedef struct TqhnswOffsetHashEntry
+{
+	Size		offset;
+	char		status;
+}			TqhnswOffsetHashEntry;
+
+static uint32
+tqhnsw_hash_pointer(uintptr_t ptr)
+{
+#if SIZEOF_VOID_P == 8
+	return murmurhash64((uint64) ptr);
+#else
+	return murmurhash32((uint32) ptr);
+#endif
+}
+
+static uint32
+tqhnsw_hash_offset(Size offset)
+{
+#if SIZEOF_SIZE_T == 8
+	return murmurhash64((uint64) offset);
+#else
+	return murmurhash32((uint32) offset);
+#endif
+}
+
+#define SH_PREFIX		tqpointerhash
+#define SH_ELEMENT_TYPE	TqhnswPointerHashEntry
+#define SH_KEY_TYPE		uintptr_t
+#define SH_KEY			ptr
+#define SH_HASH_KEY(tb, key)	tqhnsw_hash_pointer(key)
+#define SH_EQUAL(tb, a, b)		(a == b)
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+#define SH_PREFIX		tqoffsethash
+#define SH_ELEMENT_TYPE	TqhnswOffsetHashEntry
+#define SH_KEY_TYPE		Size
+#define SH_KEY			offset
+#define SH_HASH_KEY(tb, key)	tqhnsw_hash_offset(key)
+#define SH_EQUAL(tb, a, b)		(a == b)
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+typedef union
+{
+	struct tqpointerhash_hash *pointers;
+	struct tqoffsethash_hash *offsets;
+}			TqhnswVisited;
 
 /*
  * Reconstruct the rotated, full-magnitude vector rhat[i] = norm*scale*centroids[code_i]
@@ -29,6 +106,29 @@ TqhnswReconstruct(const TqModel *model, const char *codes,
 		uint8		code = TqUnpackCode(codes, codesBytes, i, model->bits);
 
 		rhat[i] = s * model->centroids[code];
+	}
+}
+
+/*
+ * Cosine: unit-normalize a reconstructed rhat vector so that -IP orders by
+ * cosine distance.  Shared by every node-creation path (build, on-disk insert,
+ * lazy scan-load) so the epsilon and accumulation precision stay identical.
+ */
+void
+TqhnswNormalizeRhat(float *rhat, int dimCodes)
+{
+	double		n = 0.0;
+	int			i;
+
+	for (i = 0; i < dimCodes; i++)
+		n += (double) rhat[i] * (double) rhat[i];
+	n = sqrt(n);
+	if (n > 1e-20)
+	{
+		float		inv = (float) (1.0 / n);
+
+		for (i = 0; i < dimCodes; i++)
+			rhat[i] *= inv;
 	}
 }
 
@@ -89,9 +189,6 @@ typedef struct TqhnswSearchCandidate
 	pairingheap_container(TqhnswSearchCandidate, membername, ptr)
 #define TqhnswGetSearchCandidateConst(membername, ptr) \
 	pairingheap_const_container(TqhnswSearchCandidate, membername, ptr)
-
-/* Per-search visited stamp, bumped once per TqhnswSearchLayer call. */
-static uint32 tqhnsw_visited_generation = 0;
 
 /* C heap: nearest first (min by distance). */
 static int
@@ -154,6 +251,33 @@ TqhnswCountElement(TqhnswElement *skipElement, TqhnswElement *e)
 }
 
 /*
+ * Init a per-search visited set.  Thread-local: never writes shared element
+ * state, so concurrent searches over shared in-memory elements (parallel build)
+ * do not clobber each other.  Mirrors hnswutils.c InitVisited.
+ */
+static inline void
+TqhnswInitVisited(char *base, TqhnswVisited *v, int ef, int m)
+{
+	if (base != NULL)
+		v->offsets = tqoffsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+	else
+		v->pointers = tqpointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+}
+
+/* Returns true if element was already visited (and marks it visited). */
+static inline bool
+TqhnswAddToVisited(char *base, TqhnswVisited *v, TqhnswElement *element)
+{
+	bool		found;
+
+	if (base != NULL)
+		tqoffsethash_insert(v->offsets, (Size) ((char *) element - base), &found);
+	else
+		tqpointerhash_insert(v->pointers, (uintptr_t) element, &found);
+	return found;
+}
+
+/*
  * Algorithm 2 from the paper (in-memory branch of HnswSearchLayer).
  *
  * ep is a List of TqhnswSearchCandidate * entry points (already distance-scored).
@@ -170,14 +294,29 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
 	int			wlen = 0;
 	ListCell   *lc2;
-	uint32		gen = ++tqhnsw_visited_generation;
+	TqhnswVisited visited;
+	TqhnswNeighborArray *localNa = NULL;
+	Size		localNaSize = 0;
+
+	TqhnswInitVisited(base, &visited, ef, m);
+
+	/*
+	 * In-memory path: a reusable buffer to snapshot each candidate's neighbor
+	 * array under its shared lock so the distance work below runs lock-free
+	 * (see the loop).  lc is fixed for this call, so one size fits every copy.
+	 */
+	if (index == NULL)
+	{
+		localNaSize = TQHNSW_NEIGHBOR_ARRAY_SIZE(TqhnswGetLayerM(m, lc));
+		localNa = palloc(localNaSize);
+	}
 
 	/* Add entry points to C and W, marking them visited. */
 	foreach(lc2, ep)
 	{
 		TqhnswSearchCandidate *sc = (TqhnswSearchCandidate *) lfirst(lc2);
 
-		sc->element->visitedGeneration = gen;
+		(void) TqhnswAddToVisited(base, &visited, sc->element);
 		pairingheap_add(C, &sc->c_node);
 		pairingheap_add(W, &sc->w_node);
 		if (TqhnswCountElement(skipElement, sc->element))
@@ -199,11 +338,35 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 			continue;
 
 		/* On-disk path: load neighbors for this layer lazily. */
-		if (index != NULL && cElement->neighbors[lc] == NULL)
-			TqhnswLoadNeighbors(index, model, metric, cElement, lc, m, ctx);
+		if (index != NULL)
+		{
+			TqhnswNeighborArrayPtr *neighborList = TqhnswPtrAccess(base, cElement->neighbors);
+
+			if (TqhnswPtrIsNull(base, neighborList[lc]))
+				TqhnswLoadNeighbors(index, model, metric, cElement, lc, m, ctx);
+		}
 
 		{
-			TqhnswNeighborArray *na = TqhnswGetNeighbors(base, cElement, lc);
+			TqhnswNeighborArray *na;
+			bool		locked = (index == NULL);	/* in-memory graph: lock shared */
+
+			na = TqhnswGetNeighbors(base, cElement, lc);
+
+			if (locked)
+			{
+				/*
+				 * Snapshot the neighbor array under a brief shared lock, then do
+				 * all the distance work below lock-free (mirrors the oracle's
+				 * HnswLoadUnvisitedFromMemory).  Holding cElement->lock across
+				 * the distance kernels would block a concurrent reciprocal
+				 * connect (EXCLUSIVE) on this node for the whole inner loop --
+				 * the hottest path of a parallel build.
+				 */
+				LWLockAcquire(&cElement->lock, LW_SHARED);
+				memcpy(localNa, na, localNaSize);
+				LWLockRelease(&cElement->lock);
+				na = localNa;
+			}
 
 			for (i = 0; i < na->count; i++)
 			{
@@ -221,14 +384,13 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 					TqhnswPtrStore(base, na->items[i].element, eElement);
 				}
 
-				if (eElement->visitedGeneration == gen)
+				if (TqhnswAddToVisited(base, &visited, eElement))
 					continue;
-				eElement->visitedGeneration = gen;
 
 				f = TqhnswGetSearchCandidate(w_node, pairingheap_first(W));
 				alwaysAdd = wlen < ef;
 
-				eDistance = TqhnswBuildDistance(query->rhat, eElement->rhat, dc, metric);
+				eDistance = TqhnswBuildDistance(TqhnswPtrAccess(base, query->rhat), TqhnswPtrAccess(base, eElement->rhat), dc, metric);
 
 				if (!(eDistance < f->distance || alwaysAdd))
 					continue;
@@ -303,8 +465,8 @@ CheckElementCloser(char *base, TqhnswCandidate *e, List *r, int dc, TqMetric met
 	foreach(lc2, r)
 	{
 		TqhnswCandidate *ri = lfirst(lc2);
-		double		distance = TqhnswBuildDistance(TqhnswPtrAccess(base, e->element)->rhat,
-												   TqhnswPtrAccess(base, ri->element)->rhat,
+		double		distance = TqhnswBuildDistance(TqhnswPtrAccess(base, TqhnswPtrAccess(base, e->element)->rhat),
+												   TqhnswPtrAccess(base, TqhnswPtrAccess(base, ri->element)->rhat),
 												   dc, metric);
 
 		if (distance <= e->distance)
@@ -368,18 +530,20 @@ void
 TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element,
 					   double distance, int lm, int lc, int dc, TqMetric metric)
 {
-	TqhnswNeighborArray *na = TqhnswGetNeighbors(base, target, lc);
+	TqhnswNeighborArray *na;
+
+	LWLockAcquire(&target->lock, LW_EXCLUSIVE);
+	na = TqhnswGetNeighbors(base, target, lc);
 
 	if (na->count < lm)
 	{
 		TqhnswPtrStore(base, na->items[na->count].element, element);
 		na->items[na->count].distance = distance;
 		na->count++;
-		return;
 	}
-
-	/* Full: rebuild the candidate set (existing + new) and re-select. */
+	else
 	{
+		/* Full: rebuild the candidate set (existing + new) and re-select. */
 		List	   *c = NIL;
 		List	   *selected;
 		ListCell   *lc2;
@@ -392,7 +556,7 @@ TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element
 			TqhnswElement *ne = TqhnswPtrAccess(base, na->items[i].element);
 
 			TqhnswPtrStore(base, hc->element, ne);
-			hc->distance = TqhnswBuildDistance(target->rhat, ne->rhat,
+			hc->distance = TqhnswBuildDistance(TqhnswPtrAccess(base, target->rhat), TqhnswPtrAccess(base, ne->rhat),
 											   dc, metric);
 			c = lappend(c, hc);
 		}
@@ -414,6 +578,8 @@ TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element
 			na->count++;
 		}
 	}
+
+	LWLockRelease(&target->lock);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -463,6 +629,7 @@ TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 
 	old = MemoryContextSwitchTo(ctx);
 	e = palloc0(sizeof(TqhnswElement));
+	LWLockInitialize(&e->lock, tqhnsw_lock_tranche_id);
 
 	buf = ReadBuffer(index, ItemPointerGetBlockNumber(tid));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -479,34 +646,21 @@ TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 	e->offno = ItemPointerGetOffsetNumber(tid);
 	e->neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 	e->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
-	e->codes = palloc(codesBytes);
-	memcpy(e->codes, etup->codes, codesBytes);
+	TqhnswPtrStore(NULL, e->codes, (char *) palloc(codesBytes));
+	memcpy(TqhnswPtrAccess(NULL, e->codes), etup->codes, codesBytes);
 
 	UnlockReleaseBuffer(buf);
 
-	e->rhat = palloc(sizeof(float) * model->dimCodes);
-	TqhnswReconstruct(model, e->codes, e->norm, e->scale, e->rhat);
+	TqhnswPtrStore(NULL, e->rhat, (float *) palloc(sizeof(float) * model->dimCodes));
+	TqhnswReconstruct(model, TqhnswPtrAccess(NULL, e->codes), e->norm, e->scale, TqhnswPtrAccess(NULL, e->rhat));
 
 	/* Cosine: unit-normalize rhat so -IP orders by cosine (mirrors build). */
 	if (metric == TQ_METRIC_COSINE)
-	{
-		double		n = 0.0;
-		int			i;
-
-		for (i = 0; i < model->dimCodes; i++)
-			n += (double) e->rhat[i] * (double) e->rhat[i];
-		n = sqrt(n);
-		if (n > 1e-20)
-		{
-			float		inv = (float) (1.0 / n);
-
-			for (i = 0; i < model->dimCodes; i++)
-				e->rhat[i] *= inv;
-		}
-	}
+		TqhnswNormalizeRhat(TqhnswPtrAccess(NULL, e->rhat), model->dimCodes);
 
 	/* Neighbor arrays populated lazily per layer by TqhnswLoadNeighbors. */
-	e->neighbors = palloc0(sizeof(TqhnswNeighborArray *) * (e->level + 1));
+	TqhnswPtrStore(NULL, e->neighbors,
+				   (TqhnswNeighborArrayPtr *) palloc0(sizeof(TqhnswNeighborArrayPtr) * (e->level + 1)));
 
 	MemoryContextSwitchTo(old);
 	entry->element = e;
@@ -563,7 +717,11 @@ TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 	UnlockReleaseBuffer(buf);
 	MemoryContextSwitchTo(old);
 
-	element->neighbors[lc] = na;
+	{
+		TqhnswNeighborArrayPtr *neighborList = TqhnswPtrAccess(NULL, element->neighbors);
+
+		TqhnswPtrStore(NULL, neighborList[lc], na);
+	}
 	return na;
 }
 
@@ -630,8 +788,8 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 
 	/* Entry point candidate. */
 	ep = list_make1(TqhnswInitSearchCandidate(entryPoint,
-											  TqhnswBuildDistance(element->rhat,
-																  entryPoint->rhat,
+											  TqhnswBuildDistance(TqhnswPtrAccess(base, element->rhat),
+																  TqhnswPtrAccess(base, entryPoint->rhat),
 																  dc, metric)));
 
 	/* 1st phase: greedy descent (ef=1) down to the element's level + 1. */
@@ -649,13 +807,33 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 	if (existing)
 		efConstruction++;
 
-	/* 2nd phase: per-layer search + select + connect. */
+	/*
+	 * The unlocked phase-A forward writes below assume element is private to this
+	 * backend.  That holds for a fresh insert (existing=false) and for the only
+	 * existing=true caller (vacuum repair), which runs on-disk (base==NULL) and
+	 * single-backed.  An existing=true element in a shared/in-memory graph would
+	 * already be discoverable, so the unlocked reset would drop its edges mid-update.
+	 */
+	Assert(base == NULL || !existing);
+
+	/*
+	 * 2nd phase A: per-layer search + select, storing the forward neighbors into
+	 * element's own (still-private) neighbor lists.  No reciprocal edges are added
+	 * here, so element stays undiscoverable to other workers' searches -- these
+	 * forward writes therefore need no lock.  Deferring the reciprocal connections
+	 * to phase B mirrors hnsw's split of HnswFindElementNeighbors (forward) from
+	 * UpdateNeighborsInMemory (reciprocal).  It is essential for the parallel
+	 * build: it guarantees element's own lists are COMPLETE before element is
+	 * published, so a concurrent worker never races this worker's unlocked forward
+	 * writes against its own locked TqhnswUpdateConnection(element, ...).
+	 */
 	for (lc = level; lc >= 0; lc--)
 	{
 		int			lm = TqhnswGetLayerM(m, lc);
 		List	   *lw = NIL;
 		List	   *selected;
 		ListCell   *lc2;
+		TqhnswNeighborArray *na;
 
 		w = TqhnswSearchLayer(base, index, model, cache, ctx, element, ep, efConstruction,
 							  lc, m, dc, metric, skipElement);
@@ -677,24 +855,53 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 
 		selected = TqhnswSelectNeighbors(base, lw, lm, dc, metric);
 
-		/* Connect element -> selected, and reciprocally selected -> element. */
+		/* Store the forward neighbors (element -> selected) in element's own list. */
+		na = TqhnswGetNeighbors(base, element, lc);
+		na->count = 0;
 		foreach(lc2, selected)
 		{
 			TqhnswCandidate *hc = lfirst(lc2);
-			TqhnswNeighborArray *na = TqhnswGetNeighbors(base, element, lc);
-			TqhnswElement *neighbor = TqhnswPtrAccess(base, hc->element);
 
-			TqhnswPtrStore(base, na->items[na->count].element, neighbor);
+			TqhnswPtrStore(base, na->items[na->count].element,
+						   TqhnswPtrAccess(base, hc->element));
 			na->items[na->count].distance = hc->distance;
 			na->count++;
-
-			/* Build + insert keep the in-memory reciprocal; repair (existing) does
-			 * not -- its reciprocity goes to disk via TqhnswUpdateNeighborsOnDisk. */
-			if (!existing)
-				TqhnswUpdateConnection(base, neighbor, element, hc->distance, lm, lc,
-									   dc, metric);
 		}
 
 		ep = w;
+	}
+
+	/*
+	 * 2nd phase B: add the reciprocal edges (selected -> element).  Adding the
+	 * first reciprocal edge is what publishes element into the searchable graph,
+	 * so this must run only after ALL forward lists are complete (phase A).
+	 * Mirrors UpdateNeighborsInMemory: snapshot element's layer-lc list under its
+	 * shared lock (once element is discoverable, a concurrent insert may add a
+	 * reciprocal edge into element), then add element to each neighbor under that
+	 * neighbor's exclusive lock (taken inside TqhnswUpdateConnection).  Repair
+	 * (existing) skips this -- its reciprocity is written to disk by
+	 * TqhnswUpdateNeighborsOnDisk.
+	 */
+	if (!existing)
+	{
+		for (lc = level; lc >= 0; lc--)
+		{
+			int			lm = TqhnswGetLayerM(m, lc);
+			Size		naSize = TQHNSW_NEIGHBOR_ARRAY_SIZE(lm);
+			TqhnswNeighborArray *snapshot = palloc(naSize);
+			int			i;
+
+			LWLockAcquire(&element->lock, LW_SHARED);
+			memcpy(snapshot, TqhnswGetNeighbors(base, element, lc), naSize);
+			LWLockRelease(&element->lock);
+
+			for (i = 0; i < snapshot->count; i++)
+			{
+				TqhnswElement *neighbor = TqhnswPtrAccess(base, snapshot->items[i].element);
+
+				TqhnswUpdateConnection(base, neighbor, element, snapshot->items[i].distance,
+									   lm, lc, dc, metric);
+			}
+		}
 	}
 }

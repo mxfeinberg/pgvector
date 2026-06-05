@@ -4,7 +4,10 @@
 #include "access/reloptions.h"
 #include "catalog/index.h"
 #include "commands/vacuum.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "tqhnsw.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -26,10 +29,50 @@ int			tqhnsw_ef_search;
 int			tqhnsw_rerank;
 bool		tqhnsw_force_scalar;
 static relopt_kind tqhnsw_relopt_kind;
+int			tqhnsw_lock_tranche_id;
+
+/*
+ * Assign a tranche ID for our LWLocks (mirrors HnswInitLockTranche). Only one
+ * backend needs to do this; the id is remembered in shared memory.
+ *
+ * This shared memory area is very small, so we just allocate it from the
+ * "slop" that PostgreSQL reserves for small allocations like this. If this
+ * grows bigger, we should use a shmem_request_hook and RequestAddinShmemSpace()
+ * to pre-reserve space for this.
+ */
+void
+TqhnswInitLockTranche(void)
+{
+	int		   *tranche_ids;
+	bool		found;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	tranche_ids = ShmemInitStruct("tqhnsw LWLock ids",
+								  sizeof(int) * 1,
+								  &found);
+	if (!found)
+	{
+#if PG_VERSION_NUM >= 190000
+		tranche_ids[0] = LWLockNewTrancheId("TqhnswBuild");
+#else
+		tranche_ids[0] = LWLockNewTrancheId();
+#endif
+	}
+	tqhnsw_lock_tranche_id = tranche_ids[0];
+	LWLockRelease(AddinShmemInitLock);
+
+#if PG_VERSION_NUM < 190000
+	/* Per-backend registration of the tranche ID */
+	LWLockRegisterTranche(tqhnsw_lock_tranche_id, "TqhnswBuild");
+#endif
+}
 
 void
 TqhnswInit(void)
 {
+	if (!process_shared_preload_libraries_in_progress)
+		TqhnswInitLockTranche();
+
 	tqhnsw_relopt_kind = add_reloption_kind();
 	add_int_reloption(tqhnsw_relopt_kind, "m", "Max number of connections",
 					  TQHNSW_DEFAULT_M, TQHNSW_MIN_M, TQHNSW_MAX_M, AccessExclusiveLock);
@@ -127,7 +170,7 @@ tqhnswhandler(PG_FUNCTION_ARGS)
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
 #if PG_VERSION_NUM >= 170000
-	amroutine->amcanbuildparallel = false;	/* MVP: serial build only */
+	amroutine->amcanbuildparallel = true;
 #endif
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false;

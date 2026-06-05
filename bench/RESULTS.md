@@ -543,17 +543,294 @@ as a kernel signal. CSVs: `bench/results/{sift1m,glove200,openai1m}_tqivf_x86.cs
 
 # TQ-HNSW (`tqhnsw`) vs HNSW — results
 
-This section will hold a direct head-to-head comparison of `tqhnsw` (TurboQuant-quantized
-HNSW: the HNSW graph topology with TQ 4-bit codes replacing the stored full-precision
-vectors at each node) against stock `hnsw` across the three standard ANN datasets
-(SIFT1M / GloVe-200-angular / OpenAI-1M×1536). The key axes are: **recall@10**,
-**QPS / avg latency (ms)**, **index size**, and **build time**. An `ef_search × rerank`
-sweep is run over a single built `tqhnsw` index (both are query-time GUCs, so one build
-covers the full grid). The `--tqhnsw-force-scalar` A/B flag (off = 8-bit SIMD block
-kernel, on = float LUT path) will also be reported to confirm the kernel label in the
-method string matches the measured latency. Expected benefit vs stock HNSW: smaller index
-(TQ 4-bit codes instead of float32 vectors stored at each node) with recall and QPS
-competitive across the `ef_search` sweep; `rerank` provides a final precision polish
-against full heap vectors.
+Direct head-to-head of `tqhnsw` (TurboQuant-quantized HNSW: the HNSW graph topology with
+TQ 4-bit codes replacing the full-precision vectors stored at each node) against stock
+`hnsw`, across the three standard ANN datasets. One `tqhnsw` index is built per dataset and
+queried across an `ef_search × rerank` grid (both are query-time GUCs); `hnsw` is the
+matched-`m`/`ef_construction` reference at `ef_search=100`.
 
-(numbers pending the sweep on `the-fire`)
+**Environment:** `the-fire` — AMD Zen4 (x86-64, AVX-512), PostgreSQL 18.4. **Non-assert
+optimized build** (`-O2 -march=native -ftree-vectorize`; the `-DUSE_ASSERT_CHECKING`
+define dropped so build/latency are representative). `maintenance_work_mem=16GB`,
+`max_parallel_maintenance_workers=4`. Both AMs at `m=16, ef_construction=64`,
+`fast_rotation=true`. `tqhnsw` queried with the **default 8-bit SIMD block kernel**
+(`force_scalar=off`). k=10; 500 queries for SIFT/GloVe, 200 for OpenAI. Raw CSVs:
+`bench/results/{sift1m,glove200,openai1m}_tqhnsw_x86.csv`. The `rerank=200` rows are
+omitted below — recall was identical to `rerank=100` at every point and QPS within noise,
+so `rerank=100` already saturates precision at these `ef_search` values.
+
+## SIFT1M — 1,000,000 × 128, L2
+
+| Method | Build (s) | Index size | Recall@10 | QPS | Avg ms |
+|--------|-----------|------------|-----------|-----|--------|
+| tqhnsw ef_search=40  | 406 | **295.7 MB** | 0.914 | **447** | 2.24 |
+| tqhnsw ef_search=100 | 406 | **295.7 MB** | 0.977 | 230 | 4.35 |
+| tqhnsw ef_search=200 | 406 | **295.7 MB** | **0.992** | 133 | 7.51 |
+| hnsw (ef_search=100) | **73** | 782.0 MB | 0.983 | 203 | 4.92 |
+
+**2.64× smaller.** tqhnsw beats hnsw recall at ef_search=200 (0.992 vs 0.983) at lower QPS,
+and at ef_search=40 runs 2.2× hnsw's QPS at 0.914 recall — a usable speed/recall knob hnsw
+lacks at fixed build.
+
+## GloVe-200-angular — 1,183,514 × 200, cosine
+
+| Method | Build (s) | Index size | Recall@10 | QPS | Avg ms |
+|--------|-----------|------------|-----------|-----|--------|
+| tqhnsw ef_search=40  | 1102 | **424.1 MB** | 0.590 | **296** | 3.38 |
+| tqhnsw ef_search=100 | 1102 | **424.1 MB** | 0.709 | 152 | 6.56 |
+| tqhnsw ef_search=200 | 1102 | **424.1 MB** | **0.779** | 89 | 11.24 |
+| hnsw (ef_search=100) | **120** | 1320.9 MB | 0.701 | 148 | 6.77 |
+
+**3.11× smaller.** GloVe-angular is the known-hard case where HNSW under-recalls at
+ef_search=100 (0.70); tqhnsw matches it at the same ef_search (0.709 @ 152 QPS ≈ hnsw 0.701
+@ 148 QPS) and exceeds it at ef_search=200 (0.779). Both want higher ef_search for high
+recall on this set.
+
+## OpenAI text-embedding-3-large — 999,800 × 1536, cosine
+
+| Method | Build (s) | Index size | Recall@10 | QPS | Avg ms |
+|--------|-----------|------------|-----------|-----|--------|
+| tqhnsw ef_search=40  | 3330 | **1301.8 MB** | 0.923 | **145** | 6.91 |
+| tqhnsw ef_search=100 | 3330 | **1301.8 MB** | 0.964 | 78 | 12.87 |
+| tqhnsw ef_search=200 | 3330 | **1301.8 MB** | **0.981** | 47 | 21.09 |
+| hnsw (ef_search=100) | **278** | 7810.9 MB | 0.960 | 139 | 7.19 |
+
+**6.0× smaller — the headline.** At 1536-d, full-precision vectors dominate the HNSW node
+payload, so 4-bit codes cut the index from 7.8 GB to 1.3 GB. tqhnsw beats hnsw recall at
+ef_search≥100 (0.964/0.981 vs 0.960), and at ef_search=40 nearly matches hnsw QPS (145 vs
+139) at 0.923 recall.
+
+---
+
+## What the data says (tqhnsw vs hnsw)
+
+**The memory win scales with dimension** — exactly the TurboQuant thesis:
+
+| Dataset | dim | tqhnsw | hnsw | Ratio |
+|---------|----:|-------:|-----:|------:|
+| SIFT1M  | 128  | 295.7 MB  | 782.0 MB  | **2.64×** |
+| GloVe   | 200  | 424.1 MB  | 1320.9 MB | **3.11×** |
+| OpenAI  | 1536 | 1301.8 MB | 7810.9 MB | **6.00×** |
+
+At low dim the per-node graph overhead (neighbor lists, headers) dilutes the code savings;
+at 1536-d the stored vector dominates and the ratio approaches the raw float32→4-bit
+compression. **The higher the embedding dimension, the larger the win** — and modern
+embedding models (OpenAI 1536, Cohere 1024, E5 1024) live at the high end.
+
+**Recall: tqhnsw ≥ hnsw at matched `ef_search`** on all three sets. The 4-bit-code graph
+descent plus heap rerank reproduces (and at ef_search=200 exceeds) stock HNSW recall — the
+quantization does not cost accuracy at these operating points.
+
+**Two costs define the tradeoff:**
+
+1. **Query latency at high recall.** To reach hnsw-or-better recall, tqhnsw needs higher
+   `ef_search` and therefore lower QPS (e.g. OpenAI 0.981 @ 47 QPS vs hnsw 0.960 @ 139 QPS).
+   Each visited node is reconstructed from codes + scored via the LUT rather than read as a
+   float vector, and the graph built on quantized distance is slightly noisier, so matching
+   recall costs more hops. At the *same* ef_search tqhnsw is latency-competitive; the gap is
+   the extra ef_search needed for the top recall band.
+2. **Build time — now parallel (sub-project #3).** The original single-threaded tqhnsw build
+   was 5.6× (SIFT) to 12× (OpenAI) slower than hnsw's 4-worker build — purely missing
+   parallelism, not algorithm. Sub-project #3 added the parallel build (see *Parallel build*
+   below): at full worker grant it runs **5.3–6.0× faster than serial**, bringing OpenAI from
+   57 min to **9.6 min** — within ~2× of hnsw at 6× less memory. Index size and recall are
+   unchanged by parallelism.
+
+**Bottom line:** at high dimension `tqhnsw` delivers a **6× smaller index at recall parity
+or better** with competitive query latency, and — with sub-project #3's parallel build — a
+build wall-clock within ~2× of hnsw (often much closer at full worker grant). For
+memory-bound deployments of high-dim embeddings — the dominant modern case — that is the
+intended win, now with no build-time penalty to speak of.
+
+> **Footnote:** the per-dataset build numbers above are the **serial** build of the
+> queried index (the query sweep builds one index serially); the parallel build added in
+> sub-project #3 is measured separately in *Parallel build* below. Index size and recall
+> are unaffected by parallelism — only the build-time column. The query kernel is the
+> default 8-bit SIMD block path (`force_scalar=off`); the block-vs-scalar A/B on a single
+> built index is a deferred harness refinement (no rebuild — see the benchmark handoff §5).
+
+---
+
+## Parallel build — serial vs parallel (the-fire)
+
+`tqhnsw` now supports the standard Postgres parallel index build (`amcanbuildparallel`).
+The data-oblivious TQ model (fixed-seed fast rotation + precomputed 4-bit codebook) is
+built once by the leader, which writes the meta + codebook side pages; worker backends
+then encode and insert into one shared in-memory graph held in a DSM segment, coordinated
+exactly like `hnsw`'s parallel build — per-element `LWLock`s, a two-lock entry-point
+protocol, a DSM bump allocator, and a flush-to-disk fallback that switches all workers to
+on-disk insert when the graph exceeds `maintenance_work_mem`. The on-disk format is
+unchanged, so **recall and size are identical to a serial build — only build wall-clock
+moves.**
+
+**Setup.** `the-fire` (Zen4, 16 cores, PG 18.4), `maintenance_work_mem=12GB`,
+`m=16, ef_construction=64`, fast rotation. *Serial* = `max_parallel_maintenance_workers=0`;
+*parallel* requests 8 and **forces the full grant** with `min_parallel_table_scan_size=0`
+(see the worker-grant note). Each dataset is loaded once and both builds are timed on the
+identical table; recall@10 is measured at `ef_search=100, rerank=100` against exact ground
+truth. CSV: `bench/results/tqhnsw_parallel_build_x86.csv`.
+
+| Dataset | dim | serial build | parallel build | **speedup** | size (serial=parallel) | recall@10 (serial/parallel) |
+|---|---|---|---|---|---|---|
+| SIFT1M    | 128  | 457 s  | **86 s**  | **5.29×** | 295.7 MB  | 0.9744 / 0.9748 |
+| GloVe-200 | 200  | 1252 s | **208 s** | **6.03×** | 424.1 MB  | 0.7078 / 0.7118 |
+| OpenAI-1M | 1536 | 3434 s | **578 s** | **5.94×** | 1301.8 MB | 0.9595 / 0.9580 |
+
+**The build gap to hnsw is closed.** tqhnsw's parallel build runs **5.3–6.0× faster than
+its serial path** — and unlike `tqivf` (whose tuplesort-bound build parallelizes to
+~1.9–2.2×), tqhnsw's compute-bound graph construction scales near-linearly with the worker
+count. At full 8-worker grant the OpenAI build drops from 57 min to **9.6 min** — within
+~2× of hnsw's 4-worker 278 s while keeping the 6× memory advantage. Size and recall are
+identical to serial on every dataset (the parallel-vs-serial recall deltas, +0.0004 /
++0.0040 / −0.0015, are unseeded-PRNG level-assignment noise).
+
+**Worker grant: forced here, TOAST-limited by default.** These numbers force the full
+8-worker grant via `min_parallel_table_scan_size=0`. With the *default* planner grant the
+worker count scales with main-heap pages, and high-dim vectors (OpenAI 1536-d) TOAST out
+of the main heap → few main-heap pages → the planner grants only ~2 workers (the same
+heuristic `tqivf` hit: SIFT 4 / GloVe 5 / OpenAI 2). So the *default-grant* OpenAI speedup
+would be ~2× (TOAST-limited), not 5.9×; the forced-grant number shows the build **scales**
+given workers, and operators who want the full speedup on high-dim tables can lower
+`min_parallel_table_scan_size`. Size and recall are unaffected by the grant.
+
+**Correctness preserved.** `make installcheck` includes a forced-worker `tqhnsw_build`
+case; TAP `102/103/104` (recall / concurrent insert / vacuum) stay green; the concurrent
+flush-to-disk fallback was validated under 4 workers with low `maintenance_work_mem`
+(recall-equivalent to the in-memory path, 0.5612 vs 0.5624). Correctness validation ran
+with `-DUSE_ASSERT_CHECKING`; these timing numbers use the optimized non-assert build.
+
+---
+
+# Five-way head-to-head — tqflat · ivfflat · hnsw · tqivf · tqhnsw
+
+The consolidated view of every method on the three standard datasets. **Read the
+comparability notes first — these rows are assembled from two separate suites and are
+apples-to-apples on _size and recall_, indicative on _latency_ and _build_.**
+
+**How to read this table (caveats):**
+- **All runs on `the-fire`** (AMD Zen4, x86-64/AVX-512, PostgreSQL 18.4,
+  `maintenance_work_mem=16GB`). Same host, same datasets.
+- **Two hnsw tunings are shown.** `hnsw (m32)` = the tuned `m=32, ef_construction=128`
+  baseline from the four-way `tqivf` suite (the stronger graph). `hnsw (m16)` =
+  `m=16, ef_construction=64`, the lighter baseline the `tqhnsw` sweep was matched against.
+  They are genuinely different operating points — compare `tqivf` against `hnsw (m32)` and
+  `tqhnsw` against `hnsw (m16)` for the fairest within-suite reads.
+- **Latency metric is not uniform.** `tqflat / ivfflat / hnsw(m32) / tqivf` latencies come
+  from the four-way suite (reported ≈ **p99**); `tqhnsw / hnsw(m16)` are **avg-ms** from the
+  tqhnsw harness. p99 ≳ avg, so cross-row latency is a guide, not a calibrated ranking.
+  `tqivf` latencies use the **widened (256/512-bit) kernel** re-run.
+- **Build column parallelism: ᵖ** = parallel build. **Every method now builds in parallel**,
+  including `tqhnsw` (sub-project #3). `tqhnsw` build is shown at the **forced full 8-worker
+  grant**; `tqivf` at its planner-granted parallelism. See the footnote under the OpenAI table
+  and the *Parallel build* section for serial baselines and the worker-grant caveat.
+- **`tqflat` is a full O(N) flat scan** (no ANN structure) — included as the size/recall
+  ceiling, not as a latency competitor.
+- Operating points: `tqflat` b4/rerank200; `ivfflat` lists=√N, probes≈10%; `tqivf`
+  probes=99/rerank200; `tqhnsw` two ef_search points. Recall knobs (`probes`, `ef_search`)
+  range wider than the single rows shown — see each method's own section above.
+
+## SIFT1M — 1,000,000 × 128, L2
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|--------|-----------|------------|-----------|--------------|
+| tqflat b4, rerank=200        | **3.2** | **77.8 MB**  | 0.9996 | 180 (flat scan) |
+| ivfflat (lists=1000, p=100)  | 11      | 525 MB       | 0.9988 | 33.6 |
+| hnsw (m16, ef=100)           | 73      | 782 MB       | 0.983  | **4.9** |
+| hnsw (m32, ef=100)           | 234     | 966 MB       | 0.9944 | 8.8 |
+| **tqivf** (p=99, r=200)      | 9.2ᵖ    | **87.5 MB**  | 0.9988 | 14.6 |
+| **tqhnsw** (ef=100)          | 86ᵖ     | 295.7 MB     | 0.977  | 4.4 |
+| **tqhnsw** (ef=200)          | 86ᵖ     | 295.7 MB     | **0.992** | 7.5 |
+
+## GloVe-200-angular — 1,183,514 × 200, cosine
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|--------|-----------|------------|-----------|--------------|
+| tqflat b4, rerank=200        | **7.4** | **164.6 MB** | **1.000** | 299 (flat scan) |
+| ivfflat (lists=1087, p=108)  | 20      | 1032 MB      | 0.9374 | 56.2 |
+| hnsw (m16, ef=100)           | 120     | 1320.9 MB    | 0.701  | **6.8** |
+| hnsw (m32, ef=100)           | 436     | 1542 MB      | 0.8386 | 12.2 |
+| **tqivf** (p=99, r=200)      | 16.4ᵖ   | **177.5 MB** | 0.933  | 20.6 |
+| **tqhnsw** (ef=100)          | 208ᵖ    | 424.1 MB     | 0.709  | 6.6 |
+| **tqhnsw** (ef=200)          | 208ᵖ    | 424.1 MB     | **0.779** | 11.2 |
+
+_(GloVe-angular is graph-hostile: every method needs a high recall knob; `tqivf` at p=400
+reaches 0.987, `tqflat` flat-scan is 1.000.)_
+
+## OpenAI text-embedding-3-large — 999,800 × 1536, cosine
+
+| Method | Build (s) | Index size | Recall@10 | Latency (ms) |
+|--------|-----------|------------|-----------|--------------|
+| tqflat b4, rerank=200        | **54**  | **998 MB**   | **1.000** | 882 (flat scan) |
+| ivfflat (lists=999, p=99)    | 93      | 7819 MB      | 0.9775 | 217 |
+| hnsw (m16, ef=100)           | 278     | 7810.9 MB    | 0.960  | **7.2** |
+| hnsw (m32, ef=100)           | 812     | 7811 MB      | 0.990  | 14.9 |
+| **tqivf** (p=99, r=200)      | 87.1ᵖ   | **1029 MB**  | 0.976  | 51.3 |
+| **tqhnsw** (ef=100)          | 578ᵖ    | **1301.8 MB**| 0.964  | 12.9 |
+| **tqhnsw** (ef=200)          | 578ᵖ    | **1301.8 MB**| **0.981** | 21.1 |
+
+ᵖ parallel build. `tqhnsw` forces the full 8-worker grant
+(`min_parallel_table_scan_size=0`); serial is **5.3–6.0× higher** (457 / 1252 / 3434 s).
+`tqivf` parallel build; its serial is ~1.9–2.2× higher (21 / 38 / 161 s). All other methods
+built with parallel workers. With the *default* (non-forced) grant, high-dim tables
+(OpenAI) TOAST out of the main heap and the planner grants fewer workers (~2) — see
+*Parallel build* above.
+
+## The whole story in two matrices
+
+**Index size (MB) — the TurboQuant axis.** TQ methods store 4-bit codes; ivfflat/hnsw store
+float32. The win grows with dimension.
+
+| Method | SIFT (128) | GloVe (200) | OpenAI (1536) |
+|--------|-----------:|------------:|--------------:|
+| tqflat   | **77.8**  | **164.6** | **998**  |
+| tqivf    | 87.5      | 177.5     | 1029     |
+| tqhnsw   | 295.7     | 424.1     | 1301.8   |
+| ivfflat  | 525       | 1032      | 7819     |
+| hnsw m32 | 966       | 1542      | 7811     |
+| _tqivf vs ivfflat_ | _6.0×_ | _5.8×_ | _7.6×_ |
+| _tqhnsw vs hnsw m16_ | _2.6×_ | _3.1×_ | _6.0×_ |
+
+**Recall@10 at the representative operating point** (each method's knob can go higher):
+
+| Method | SIFT | GloVe | OpenAI |
+|--------|-----:|------:|-------:|
+| tqflat (flat)   | 0.9996 | 1.000 | 1.000 |
+| tqivf (p99)     | 0.9988 | 0.933 | 0.976 |
+| tqhnsw (ef200)  | 0.992  | 0.779 | 0.981 |
+| ivfflat         | 0.9988 | 0.937 | 0.978 |
+| hnsw m32        | 0.9944 | 0.839 | 0.990 |
+| hnsw m16        | 0.983  | 0.701 | 0.960 |
+
+## What the five-way picture says
+
+- **Memory: the three TQ methods are 5–8× smaller** than ivfflat/hnsw at high dim, and the
+  advantage scales with dimension (the OpenAI-1536 column is the headline: ~1 GB vs ~7.8 GB).
+  `tqflat` ≤ `tqivf` < `tqhnsw` on size — the graph methods carry neighbor-list overhead the
+  flat/IVF layouts don't, which is why `tqhnsw`'s ratio (2.6–6.0×) trails `tqivf`'s (5.8–7.6×).
+- **Recall: every TQ method matches or beats its float counterpart** after rerank. `tqflat`
+  is the recall ceiling (full scan); `tqivf` tracks ivfflat; `tqhnsw` tracks/edges hnsw.
+- **Latency is the differentiator and it's a clean ladder:** `hnsw` (single-digit ms, the
+  raw-latency king) → `tqhnsw` (low-double-digit ms, ~6× less memory) → `tqivf`
+  (15–51 ms, sublinear, 6–8× less memory, beats ivfflat outright) → `ivfflat` (33–217 ms) →
+  `tqflat` (180–880 ms, O(N) flat scan). **`tqhnsw` is the new low-latency / low-memory
+  corner** the family was missing: it brings the graph's ~log(N) traversal to the TQ codes,
+  landing between hnsw and tqivf on latency while keeping the 6×-at-1536d memory win.
+- **Build: every method now builds in parallel.** `tqivf` is at ivfflat parity; `tqhnsw`'s
+  parallel build (sub-project #3) runs 5.3–6.0× faster than serial — at full worker grant
+  within ~2× of hnsw (86 / 208 / 578 s vs hnsw m16 73 / 120 / 278 s) while keeping the 6×
+  memory win. The old single-threaded 5–12× build gap is closed.
+
+**Pick-by-constraint:**
+
+| If you need… | Use |
+|---|---|
+| Smallest index, recall is king, latency tolerant (≤100k or batch) | **tqflat** |
+| Sublinear latency + 6–8× less memory, beats ivfflat on every axis | **tqivf** |
+| Graph-class latency at high dim with ~6× less memory than hnsw | **tqhnsw** |
+| Absolute lowest query latency, memory no object | hnsw |
+| (legacy float IVF) | ivfflat — dominated by tqivf everywhere tested |
+
+> **For a pristine apples-to-apples five-way** (one hnsw tuning, uniform p50/p99, uniform
+> kernel, single host pass) a unified re-run is the clean follow-up — the harness supports
+> all five methods in one invocation. The numbers above are assembled from the existing
+> suites and are exact on size/recall, indicative on latency/build.

@@ -5,11 +5,17 @@
 
 #include "access/amapi.h"
 #include "access/generic_xlog.h"
+#include "access/parallel.h"
 #include "access/reloptions.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
 #include "utils/hsearch.h"
+#include "storage/condition_variable.h"
+#include "storage/dsm.h"
+#include "storage/lwlock.h"
+#include "storage/s_lock.h"
+#include "storage/shm_toc.h"
 #include "utils/relcache.h"
 #include "utils/relptr.h"
 #include "tq.h"						/* TqModel, TqEntry, TqMetric, TqTypeInfo, TqPackCode */
@@ -31,6 +37,12 @@ typedef struct TqhnswNeighborArray TqhnswNeighborArray;
 
 TqhnswPtrDeclare(TqhnswElementData, TqhnswElementRelptr, TqhnswElementPtr);
 TqhnswPtrDeclare(TqhnswNeighborArray, TqhnswNeighborArrayRelptr, TqhnswNeighborArrayPtr);
+/* neighbors: relptr to an array of per-layer TqhnswNeighborArrayPtr (relptr-capable
+ * so the in-memory graph is DSM-relocatable for parallel build). */
+TqhnswPtrDeclare(TqhnswNeighborArrayPtr, TqhnswNeighborsRelptr, TqhnswNeighborsPtr);
+/* rhat/codes: relptr-capable element payloads (DSM-relocatable for parallel build). */
+TqhnswPtrDeclare(float, TqhnswRhatRelptr, TqhnswRhatPtr);
+TqhnswPtrDeclare(char, TqhnswCodesRelptr, TqhnswCodesPtr);
 
 #define TqhnswPtrAccess(base, hp) ((base) == NULL ? (hp).ptr : relptr_access((char *)(base), (hp).relptr))
 #define TqhnswPtrStore(base, hp, v) ((base) == NULL ? (void) ((hp).ptr = (v)) : (void) relptr_store((char *)(base), (hp).relptr, v))
@@ -208,6 +220,9 @@ typedef TqhnswNeighborTupleData * TqhnswNeighborTuple;
 	MAXALIGN(offsetof(TqhnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 /* ---- tqhnsw.c ---- */
+/* LWLock tranche for per-element / graph locks (parallel build). */
+extern int	tqhnsw_lock_tranche_id;
+extern void TqhnswInitLockTranche(void);
 extern void TqhnswInit(void);
 extern TqModel *TqhnswLoadModel(Relation index, MemoryContext ctx);
 extern TqModel *TqhnswGetCachedModel(Relation index);
@@ -228,33 +243,99 @@ struct TqhnswElementData
 {
 	ItemPointerData heaptid;
 	uint8		level;
-	float	   *rhat;			/* reconstructed rotated vector, dimCodes floats */
-	char	   *codes;			/* packed codes (flushed to disk) */
+	TqhnswRhatPtr rhat;			/* reconstructed rotated vector, dimCodes floats */
+	TqhnswCodesPtr codes;		/* packed codes (flushed to disk) */
 	float		norm;
 	float		scale;
-	uint32		visitedGeneration;	/* per-search visited stamp */
-	TqhnswNeighborArray **neighbors; /* [level+1]; each sized TqhnswGetLayerM(m,lc) */
+	TqhnswNeighborsPtr neighbors;	/* [level+1] array of per-layer relptrs */
 	/* assigned during flush */
 	BlockNumber blkno;
 	OffsetNumber offno;
 	BlockNumber neighborPage;
 	OffsetNumber neighborOffno;
-	TqhnswElement *next;		/* singly-linked build list */
+	TqhnswElementPtr next;		/* was TqhnswElement *next; now relptr-capable */
+	LWLock		lock;			/* protects this element's neighbor arrays */
 };
 
 static inline TqhnswNeighborArray *
 TqhnswGetNeighbors(char *base, TqhnswElement *element, int lc)
 {
-	(void) base;				/* in-memory build: neighbors are absolute */
+	TqhnswNeighborArrayPtr *neighborList = TqhnswPtrAccess(base, element->neighbors);
+
 	Assert(lc <= element->level);	/* neighbors[] is sized [0..level] */
-	return element->neighbors[lc];
+	return TqhnswPtrAccess(base, neighborList[lc]);
 }
+
+typedef struct TqhnswAllocator
+{
+	void	   *(*alloc) (Size size, void *state);
+	void	   *state;
+}			TqhnswAllocator;
+
+#define TqhnswAlloc(allocator, size) ((allocator)->alloc((size), (allocator)->state))
+
+/*
+ * Relocatable graph header: owns the build-list head, the entry point, and the
+ * vector counter.  Lives on the build-state stack for serial builds and (in a
+ * later task) in a DSM segment for parallel builds.  Mirrors hnsw's HnswGraph.
+ */
+typedef struct TqhnswGraph
+{
+	slock_t		lock;			/* protects head + nVectors */
+	TqhnswElementPtr head;
+	int64		nVectors;
+
+	LWLock		entryLock;
+	LWLock		entryWaitLock;
+	TqhnswElementPtr entryPoint;
+
+	LWLock		allocatorLock;
+	Size		memoryUsed;
+	Size		memoryTotal;
+	LWLock		flushLock;		/* serialize the in-memory -> on-disk flush */
+	bool		flushed;		/* true once the graph has been flushed to disk */
+	int64		indtuples;		/* total tuples inserted (in-memory + on-disk) */
+}			TqhnswGraph;
+
+#define TQHNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
+
+typedef struct TqhnswShared
+{
+	/* Immutable state */
+	Oid			heaprelid;
+	Oid			indexrelid;
+	bool		isconcurrent;
+
+	/* Worker progress */
+	ConditionVariable workersdonecv;
+	slock_t		mutex;
+	int			nparticipantsdone;
+	double		reltuples;
+
+	/* Shared graph (the ParallelTableScanDesc is BUFFERALIGN'd after this struct) */
+	TqhnswGraph graphData;
+}			TqhnswShared;
+
+#define ParallelTableScanFromTqhnswShared(shared) \
+	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(TqhnswShared)))
+
+typedef struct TqhnswLeader
+{
+	ParallelContext *pcxt;
+	int			nparticipanttuplesorts;
+	TqhnswShared *tqhnswshared;
+	char	   *tqhnswarea;
+	Snapshot	snapshot;
+}			TqhnswLeader;
 
 /* ---- tqhnswutils.c ---- */
 /* Reconstruct the rotated full-magnitude vector from an entry's codes (no inverse
  * rotation: distances are computed in rotated space, which is orthonormal). */
 extern void TqhnswReconstruct(const TqModel *model, const char *codes,
 							  float norm, float scale, float *rhat /* dimCodes */);
+
+/* Cosine: unit-normalize a reconstructed rhat vector in place. */
+extern void TqhnswNormalizeRhat(float *rhat, int dimCodes);
 
 /* Build-time distance on reconstructed rotated vectors (smaller = nearer). */
 extern double TqhnswBuildDistance(const float *a, const float *b, int dc,
@@ -301,6 +382,8 @@ extern TqhnswNeighborArray *TqhnswLoadNeighbors(Relation index, const TqModel *m
 												int lc, int m, MemoryContext ctx);
 
 /* ---- tqhnswbuild.c ---- */
+/* ---- tqhnswbuild.c (parallel worker entry point) ---- */
+extern PGDLLEXPORT void TqhnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 extern int	TqhnswRandomLevel(double ml, int maxLevel);
 extern IndexBuildResult *tqhnswbuild(Relation heap, Relation index, struct IndexInfo *indexInfo);
 extern void tqhnswbuildempty(Relation index);
@@ -348,6 +431,9 @@ extern IndexBulkDeleteResult *tqhnswbulkdelete(IndexVacuumInfo *info, IndexBulkD
 extern IndexBulkDeleteResult *tqhnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
 
 /* ---- tqhnswinsert.c (exposed for vacuum repair) ---- */
+
+/* on-disk single-tuple insert; the build's out-of-memory fallback routes here */
+extern void TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric, Datum value, ItemPointer heaptid, MemoryContext insertCtx);
 
 typedef enum TqhnswEntryUpdate
 {

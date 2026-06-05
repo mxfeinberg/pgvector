@@ -54,48 +54,39 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 	element = palloc0(sizeof(TqhnswElement));
 	element->heaptid = *heaptid;
 	element->level = (uint8) level;
-	element->visitedGeneration = 0;
 	element->norm = scratch->norm;
 	element->scale = scratch->scale;
-	element->codes = palloc0(codesBytes);
-	memcpy(element->codes, scratch->data, codesBytes);
-	element->rhat = palloc(sizeof(float) * dimCodes);
+	TqhnswPtrStore(NULL, element->codes, (char *) palloc0(codesBytes));
+	memcpy(TqhnswPtrAccess(NULL, element->codes), scratch->data, codesBytes);
+	TqhnswPtrStore(NULL, element->rhat, (float *) palloc(sizeof(float) * dimCodes));
 
-	element->neighbors = palloc(sizeof(TqhnswNeighborArray *) * (level + 1));
-	for (lc = 0; lc <= level; lc++)
 	{
-		int			lm = TqhnswGetLayerM(m, lc);
+		TqhnswNeighborArrayPtr *neighbors = palloc(sizeof(TqhnswNeighborArrayPtr) * (level + 1));
 
-		element->neighbors[lc] = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
-		element->neighbors[lc]->count = 0;
+		TqhnswPtrStore(NULL, element->neighbors, neighbors);
+		for (lc = 0; lc <= level; lc++)
+		{
+			int			lm = TqhnswGetLayerM(m, lc);
+			TqhnswNeighborArray *na = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
+
+			na->count = 0;
+			TqhnswPtrStore(NULL, neighbors[lc], na);
+		}
 	}
 
 	element->blkno = InvalidBlockNumber;
 	element->offno = InvalidOffsetNumber;
 	element->neighborPage = InvalidBlockNumber;
 	element->neighborOffno = InvalidOffsetNumber;
-	element->next = NULL;
+	TqhnswPtrStore(NULL, element->next, (TqhnswElement *) NULL);
+	LWLockInitialize(&element->lock, tqhnsw_lock_tranche_id);
 
-	TqhnswReconstruct(model, element->codes, element->norm, element->scale,
-					  element->rhat);
+	TqhnswReconstruct(model, TqhnswPtrAccess(NULL, element->codes), element->norm, element->scale,
+					  TqhnswPtrAccess(NULL, element->rhat));
 
 	/* Cosine: unit-normalize rhat so -IP orders by cosine (mirrors build). */
 	if (metric == TQ_METRIC_COSINE)
-	{
-		double		n = 0.0;
-		int			i;
-
-		for (i = 0; i < dimCodes; i++)
-			n += (double) element->rhat[i] * (double) element->rhat[i];
-		n = sqrt(n);
-		if (n > 1e-20)
-		{
-			float		inv = (float) (1.0 / n);
-
-			for (i = 0; i < dimCodes; i++)
-				element->rhat[i] *= inv;
-		}
-	}
+		TqhnswNormalizeRhat(TqhnswPtrAccess(NULL, element->rhat), dimCodes);
 
 	pfree(scratch);
 	return element;
@@ -115,7 +106,7 @@ TqhnswSetElementTuple(TqhnswElementTuple etup, TqhnswElement *e, int codesBytes)
 	etup->heaptid = e->heaptid;
 	etup->norm = e->norm;
 	etup->scale = e->scale;
-	memcpy(etup->codes, e->codes, codesBytes);
+	memcpy(etup->codes, TqhnswPtrAccess(NULL, e->codes), codesBytes);
 }
 
 /*
@@ -135,7 +126,7 @@ TqhnswSetNeighborTuple(TqhnswNeighborTuple ntup, TqhnswElement *e, int m)
 	for (lc = e->level; lc >= 0; lc--)
 	{
 		int			lm = TqhnswGetLayerM(m, lc);
-		TqhnswNeighborArray *na = e->neighbors[lc];
+		TqhnswNeighborArray *na = TqhnswGetNeighbors(NULL, e, lc);
 		int			i;
 
 		for (i = 0; i < lm; i++)
@@ -558,7 +549,7 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 	 * pointer so we never leave a dangling array on, or otherwise mutate, the
 	 * cached element's authoritative neighbor state (FIX 2).
 	 */
-	savedNeighbors = neighborElement->neighbors[lc];
+	savedNeighbors = TqhnswGetNeighbors(NULL, neighborElement, lc);
 	na = TqhnswLoadNeighbors(index, model, metric, neighborElement, lc, m, updateCtx);
 
 	if (na->count < lm)
@@ -578,13 +569,17 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 		TqhnswNeighborArray *sna;
 		int			i;
 
-		scratch.rhat = neighborElement->rhat;
+		TqhnswPtrStore(NULL, scratch.rhat, TqhnswPtrAccess(NULL, neighborElement->rhat));
 		scratch.level = (uint8) lc;		/* neighbors[] sized [0..lc] */
-		scratch.neighbors = (TqhnswNeighborArray **)
-			palloc0(sizeof(TqhnswNeighborArray *) * (lc + 1));
+		LWLockInitialize(&scratch.lock, tqhnsw_lock_tranche_id);
 		sna = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
 		sna->count = na->count;
-		scratch.neighbors[lc] = sna;
+		{
+			TqhnswNeighborArrayPtr *snl = palloc0(sizeof(TqhnswNeighborArrayPtr) * (lc + 1));
+
+			TqhnswPtrStore(NULL, scratch.neighbors, snl);
+			TqhnswPtrStore(NULL, snl[lc], sna);
+		}
 
 		/* Resolve each loaded TID to an element so rhat is available. */
 		for (i = 0; i < na->count; i++)
@@ -593,8 +588,8 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 												  &na->items[i].tid, cacheCtx, cache);
 
 			TqhnswPtrStore(NULL, sna->items[i].element, ne);
-			sna->items[i].distance = TqhnswBuildDistance(neighborElement->rhat,
-														 ne->rhat, dc, metric);
+			sna->items[i].distance = TqhnswBuildDistance(TqhnswPtrAccess(NULL, neighborElement->rhat),
+														 TqhnswPtrAccess(NULL, ne->rhat), dc, metric);
 		}
 
 		/* Re-select into the scratch slice (newElement competes). */
@@ -617,7 +612,11 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 	}
 
 	/* Restore the cached element's neighbor pointer (FIX 2). */
-	neighborElement->neighbors[lc] = savedNeighbors;
+	{
+		TqhnswNeighborArrayPtr *nl = TqhnswPtrAccess(NULL, neighborElement->neighbors);
+
+		TqhnswPtrStore(NULL, nl[lc], savedNeighbors);
+	}
 
 	MemoryContextSwitchTo(oldCtx);
 	return idx;
@@ -707,7 +706,7 @@ TqhnswUpdateNeighborsOnDisk(Relation index, const TqModel *model, TqMetric metri
 
 	for (int lc = newElement->level; lc >= 0; lc--)
 	{
-		TqhnswNeighborArray *na = newElement->neighbors[lc];
+		TqhnswNeighborArray *na = TqhnswGetNeighbors(NULL, newElement, lc);
 
 		for (int i = 0; i < na->count; i++)
 		{
@@ -841,7 +840,7 @@ TqhnswGetInsertMeta(Relation index, int *m, int *efConstruction,
 /*
  * Insert a single quantized tuple into the on-disk graph.
  */
-static void
+void
 TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 						Datum value, ItemPointer heaptid, MemoryContext insertCtx)
 {

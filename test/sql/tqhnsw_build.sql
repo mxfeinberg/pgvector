@@ -32,3 +32,26 @@ SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LI
 EXPLAIN (COSTS OFF) SELECT id FROM tqhnsw_b ORDER BY v <-> ARRAY[1,1,1,1,1,1,1,1]::real[]::vector LIMIT 1;
 
 DROP TABLE tqhnsw_b;
+
+-- Parallel build: forced workers produce a usable index with correct recall.
+SET max_parallel_maintenance_workers = 4;
+SET min_parallel_table_scan_size = 1;
+CREATE TABLE tqhnsw_par (id int, v vector(32));
+INSERT INTO tqhnsw_par SELECT g,
+  ARRAY[g%7,g%11,g%13,g%17,g%19,g%23,g%29,g%31,
+        g%37,g%41,g%43,g%47,g%53,g%59,g%61,g%67,
+        g%71,g%73,g%79,g%83,g%89,g%97,g%101,g%103,
+        g%107,g%109,g%113,g%127,g%131,g%137,g%139,g%149]::real[]::vector(32)
+  FROM generate_series(1, 2000) g;
+CREATE INDEX tqhnsw_par_idx ON tqhnsw_par USING tqhnsw (v vector_l2_ops);
+-- Verify the graph is fully built.
+SELECT regexp_replace(tqhnsw_test_meta('tqhnsw_par_idx'), ' entry_level=.*', '');
+SELECT tqhnsw_test_graph('tqhnsw_par_idx');
+-- Every one of the first 10 query rows finds itself as the nearest neighbor.
+SELECT count(*) = 10 AS all_self_match FROM (
+  SELECT q.id, (SELECT p.id FROM tqhnsw_par p ORDER BY p.v <-> q.v LIMIT 1) AS nn
+  FROM tqhnsw_par q WHERE q.id <= 10
+) s WHERE nn = id;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_maintenance_workers;
+DROP TABLE tqhnsw_par;

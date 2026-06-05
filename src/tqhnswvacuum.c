@@ -264,13 +264,18 @@ TqhnswResetNeighbors(TqhnswElement *element, int m)
 {
 	int			lc;
 
-	element->neighbors = palloc(sizeof(TqhnswNeighborArray *) * (element->level + 1));
-	for (lc = 0; lc <= element->level; lc++)
 	{
-		int			lm = TqhnswGetLayerM(m, lc);
+		TqhnswNeighborArrayPtr *neighbors = palloc(sizeof(TqhnswNeighborArrayPtr) * (element->level + 1));
 
-		element->neighbors[lc] = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
-		element->neighbors[lc]->count = 0;
+		TqhnswPtrStore(NULL, element->neighbors, neighbors);
+		for (lc = 0; lc <= element->level; lc++)
+		{
+			int			lm = TqhnswGetLayerM(m, lc);
+			TqhnswNeighborArray *na = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
+
+			na->count = 0;
+			TqhnswPtrStore(NULL, neighbors[lc], na);
+		}
 	}
 }
 
@@ -433,12 +438,13 @@ RepairGraphEntryPoint(TqhnswVacuumState *vs)
 				 * point).  The pointer array itself stays allocated so
 				 * TqhnswSearchLayer's per-layer NULL check is valid.
 				 */
-				if (highestPoint != NULL && highestPoint->neighbors != NULL)
+				if (highestPoint != NULL && !TqhnswPtrIsNull(NULL, highestPoint->neighbors))
 				{
+					TqhnswNeighborArrayPtr *nl = TqhnswPtrAccess(NULL, highestPoint->neighbors);
 					int			lc;
 
 					for (lc = 0; lc <= highestPoint->level; lc++)
-						highestPoint->neighbors[lc] = NULL;
+						TqhnswPtrStore(NULL, nl[lc], (TqhnswNeighborArray *) NULL);
 				}
 
 				RepairGraphElement(vs, entryPoint, highestPoint, cache, vs->tmpCtx);

@@ -1,0 +1,33 @@
+
+================ sift 09:29:22 ================
+  n=1000000 dim=128 metric=vector_l2_ops
+  loading 1000000 vectors …
+  Loading 1,000,000 vectors (dim=128) … done (21.1s)
+  SERIAL build …
+  serial: 457.2s size=295.7 MB recall@10=0.9744
+  PARALLEL build …
+  parallel: 86.4s size=295.7 MB recall@10=0.9748 (cap=8)
+  >>> sift: speedup 5.29x  (serial 457s -> parallel 86s), size 295.7 MB/295.7 MB, recall 0.9744/0.9748
+
+================ glove 09:38:52 ================
+  n=1183514 dim=200 metric=vector_cosine_ops
+  loading 1183514 vectors …
+  Loading 1,183,514 vectors (dim=200) … done (111.7s)
+  SERIAL build …
+  serial: 1251.6s size=424.1 MB recall@10=0.7078
+  PARALLEL build …
+  parallel: 207.5s size=424.0 MB recall@10=0.7118 (cap=8)
+  >>> glove: speedup 6.03x  (serial 1252s -> parallel 208s), size 424.1 MB/424.0 MB, recall 0.7078/0.7118
+
+================ openai 10:05:11 ================
+  n=999800 dim=1536 metric=vector_cosine_ops
+  loading 999800 vectors …
+  Loading 999,800 vectors (dim=1536) … done (723.3s)
+  computing exact ground truth (seqscan) …
+  SERIAL build …
+  serial: 3433.8s size=1301.8 MB recall@10=0.9595
+  PARALLEL build …
+  parallel: 577.7s size=1301.8 MB recall@10=0.9580 (cap=8)
+  >>> openai: speedup 5.94x  (serial 3434s -> parallel 578s), size 1301.8 MB/1301.8 MB, recall 0.9595/0.9580
+
+DONE -> bench/results/tqhnsw_parallel_build_x86.csv
