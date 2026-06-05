@@ -13,12 +13,10 @@
 #include "varatt.h"
 #endif
 
-PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
-
 /*
  * Quantize a heap value into a fresh in-memory element (codes + rhat), drawing a
  * random level.  Mirrors TqhnswBuildCallback's encode block exactly (detoast ->
- * cosine l2_normalize -> TqEncode -> reconstruct rhat -> cosine unit-normalize
+ * TqExtractForEncode -> TqEncode -> reconstruct rhat -> cosine unit-normalize
  * rhat) so on-disk inserts are numerically identical to build-time nodes.
  *
  * Allocated in the current (per-insert) memory context.  Neighbor arrays are
@@ -31,23 +29,23 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 					  Datum value)
 {
 	TqhnswElement *element;
-	Vector	   *vec;
 	int			level;
 	int			lc;
 	Size		scratchSize = TqEntrySize(dimCodes, model->bits, false);
 	TqEntry    *scratch = (TqEntry *) palloc(scratchSize);
+	const TqTypeInfo *ti = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
+	float	   *vscratch = palloc(sizeof(float) * model->dim);	/* freed with the
+																	 * caller's short-lived
+																	 * context (insertCtx /
+																	 * build tmpCtx reset) */
+	const float *fv;
 
 	value = PointerGetDatum(PG_DETOAST_DATUM(value));
 
-	/* Cosine: normalize before encode so the stripped norm is unit. */
-	if (metric == TQ_METRIC_COSINE)
-		value = DirectFunctionCall1Coll(l2_normalize,
-										index->rd_indcollation[0], value);
-
-	vec = DatumGetVector(value);
+	fv = TqExtractForEncode(ti, value, metric, vscratch, model->dim);
 
 	memset(scratch, 0, scratchSize);
-	TqEncode(model, vec->x, scratch);
+	TqEncode(model, fv, scratch);
 
 	level = TqhnswRandomLevel(TqhnswGetMl(m), TqhnswGetMaxLevel(m));
 

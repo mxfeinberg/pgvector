@@ -242,11 +242,34 @@ typedef struct TqBlockAccum
 	int			sinceFlush;		/* coords accumulated since last flush */
 }			TqBlockAccum;
 
-/* Type-info vtable returned by tqflat_support (one per opclass) */
+/* Type-info vtable returned by each opclass's type-info support proc. */
 typedef struct TqTypeInfo
 {
 	TqMetric	metric;
+	int			maxDimensions;	/* reject declared dim above this */
+	/*
+	 * Produce a dense float array of length `dim` from a column Datum.
+	 *   vector:    returns ->x directly (scratch unused — zero-copy)
+	 *   halfvec:   HalfToFloat4 per coord into scratch, returns scratch
+	 *   sparsevec: zeroes scratch, scatters nonzeros, returns scratch
+	 */
+	const float *(*toFloat) (Datum value, float *scratch, int dim);
+	/*
+	 * Type-specific l2_normalize (returns a normalized Datum of the same type).
+	 * Used for cosine on the native-Datum exact-rerank path and the rescan
+	 * query-normalize. NULL for non-cosine opclasses (only the cosine vtables
+	 * set it). Mirrors HnswTypeInfo.normalize.
+	 */
+	PGFunction	normalize;
 }			TqTypeInfo;
+
+/* ---- tqtypeinfo.c ---- */
+extern const float *TqVectorToFloat(Datum value, float *scratch, int dim);
+extern const float *TqHalfvecToFloat(Datum value, float *scratch, int dim);
+extern const float *TqSparsevecToFloat(Datum value, float *scratch, int dim);
+extern const TqTypeInfo *TqGetTypeInfo(Relation index, int procnum);
+extern const float *TqExtractForEncode(const TqTypeInfo *ti, Datum value,
+									   TqMetric metric, float *scratch, int dim);
 
 /* ---- tqfwht.c ---- */
 extern int	TqNextPow2(int n);
@@ -258,6 +281,7 @@ extern void TqApplyRht(uint64 seed, int nstages, int dPadded,
 #define TQ_RHT_STAGES 3
 
 /* ---- tqquant.c ---- */
+extern void TqL2NormalizeFloat(float *v, int dim);
 extern void TqBuildCodebook(int dim, int bits, float *boundaries, float *centroids);
 extern void TqBuildRotation(int dim, uint64 seed, float *rotation);
 extern void TqBuildQjl(int dim, uint64 seed, float *qjl);

@@ -151,6 +151,31 @@ TqBuildQjl(int dim, uint64 seed, float *qjl)
 }
 
 /* ----------------------------------------------------------------
+ * TqL2NormalizeFloat
+ *
+ * In-place L2 normalization of a float array, matching l2_normalize semantics:
+ * norm accumulated in double; zero norm leaves the vector unchanged (zeros).
+ * Unlike l2_normalize we skip the isinf overflow guard: since norm >= |v[i]|
+ * for every i, each output |v[i] / norm| <= 1, so the result is bounded and
+ * cannot overflow a float.
+ * ---------------------------------------------------------------- */
+void
+TqL2NormalizeFloat(float *v, int dim)
+{
+	double		norm = 0;
+
+	for (int i = 0; i < dim; i++)
+		norm += (double) v[i] * (double) v[i];
+	norm = sqrt(norm);
+
+	if (norm > 0)
+	{
+		for (int i = 0; i < dim; i++)
+			v[i] = (float) (v[i] / norm);
+	}
+}
+
+/* ----------------------------------------------------------------
  * M1.3: TqBuildCodebook
  *
  * Grid-based Lloyd-Max quantizer for the marginal coordinate density

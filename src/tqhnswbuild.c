@@ -35,8 +35,6 @@
 StaticAssertDecl(sizeof(TqhnswPageOpaqueData) == sizeof(TqPageOpaqueData),
 				 "tqhnsw page opaque must match tq page opaque");
 
-PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
-
 /*
  * Serial in-memory build state.  Holds the model, the in-memory graph (a
  * singly-linked build list rooted at head), the entry point, and the build
@@ -58,6 +56,10 @@ typedef struct TqhnswBuildState
 
 	TqEntry    *scratch;		/* TqEntrySize(dimCodes, bits, false) bytes */
 	Size		scratchSize;
+
+	/* Type-info vtable (resolved from opclass support proc). */
+	const TqTypeInfo *typeInfo;
+	float	   *vecScratch;		/* dim floats, reused per tuple */
 
 	TqhnswGraph graphData;		/* serial: graph lives here */
 	TqhnswGraph *graph;			/* points at graphData (serial) or DSM (parallel) */
@@ -210,14 +212,16 @@ TqhnswResolveBuildParams(Relation index, int *dim, TqMetric *metric,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("column does not have dimensions")));
 
-	/* Resolve metric from FUNCTION 3 support proc (mirror TqInitBuildState). */
-	*metric = TQ_METRIC_L2;
-	if (OidIsValid(index_getprocid(index, 1, TQHNSW_TYPE_INFO_PROC)))
+	/* Resolve metric + maxDimensions from the type-info support proc. */
 	{
-		FmgrInfo   *typeProc = index_getprocinfo(index, 1, TQHNSW_TYPE_INFO_PROC);
-		TqTypeInfo *ti = (TqTypeInfo *) DatumGetPointer(FunctionCall0Coll(typeProc, InvalidOid));
+		const TqTypeInfo *ti = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
 
 		*metric = ti->metric;
+		if (*dim > ti->maxDimensions)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("column cannot have more than %d dimensions for tqhnsw index",
+							ti->maxDimensions)));
 	}
 }
 
@@ -407,16 +411,12 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 
 	/* Encode the value into the element (codes/norm/scale + reconstructed rhat). */
 	{
-		Vector	   *vec;
+		const float *fv = TqExtractForEncode(buildstate->typeInfo, value,
+											 buildstate->metric,
+											 buildstate->vecScratch, buildstate->dim);
 
-		/* Cosine: normalize before encode so the stripped norm is unit. */
-		if (buildstate->metric == TQ_METRIC_COSINE)
-			value = DirectFunctionCall1Coll(l2_normalize,
-											buildstate->index->rd_indcollation[0], value);
-
-		vec = DatumGetVector(value);
 		memset(buildstate->scratch, 0, buildstate->scratchSize);
-		TqEncode(model, vec->x, buildstate->scratch);
+		TqEncode(model, fv, buildstate->scratch);
 		element->norm = buildstate->scratch->norm;
 		element->scale = buildstate->scratch->scale;
 		memcpy(TqhnswPtrAccess(base, element->codes), buildstate->scratch->data,
@@ -424,7 +424,7 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 		TqhnswReconstruct(model, TqhnswPtrAccess(base, element->codes), element->norm,
 						  element->scale, TqhnswPtrAccess(base, element->rhat));
 
-		/* Cosine: unit-normalize rhat so -IP orders by cosine (spike caveat). */
+		/* Cosine: unit-normalize rhat so -IP orders by cosine. */
 		if (buildstate->metric == TQ_METRIC_COSINE)
 			TqhnswNormalizeRhat(TqhnswPtrAccess(base, element->rhat), buildstate->dimCodes);
 	}
@@ -505,8 +505,9 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 }
 
 /*
- * Build callback.  Detoast -> (cosine) normalize -> insert (in-memory, or the
- * on-disk fallback once the graph has been flushed).  Mirrors hnswbuild.c's
+ * Build callback.  Extract -> encode -> insert (in-memory, or the on-disk
+ * fallback once the graph has been flushed); the cosine float-normalize happens
+ * inside TqExtractForEncode at the encode site.  Mirrors hnswbuild.c's
  * BuildCallback.
  */
 static void
@@ -771,6 +772,8 @@ TqhnswInitWorkerBuildState(TqhnswBuildState * buildstate, Relation index)
 	buildstate->maxLevel = TqhnswGetMaxLevel(buildstate->m);
 	buildstate->scratchSize = TqEntrySize(buildstate->model->dimCodes, bits, false);
 	buildstate->scratch = (TqEntry *) palloc(buildstate->scratchSize);
+	buildstate->typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
+	buildstate->vecScratch = palloc(sizeof(float) * buildstate->dim);
 	buildstate->graphCtx = AllocSetContextCreate(CurrentMemoryContext,
 												 "tqhnsw build graph",
 												 ALLOCSET_DEFAULT_SIZES);
@@ -1175,9 +1178,16 @@ tqhnswbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	buildstate.ml = TqhnswGetMl(buildstate.m);
 	buildstate.maxLevel = TqhnswGetMaxLevel(buildstate.m);
 
-	/* Scratch encode entry. */
+	/* Scratch encode entry + type-info vtable. */
 	buildstate.scratchSize = TqEntrySize(model.dimCodes, bits, false);
 	buildstate.scratch = (TqEntry *) palloc(buildstate.scratchSize);
+	buildstate.typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
+	buildstate.vecScratch = palloc(sizeof(float) * buildstate.dim);
+
+	if (buildstate.typeInfo->toFloat == TqSparsevecToFloat)
+		ereport(NOTICE,
+				(errmsg("tq densifies sparsevec to %d dimensions; sparse storage advantage is not preserved",
+						buildstate.dim)));
 
 	buildstate.graphCtx = AllocSetContextCreate(CurrentMemoryContext,
 												"tqhnsw build graph",

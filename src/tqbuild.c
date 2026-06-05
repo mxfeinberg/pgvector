@@ -35,6 +35,10 @@ typedef struct TqBuildState
 	int			dimCodes;		/* dim, or next_pow2(dim) in fast mode */
 	TqModel		model;
 
+	/* Type-info vtable (resolved from opclass support proc). */
+	const TqTypeInfo *typeInfo;
+	float	   *vecScratch;		/* dim floats, reused per tuple */
+
 	/* Entry sizing */
 	Size		entrySize;		/* MAXALIGNed size of one TqEntry on disk */
 	int			codesBytes;		/* TQ_CODES_BYTES(dim, bits) */
@@ -604,17 +608,21 @@ TqBuildCallback(Relation index, ItemPointer tid, Datum *values,
 {
 	TqBuildState *buildstate = (TqBuildState *) state;
 	MemoryContext oldCtx;
-	Vector	   *vec;
 	int			slot;
 
 	if (isnull[0])
 		return;
 
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
-	vec = DatumGetVector(values[0]);
 
-	memset(buildstate->entry, 0, buildstate->entrySize);
-	TqEncode(&buildstate->model, vec->x, buildstate->entry);
+	{
+		const float *fv = buildstate->typeInfo->toFloat(values[0],
+														buildstate->vecScratch,
+														buildstate->dim);
+
+		memset(buildstate->entry, 0, buildstate->entrySize);
+		TqEncode(&buildstate->model, fv, buildstate->entry);
+	}
 
 	slot = buildstate->slot;
 	TqScatterCodes(&buildstate->model, buildstate->entry->data, slot,
@@ -641,7 +649,6 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 				 IndexInfo *indexInfo, ForkNumber forkNum)
 {
 	TqOptions  *opts = (TqOptions *) index->rd_options;
-	FmgrInfo   *typeProc;
 
 	buildstate->heap = heap;
 	buildstate->index = index;
@@ -654,10 +661,6 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("column does not have dimensions")));
-	if (buildstate->dim > TQ_MAX_DIM)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("column cannot have more than %d dimensions for tqflat index", TQ_MAX_DIM)));
 	if (buildstate->dim < 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -686,16 +689,24 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 	buildstate->dimCodes = buildstate->fastRotation ?
 		TqNextPow2(buildstate->dim) : buildstate->dim;
 
-	/* Metric from the opclass type-info support function (default L2) */
-	buildstate->metric = TQ_METRIC_L2;
-	if (OidIsValid(index_getprocid(index, 1, TQ_TYPE_INFO_PROC)))
-	{
-		TqTypeInfo *ti;
+	/* Type-info vtable from the opclass support proc (default vector/L2). */
+	buildstate->typeInfo = TqGetTypeInfo(index, TQ_TYPE_INFO_PROC);
+	buildstate->metric = buildstate->typeInfo->metric;
 
-		typeProc = index_getprocinfo(index, 1, TQ_TYPE_INFO_PROC);
-		ti = (TqTypeInfo *) DatumGetPointer(FunctionCall0Coll(typeProc, InvalidOid));
-		buildstate->metric = ti->metric;
-	}
+	if (buildstate->dim > buildstate->typeInfo->maxDimensions)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("column cannot have more than %d dimensions for tqflat index",
+						buildstate->typeInfo->maxDimensions)));
+
+	/* heap == NULL on the ambuildempty path: no rows to densify, no warning. */
+	if (buildstate->heap != NULL &&
+		buildstate->typeInfo->toFloat == TqSparsevecToFloat)
+		ereport(NOTICE,
+				(errmsg("tq densifies sparsevec to %d dimensions; sparse storage advantage is not preserved",
+						buildstate->dim)));
+
+	buildstate->vecScratch = palloc(sizeof(float) * buildstate->dim);
 
 	/* Entry sizing (over dimCodes: padded dim in fast mode, else dim) */
 	buildstate->codesBytes = TQ_CODES_BYTES(buildstate->dimCodes, buildstate->bits);
@@ -913,7 +924,6 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		 bool indexUnchanged, struct IndexInfo *indexInfo)
 {
 	TqModel    *model;
-	Vector	   *vec;
 	TqEntry    *entry;
 	Size		entrySize;
 	Buffer		buf;
@@ -940,17 +950,20 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 	/* Load (or reuse cached) model */
 	model = TqGetCachedModel(index);
 
-	/* Get the vector */
-	vec = DatumGetVector(values[0]);
-
 	/* Allocate and zero the scratch entry (sized over dimCodes) */
 	entrySize = TqEntrySize(model->dimCodes, model->bits, model->tqProd);
 	entry = palloc0(entrySize);
 	entry->heaptid = *heap_tid;
 	entry->deleted = 0;
 
-	/* Encode: fills codes (+ qjl signs when tqProd) into entry->data */
-	TqEncode(model, vec->x, entry);
+	/* Encode: plain extraction (no normalize) so norm is stored correctly. */
+	{
+		const TqTypeInfo *ti = TqGetTypeInfo(index, TQ_TYPE_INFO_PROC);
+		float	   *scratch = palloc(sizeof(float) * model->dim);
+		const float *fv = ti->toFloat(values[0], scratch, model->dim);
+
+		TqEncode(model, fv, entry);
+	}
 
 	MemoryContextSwitchTo(oldCtx);
 

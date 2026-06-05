@@ -218,11 +218,20 @@ tqhnswhandler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(amroutine);
 }
 
+/* Type-specific l2_normalize, wired into cosine TqTypeInfo vtables for rerank. */
+PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum sparsevec_l2_normalize(PG_FUNCTION_ARGS);
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_l2_support);
 Datum
 tqhnsw_l2_support(PG_FUNCTION_ARGS)
 {
-	static const TqTypeInfo ti = {.metric = TQ_METRIC_L2};
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_L2,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqVectorToFloat,
+	};
 
 	PG_RETURN_POINTER(&ti);
 }
@@ -231,7 +240,11 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_ip_support);
 Datum
 tqhnsw_ip_support(PG_FUNCTION_ARGS)
 {
-	static const TqTypeInfo ti = {.metric = TQ_METRIC_IP};
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_IP,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqVectorToFloat,
+	};
 
 	PG_RETURN_POINTER(&ti);
 }
@@ -240,7 +253,92 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_cosine_support);
 Datum
 tqhnsw_cosine_support(PG_FUNCTION_ARGS)
 {
-	static const TqTypeInfo ti = {.metric = TQ_METRIC_COSINE};
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_COSINE,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqVectorToFloat,
+		.normalize = l2_normalize,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_halfvec_l2_support);
+Datum
+tqhnsw_halfvec_l2_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_L2,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqHalfvecToFloat,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_halfvec_ip_support);
+Datum
+tqhnsw_halfvec_ip_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_IP,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqHalfvecToFloat,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_halfvec_cosine_support);
+Datum
+tqhnsw_halfvec_cosine_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_COSINE,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqHalfvecToFloat,
+		.normalize = halfvec_l2_normalize,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_sparsevec_l2_support);
+Datum
+tqhnsw_sparsevec_l2_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_L2,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqSparsevecToFloat,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_sparsevec_ip_support);
+Datum
+tqhnsw_sparsevec_ip_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_IP,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqSparsevecToFloat,
+	};
+
+	PG_RETURN_POINTER(&ti);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqhnsw_sparsevec_cosine_support);
+Datum
+tqhnsw_sparsevec_cosine_support(PG_FUNCTION_ARGS)
+{
+	static const TqTypeInfo ti = {
+		.metric = TQ_METRIC_COSINE,
+		.maxDimensions = TQ_MAX_DIM,
+		.toFloat = TqSparsevecToFloat,
+		.normalize = sparsevec_l2_normalize,
+	};
 
 	PG_RETURN_POINTER(&ti);
 }

@@ -20,13 +20,10 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
-
-PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
 
 /*
  * One scored candidate kept in the final result array.  dist is the value we
@@ -72,9 +69,14 @@ typedef struct TqhnswScanOpaqueData
 	Oid			collation;
 	AttrNumber	heapAttno;		/* heap attribute backing the index column */
 
+	/* Type-info vtable (resolved from opclass support proc). */
+	const TqTypeInfo *typeInfo;
+
 	/* Per-query state (rebuilt on each rescan). */
 	float	   *lut;			/* dimCodes * nLevels */
-	Vector	   *queryVec;		/* normalized query (for rerank / cosine) */
+	Datum		queryDatum;		/* native query (normalized for cosine), for rerank */
+	bool		haveQuery;
+	float	   *vecScratch;		/* dim floats (rebuilt per rescan) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
 	/* 8-bit query LUT for the block kernel (built each rescan, mirrors tqivf). */
@@ -656,18 +658,17 @@ TqhnswSearchGraph(IndexScanDesc scan)
 }
 
 /*
- * Fetch the original vector for tid from the heap.  Returns a palloc'd copy in
- * the current memory context, or NULL if the tuple is no longer visible.
- * Replicated from TqHeapFetchVector (tqscan.c).
+ * Fetch the original datum for tid from the heap.  Returns a palloc'd
+ * fully-detoasted copy in the current memory context, or (Datum) 0 if the
+ * tuple is no longer visible.  Mirrors TqHeapFetchDatum (tqscan.c).
  */
-static Vector *
-TqhnswHeapFetchVector(IndexScanDesc scan, TqhnswScanOpaque so, ItemPointer tid)
+static Datum
+TqhnswHeapFetchDatum(IndexScanDesc scan, TqhnswScanOpaque so, ItemPointer tid)
 {
 	bool		call_again = false;
 	bool		all_dead = false;
 	Datum		datum;
 	bool		isnull;
-	Vector	   *vec;
 
 	if (so->fetch == NULL)
 	{
@@ -691,20 +692,14 @@ TqhnswHeapFetchVector(IndexScanDesc scan, TqhnswScanOpaque so, ItemPointer tid)
 	ExecClearTuple(so->slot);
 	if (!table_index_fetch_tuple(so->fetch, tid, scan->xs_snapshot, so->slot,
 								 &call_again, &all_dead))
-		return NULL;
+		return (Datum) 0;
 
 	datum = slot_getattr(so->slot, so->heapAttno, &isnull);
 	if (isnull)
-		return NULL;
+		return (Datum) 0;
 
-	vec = DatumGetVector(datum);
-	{
-		Size		sz = VARSIZE_ANY(vec);
-		Vector	   *copy = palloc(sz);
-
-		memcpy(copy, vec, sz);
-		return copy;
-	}
+	/* palloc'd, fully-detoasted copy that outlives the slot. */
+	return PointerGetDatum(PG_DETOAST_DATUM_COPY(datum));
 }
 
 IndexScanDesc
@@ -731,6 +726,10 @@ tqhnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->procinfo = index_getprocinfo(index, 1, TQHNSW_DISTANCE_PROC);
 	so->collation = index->rd_indcollation[0];
 	so->heapAttno = index->rd_index->indkey.values[0];
+
+	/* Type-info vtable from the opclass support proc. */
+	so->typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
+	so->haveQuery = false;
 
 	/* Entry point + m from the meta page. */
 	TqhnswGetMetaInfo(index, &dim, &so->metric, &so->m,
@@ -780,7 +779,8 @@ tqhnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	/* Reset per-query allocations; the model lives in rd_indexcxt. */
 	MemoryContextReset(so->tmpCtx);
 	so->lut = NULL;
-	so->queryVec = NULL;
+	so->haveQuery = false;
+	so->vecScratch = NULL;
 	so->results = NULL;
 	so->lut8 = NULL;
 	so->expandOut = NULL;
@@ -792,29 +792,38 @@ tqhnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		!(scan->orderByData->sk_flags & SK_ISNULL))
 	{
 		Datum		value = scan->orderByData->sk_argument;
-		Vector	   *q;
+		const float *qfloat;
 
 		Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
 		Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
 
-		/* Normalize the query for cosine (||q|| = 1). */
-		if (so->metric == TQ_METRIC_COSINE)
-			value = DirectFunctionCall1Coll(l2_normalize, so->collation, value);
+		/*
+		 * Cosine: normalize the NATIVE query (type-specific) so rerank's
+		 * FUNCTION 1 sees a unit query and the float LUT is built from it.
+		 */
+		if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
+			value = DirectFunctionCall1Coll(so->typeInfo->normalize, so->collation, value);
 
-		q = DatumGetVector(value);
-		so->queryVec = q;
+		/* Keep the native (normalized for cosine) query for native-Datum rerank. */
+		so->queryDatum = value;
+		so->haveQuery = true;
 
+		/* Dense float query for the LUT/estimate path. */
+		so->vecScratch = palloc(sizeof(float) * model->dim);
+		qfloat = so->typeInfo->toFloat(value, so->vecScratch, model->dim);
+
+		/* ||q||^2 (1 for cosine after normalize, but compute generally). */
 		{
 			double		s = 0.0;
 			int			i;
 
-			for (i = 0; i < q->dim; i++)
-				s += (double) q->x[i] * q->x[i];
+			for (i = 0; i < model->dim; i++)
+				s += (double) qfloat[i] * qfloat[i];
 			so->qNormSq = s;
 		}
 
 		so->lut = palloc(sizeof(float) * model->dimCodes * model->nLevels);
-		TqBuildQueryLut(model, q->x, so->lut, NULL);
+		TqBuildQueryLut(model, qfloat, so->lut, NULL);
 
 		so->lut8 = palloc(model->dimCodes * model->nLevels);
 		TqBuildLut8(model, so->lut, so->lut8, &so->lutBias, &so->lutScale);
@@ -887,7 +896,7 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * whose heap tuple is no longer visible get +inf and drop out (this is
 		 * how deletes are handled without graph mutation).
 		 */
-		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->queryVec != NULL)
+		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->haveQuery)
 		{
 			int			k = Min(tqhnsw_rerank, so->nresults);
 			int			i;
@@ -896,28 +905,31 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 			for (i = 0; i < k; i++)
 			{
-				Vector	   *heapVec = TqhnswHeapFetchVector(scan, so, &so->results[i].heaptid);
+				Datum		heapDatum = TqhnswHeapFetchDatum(scan, so, &so->results[i].heaptid);
 
-				if (heapVec != NULL)
+				if (heapDatum != (Datum) 0)
 				{
-					Datum		heapDatum = PointerGetDatum(heapVec);
+					Datum		cmpDatum = heapDatum;
 					double		d;
 
-					if (so->metric == TQ_METRIC_COSINE)
-						heapDatum = DirectFunctionCall1Coll(l2_normalize,
-															so->collation,
-															heapDatum);
+					/*
+					 * Cosine: normalize the heap value (type-specific) so
+					 * FUNCTION 1 (-inner_product) computes -cos, matching the
+					 * estimate ranking.
+					 */
+					if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
+						cmpDatum = DirectFunctionCall1Coll(so->typeInfo->normalize,
+														   so->collation, heapDatum);
 
 					d = DatumGetFloat8(FunctionCall2Coll(so->procinfo,
 														 so->collation,
-														 PointerGetDatum(so->queryVec),
-														 heapDatum));
-
+														 so->queryDatum,
+														 cmpDatum));
 					so->results[i].dist = d;
 
-					if (so->metric == TQ_METRIC_COSINE)
-						pfree(DatumGetPointer(heapDatum));
-					pfree(heapVec);
+					if (cmpDatum != heapDatum)
+						pfree(DatumGetPointer(cmpDatum));
+					pfree(DatumGetPointer(heapDatum));
 				}
 				else
 				{
