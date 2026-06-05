@@ -1028,6 +1028,15 @@ CREATE FUNCTION tqivf_ip_support(internal) RETURNS internal
 CREATE FUNCTION tqivf_cosine_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION tqivf_halfvec_l2_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION tqivf_halfvec_ip_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION tqivf_halfvec_cosine_support(internal) RETURNS internal
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE OPERATOR CLASS vector_l2_ops
 	DEFAULT FOR TYPE vector USING tqivf AS
 	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
@@ -1051,6 +1060,33 @@ CREATE OPERATOR CLASS vector_cosine_ops
 	FUNCTION 3 vector_spherical_distance(vector, vector),
 	FUNCTION 4 vector_norm(vector),
 	FUNCTION 6 tqivf_cosine_support(internal);
+
+CREATE OPERATOR CLASS halfvec_l2_ops
+	FOR TYPE halfvec USING tqivf AS
+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec),
+	FUNCTION 3 l2_distance(halfvec, halfvec),
+	FUNCTION 5 ivfflat_halfvec_support(internal),
+	FUNCTION 6 tqivf_halfvec_l2_support(internal);
+
+CREATE OPERATOR CLASS halfvec_ip_ops
+	FOR TYPE halfvec USING tqivf AS
+	OPERATOR 1 <#> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
+	FUNCTION 3 halfvec_spherical_distance(halfvec, halfvec),
+	FUNCTION 4 l2_norm(halfvec),
+	FUNCTION 5 ivfflat_halfvec_support(internal),
+	FUNCTION 6 tqivf_halfvec_ip_support(internal);
+
+CREATE OPERATOR CLASS halfvec_cosine_ops
+	FOR TYPE halfvec USING tqivf AS
+	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
+	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
+	FUNCTION 2 l2_norm(halfvec),
+	FUNCTION 3 halfvec_spherical_distance(halfvec, halfvec),
+	FUNCTION 4 l2_norm(halfvec),
+	FUNCTION 5 ivfflat_halfvec_support(internal),
+	FUNCTION 6 tqivf_halfvec_cosine_support(internal);
 
 -- tqhnsw access method
 

@@ -130,6 +130,8 @@ typedef struct TqivfBuildState
 	int			dimPadded;
 	int			dimCodes;		/* dim, or next_pow2(dim) in fast mode */
 	TqModel		model;
+	const TqTypeInfo *typeInfo;	/* tqivf type-info vtable (extractor + metric) */
+	float	   *vecScratch;		/* dim floats, reused per tuple at encode */
 
 	/* Clustering (full-precision, un-rotated centers) */
 	int			lists;
@@ -789,10 +791,6 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("column does not have dimensions")));
-	if (buildstate->dim > TQ_MAX_DIM)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("column cannot have more than %d dimensions for tqivf index", TQ_MAX_DIM)));
 	if (buildstate->dim < 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -804,15 +802,21 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 	buildstate->lists = opts ? opts->lists : TQIVF_DEFAULT_LISTS;
 	buildstate->nLevels = 1 << buildstate->bits;
 
-	/* Metric from the opclass type-info support function (default L2) */
-	buildstate->metric = TQ_METRIC_L2;
-	if (OidIsValid(index_getprocid(index, 1, TQIVF_TYPE_INFO_PROC)))
-	{
-		FmgrInfo   *typeProc = index_getprocinfo(index, 1, TQIVF_TYPE_INFO_PROC);
-		TqTypeInfo *ti = (TqTypeInfo *) DatumGetPointer(FunctionCall0Coll(typeProc, InvalidOid));
+	/* Type-info vtable from the opclass support proc (default vector/L2). */
+	buildstate->typeInfo = TqGetTypeInfo(index, TQIVF_TYPE_INFO_PROC);
+	buildstate->metric = buildstate->typeInfo->metric;
 
-		buildstate->metric = ti->metric;
-	}
+	if (buildstate->dim > buildstate->typeInfo->maxDimensions)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("column cannot have more than %d dimensions for tqivf index",
+						buildstate->typeInfo->maxDimensions)));
+
+	/*
+	 * vecScratch lives in this (parent) context, NOT tmpCtx, so it persists
+	 * and is reused across all build-callback tuples (tmpCtx is reset per tuple).
+	 */
+	buildstate->vecScratch = palloc(sizeof(float) * buildstate->dim);
 
 	/* Assignment / probe support functions (FUNCTION 1 = exact distance) */
 	buildstate->procinfo = index_getprocinfo(index, 1, TQIVF_DISTANCE_PROC);
@@ -820,9 +824,11 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 	buildstate->collation = index->rd_indcollation[0];
 
 	/*
-	 * Clustering context: tqivf deliberately leaves opclass FUNCTION slot 5
-	 * unregistered, so IvfflatGetTypeInfo() returns the default Vector
-	 * typeInfo.  Centers are sized to `lists`; IvfflatKmeans reads k from
+	 * Clustering typeInfo from the opclass: the vector opclasses omit FUNCTION
+	 * slot 5 so IvfflatGetTypeInfo() returns the default Vector typeInfo, while
+	 * the halfvec opclasses register slot 5 (ivfflat_halfvec_support) so
+	 * sampling / k-means / centroid storage run natively on halfvec.  Centers
+	 * are sized to `lists` via typeInfo->itemSize; IvfflatKmeans reads k from
 	 * centers->maxlen / centers->length and never touches reloptions.
 	 */
 	typeInfo = IvfflatGetTypeInfo(index);
@@ -921,7 +927,8 @@ TqivfComputeCenters(TqivfBuildState * buildstate)
 /*
  * Write the `lists` list-directory records up front (Invalid chain heads, zero
  * counts), recording each record's (blkno, offno) for later back-patching.
- * Mirrors ivfbuild.c's CreateListPages, using TQIVF_LIST_SIZE for item size.
+ * Mirrors ivfbuild.c's CreateListPages, sizing each list item via the type's
+ * itemSize (offsetof(center) + itemSize(dim)).
  */
 static BlockNumber
 TqivfCreateListPages(TqivfBuildState * buildstate)
@@ -932,7 +939,9 @@ TqivfCreateListPages(TqivfBuildState * buildstate)
 	Page		page;
 	GenericXLogState *state;
 	BlockNumber listStart;
-	Size		listSize = MAXALIGN(TQIVF_LIST_SIZE(buildstate->dim));
+	const		IvfflatTypeInfo *ivfTypeInfo = IvfflatGetTypeInfo(buildstate->index);
+	Size		listSize = MAXALIGN(offsetof(TqivfListData, center) +
+									ivfTypeInfo->itemSize(buildstate->dim));
 	TqivfList	list = palloc0(listSize);
 
 	buf = TqNewBuffer(index, forkNum);
@@ -1021,7 +1030,9 @@ TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
 	}
 
 	{
-		Vector	   *vec = DatumGetVector(value);
+		const float *fv = buildstate->typeInfo->toFloat(value,
+														buildstate->vecScratch,
+														buildstate->dim);
 		Size		entrySize = TqEntrySize(buildstate->model.dimCodes,
 										   buildstate->model.bits, false);
 		Size		byteaSize = VARHDRSZ + entrySize;
@@ -1031,7 +1042,7 @@ TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
 		SET_VARSIZE(payload, byteaSize);
 		entry->heaptid = *tid;
 		entry->deleted = 0;
-		TqEncode(&buildstate->model, vec->x, entry);
+		TqEncode(&buildstate->model, fv, entry);
 
 		ExecClearTuple(slot);
 		slot->tts_values[0] = Int32GetDatum(closestCenter);
@@ -1394,7 +1405,9 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			struct IndexInfo *indexInfo)
 {
 	TqModel    *model;
-	Vector	   *vec;
+	Datum		vecDatum;
+	const TqTypeInfo *ti;
+	float	   *vecScratch;
 	TqEntry    *entry;
 	Size		entrySize;
 	MemoryContext insertCtx;
@@ -1430,8 +1443,8 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	/* Get meta info: metric, list count, directory head. */
 	TqivfGetMetaInfo(index, NULL, &metric, &lists, &listStart);
 
-	/* Detoast once for all calls (DatumGetVector already calls PG_DETOAST_DATUM) */
-	vec = DatumGetVector(values[0]);
+	/* Detoast once for all calls */
+	vecDatum = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
 
 	/*
 	 * Normalize if needed (FUNCTION 2 / TQIVF_NORM_PROC).  For inner product
@@ -1444,14 +1457,14 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 		collation = index->rd_indcollation[0];
 
-		if (!IvfflatCheckNorm(normprocinfo, collation, PointerGetDatum(vec)))
+		if (!IvfflatCheckNorm(normprocinfo, collation, vecDatum))
 		{
 			MemoryContextSwitchTo(oldCtx);
 			MemoryContextDelete(insertCtx);
 			return false;
 		}
 
-		vec = DatumGetVector(IvfflatNormValue(typeInfo, collation, PointerGetDatum(vec)));
+		vecDatum = IvfflatNormValue(typeInfo, collation, vecDatum);
 	}
 
 	/*
@@ -1494,7 +1507,7 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 				double		distance;
 
 				distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation,
-															PointerGetDatum(vec),
+															vecDatum,
 															PointerGetDatum(&list->center)));
 
 				if (!found || distance < minDistance)
@@ -1527,11 +1540,13 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	 * layout; take them from the model so the size tracks the model if that ever
 	 * changes.
 	 */
+	ti = TqGetTypeInfo(index, TQIVF_TYPE_INFO_PROC);
+	vecScratch = palloc(sizeof(float) * model->dim);
 	entrySize = MAXALIGN(TqEntrySize(model->dimCodes, model->bits, false));
 	entry = palloc0(entrySize);
 	entry->heaptid = *heap_tid;
 	entry->deleted = 0;
-	TqEncode(model, vec->x, entry);
+	TqEncode(model, ti->toFloat(vecDatum, vecScratch, model->dim), entry);
 
 	MemoryContextSwitchTo(oldCtx);
 

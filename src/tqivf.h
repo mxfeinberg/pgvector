@@ -91,7 +91,8 @@ typedef TqivfMetaPageData * TqivfMetaPage;
 
 /*
  * List directory record (one per list). Mirrors IvfflatListData: variable-length
- * with `center` last, so record size = offsetof(...center) + VECTOR_SIZE(dim).
+ * with `center` last, so record size = offsetof(...center) + the centroid
+ * type's itemSize(dim) (VECTOR_SIZE for vector, smaller for halfvec).
  * The per-list payload is the TQ chain heads instead of a single startPage.
  */
 typedef struct TqivfListData
@@ -107,7 +108,6 @@ typedef struct TqivfListData
 
 typedef TqivfListData * TqivfList;
 
-#define TQIVF_LIST_SIZE(_dim) (offsetof(TqivfListData, center) + VECTOR_SIZE(_dim))
 
 /* Scan-time list candidate (ordered by centroid distance). */
 typedef struct TqivfScanList

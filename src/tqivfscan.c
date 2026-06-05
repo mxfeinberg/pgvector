@@ -24,8 +24,6 @@
 #include "varatt.h"
 #endif
 
-PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
-
 #define GetTqivfScanList(ptr) pairingheap_container(TqivfScanList, ph_node, ptr)
 #define GetTqivfScanListConst(ptr) pairingheap_const_container(TqivfScanList, ph_node, ptr)
 
@@ -62,7 +60,10 @@ typedef struct TqivfScanOpaqueData
 	uint8	   *lut8;			/* 8-bit query LUT for the block kernel */
 	float		lutBias;		/* affine recovery: mse = lutScale*sum + dc*lutBias */
 	float		lutScale;
-	Vector	   *queryVec;		/* normalized query (for rerank / cosine) */
+	const TqTypeInfo *typeInfo;	/* tqivf type-info vtable (extractor + normalize) */
+	Datum		queryDatum;		/* native query (normalized for cosine), for rerank/probe */
+	bool		haveQuery;
+	float	   *vecScratch;		/* dim floats (rebuilt per rescan) for the LUT */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
 	/* Results. */
@@ -153,16 +154,15 @@ TqivfEstToDist(TqMetric metric, double qNormSq, float norm, float est)
 /*
  * Fetch the original vector for tid from the heap.  Returns a palloc'd copy in
  * the current memory context, or NULL if the tuple is no longer visible.
- * Replicates tqscan's TqHeapFetchVector scoped to TqivfScanOpaque.
+ * Replicates tqscan's TqHeapFetchDatum scoped to TqivfScanOpaque.
  */
-static Vector *
-TqivfHeapFetchVector(IndexScanDesc scan, TqivfScanOpaque so, ItemPointer tid)
+static Datum
+TqivfHeapFetchDatum(IndexScanDesc scan, TqivfScanOpaque so, ItemPointer tid)
 {
 	bool		call_again = false;
 	bool		all_dead = false;
 	Datum		datum;
 	bool		isnull;
-	Vector	   *vec;
 
 	if (so->fetch == NULL)
 	{
@@ -186,25 +186,14 @@ TqivfHeapFetchVector(IndexScanDesc scan, TqivfScanOpaque so, ItemPointer tid)
 	ExecClearTuple(so->slot);
 	if (!table_index_fetch_tuple(so->fetch, tid, scan->xs_snapshot, so->slot,
 								 &call_again, &all_dead))
-		return NULL;
+		return (Datum) 0;
 
 	datum = slot_getattr(so->slot, so->heapAttno, &isnull);
 	if (isnull)
-		return NULL;
+		return (Datum) 0;
 
-	/*
-	 * Detoast first, then size from the DETOASTED pointer (see tqscan's
-	 * TqHeapFetchVector for the short-header truncation hazard).  The slot's
-	 * storage may be reused on the next fetch, so always return a private copy.
-	 */
-	vec = DatumGetVector(datum);
-	{
-		Size		sz = VARSIZE_ANY(vec);
-		Vector	   *copy = palloc(sz);
-
-		memcpy(copy, vec, sz);
-		return copy;
-	}
+	/* palloc'd, fully-detoasted copy that outlives the slot. */
+	return PointerGetDatum(PG_DETOAST_DATUM_COPY(datum));
 }
 
 /*
@@ -251,7 +240,7 @@ TqivfGetScanLists(IndexScanDesc scan)
 			/* Exact query->centroid distance via FUNCTION 1. */
 			distance = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
 														PointerGetDatum(&list->center),
-														PointerGetDatum(so->queryVec)));
+														so->queryDatum));
 
 			if (listCount < so->maxProbes)
 			{
@@ -564,7 +553,7 @@ TqivfLoadBatch(IndexScanDesc scan)
 	 * not set xs_orderbyvals), so the scale difference affects only internal
 	 * ordering.
 	 */
-	if (tqivf_rerank > 0 && n > 0 && so->queryVec != NULL)
+	if (tqivf_rerank > 0 && n > 0 && so->haveQuery)
 	{
 		int			k = Min(tqivf_rerank, n);
 
@@ -572,33 +561,29 @@ TqivfLoadBatch(IndexScanDesc scan)
 
 		for (i = 0; i < k; i++)
 		{
-			Vector	   *heapVec = TqivfHeapFetchVector(scan, so, &results[i].tid);
+			Datum		heapDatum = TqivfHeapFetchDatum(scan, so, &results[i].tid);
 
-			if (heapVec != NULL)
+			if (heapDatum != (Datum) 0)
 			{
-				Datum		heapDatum = PointerGetDatum(heapVec);
+				Datum		cmpDatum = heapDatum;
 				double		d;
 
 				/*
-				 * For cosine, normalize the heap vector so FUNCTION 1
-				 * (vector_negative_inner_product) computes -cos(q, x), ranking
-				 * identically to the estimate-based distance 1 - cos(q, x).
+				 * For cosine, normalize the heap value (type-specific) so
+				 * FUNCTION 1 computes -cos(q, x), ranking identically to the
+				 * estimate-based distance 1 - cos(q, x).
 				 */
-				if (so->metric == TQ_METRIC_COSINE)
-					heapDatum = DirectFunctionCall1Coll(l2_normalize,
-														so->collation,
-														heapDatum);
+				if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
+					cmpDatum = DirectFunctionCall1Coll(so->typeInfo->normalize,
+													   so->collation, heapDatum);
 
-				d = DatumGetFloat8(FunctionCall2Coll(so->procinfo,
-													 so->collation,
-													 PointerGetDatum(so->queryVec),
-													 heapDatum));
-
+				d = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
+													 so->queryDatum, cmpDatum));
 				results[i].dist = d;
 
-				if (so->metric == TQ_METRIC_COSINE)
-					pfree(DatumGetPointer(heapDatum));
-				pfree(heapVec);
+				if (cmpDatum != heapDatum)
+					pfree(DatumGetPointer(cmpDatum));
+				pfree(DatumGetPointer(heapDatum));
 			}
 			else
 			{
@@ -664,6 +649,7 @@ tqivfbeginscan(Relation index, int nkeys, int norderbys)
 	/* Exact distance (FUNCTION 1) + collation for probe selection / rerank. */
 	so->procinfo = index_getprocinfo(index, 1, TQIVF_DISTANCE_PROC);
 	so->collation = index->rd_indcollation[0];
+	so->typeInfo = TqGetTypeInfo(index, TQIVF_TYPE_INFO_PROC);
 
 	/* Map the index column to its backing heap attribute. */
 	so->heapAttno = index->rd_index->indkey.values[0];
@@ -678,7 +664,9 @@ tqivfbeginscan(Relation index, int nkeys, int norderbys)
 
 	so->lut = NULL;
 	so->lut8 = NULL;
-	so->queryVec = NULL;
+	so->queryDatum = (Datum) 0;
+	so->haveQuery = false;
+	so->vecScratch = NULL;
 	so->qNormSq = 0.0;
 	so->results = NULL;
 	so->nresults = 0;
@@ -740,7 +728,7 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->heapRel = NULL;
 
 	/*
-	 * Reset per-query allocations (LUT, queryVec, results, probeLists, listQueue).
+	 * Reset per-query allocations (LUT, queryDatum, results, probeLists, listQueue).
 	 * The model lives in rd_indexcxt and is unaffected.  listQueue lives in tmpCtx
 	 * and is freed by the reset, so re-allocate it afterward.
 	 */
@@ -748,7 +736,9 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	MemoryContextReset(so->tmpCtx);
 	so->lut = NULL;
 	so->lut8 = NULL;
-	so->queryVec = NULL;
+	so->queryDatum = (Datum) 0;
+	so->haveQuery = false;
+	so->vecScratch = NULL;
 	so->results = NULL;
 	so->probeLists = NULL;
 
@@ -763,27 +753,35 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		!(scan->orderByData->sk_flags & SK_ISNULL))
 	{
 		Datum		value = scan->orderByData->sk_argument;
-		Vector	   *q;
+		const float *qfloat;
 		int			i;
 		double		s = 0.0;
 
 		Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
 		Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
 
-		/* Normalize the query for cosine (||q|| = 1). */
-		if (so->metric == TQ_METRIC_COSINE)
-			value = DirectFunctionCall1Coll(l2_normalize, so->collation, value);
+		/*
+		 * Cosine: normalize the NATIVE query (type-specific) so probe/rerank's
+		 * FUNCTION 1 sees a unit query and the float LUT is built from it.
+		 */
+		if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
+			value = DirectFunctionCall1Coll(so->typeInfo->normalize, so->collation, value);
 
-		q = DatumGetVector(value);
-		so->queryVec = q;
+		/* Keep the native (normalized for cosine) query for probe + rerank. */
+		so->queryDatum = value;
+		so->haveQuery = true;
 
-		for (i = 0; i < q->dim; i++)
-			s += (double) q->x[i] * q->x[i];
+		/* Dense float query for the LUT/estimate path. */
+		so->vecScratch = palloc(sizeof(float) * model->dim);
+		qfloat = so->typeInfo->toFloat(value, so->vecScratch, model->dim);
+
+		for (i = 0; i < model->dim; i++)
+			s += (double) qfloat[i] * qfloat[i];
 		so->qNormSq = s;
 
 		/* Build the LUT (sized over dimCodes), then the 8-bit block LUT. */
 		so->lut = palloc(sizeof(float) * model->dimCodes * model->nLevels);
-		TqBuildQueryLut(model, q->x, so->lut, NULL);
+		TqBuildQueryLut(model, qfloat, so->lut, NULL);
 
 		so->lut8 = palloc(model->dimCodes * model->nLevels);
 		TqBuildLut8(model, so->lut, so->lut8, &so->lutBias, &so->lutScale);

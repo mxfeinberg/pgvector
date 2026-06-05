@@ -36,3 +36,23 @@ SELECT cardinality(tqivf_test_list_counts('tqivf_par_idx'));
 RESET max_parallel_maintenance_workers;
 RESET min_parallel_table_scan_size;
 DROP TABLE tqivf_par;
+
+-- halfvec opclasses (tqivf #6 Plan 2)
+CREATE TABLE tqivf_hv (v halfvec(4));
+INSERT INTO tqivf_hv VALUES ('[1,2,3,4]'), ('[2,3,4,5]'), ('[0,0,0,1]'), ('[5,4,3,2]');
+CREATE INDEX ON tqivf_hv USING tqivf (v halfvec_l2_ops) WITH (lists = 1);
+SELECT v FROM tqivf_hv ORDER BY v <-> '[1,2,3,4]' LIMIT 2;
+DROP TABLE tqivf_hv;
+
+-- IP query is [1,2,3,5] (not [1,2,3,4]) for an unambiguous top-2 (avoids an IP tie)
+CREATE TABLE tqivf_hv_ip (v halfvec(4));
+INSERT INTO tqivf_hv_ip VALUES ('[1,2,3,5]'), ('[2,3,4,5]'), ('[0,0,0,1]'), ('[5,4,3,2]');
+CREATE INDEX ON tqivf_hv_ip USING tqivf (v halfvec_ip_ops) WITH (lists = 1);
+SELECT v FROM tqivf_hv_ip ORDER BY v <#> '[1,2,3,5]' LIMIT 2;
+DROP TABLE tqivf_hv_ip;
+
+CREATE TABLE tqivf_hv_cos (v halfvec(4));
+INSERT INTO tqivf_hv_cos VALUES ('[1,2,3,4]'), ('[2,3,4,5]'), ('[1,0,0,0]'), ('[5,4,3,2]');
+CREATE INDEX ON tqivf_hv_cos USING tqivf (v halfvec_cosine_ops) WITH (lists = 1);
+SELECT v FROM tqivf_hv_cos ORDER BY v <=> '[1,2,3,4]' LIMIT 2;
+DROP TABLE tqivf_hv_cos;

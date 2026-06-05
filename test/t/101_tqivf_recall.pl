@@ -26,7 +26,8 @@ my $array_sql = join(",", ("random() - 0.5") x $dim);
 # ---------------------------------------------------------------------------
 sub test_recall
 {
-	my ($probes, $rerank, $min, $operator, $label) = @_;
+	my ($probes, $rerank, $min, $operator, $label, $table) = @_;
+	$table //= "tst";
 	my $correct = 0;
 	my $total = 0;
 
@@ -35,9 +36,9 @@ sub test_recall
 		SET enable_seqscan = off;
 		SET tqivf.probes = $probes;
 		SET tqivf.rerank = $rerank;
-		EXPLAIN ANALYZE SELECT i FROM tst ORDER BY v $operator '$queries[0]' LIMIT $limit;
+		EXPLAIN ANALYZE SELECT i FROM $table ORDER BY v $operator '$queries[0]' LIMIT $limit;
 	));
-	like($explain, qr/Index Scan using idx on tst/, "index scan used for $label");
+	like($explain, qr/Index Scan using idx on $table/, "index scan used for $label");
 
 	for my $i (0 .. $#queries)
 	{
@@ -45,7 +46,7 @@ sub test_recall
 			SET enable_seqscan = off;
 			SET tqivf.probes = $probes;
 			SET tqivf.rerank = $rerank;
-			SELECT i FROM tst ORDER BY v $operator '$queries[$i]' LIMIT $limit;
+			SELECT i FROM $table ORDER BY v $operator '$queries[$i]' LIMIT $limit;
 		));
 		my @actual_ids = split("\n", $actual);
 		my %actual_set = map { $_ => 1 } @actual_ids;
@@ -258,6 +259,70 @@ my $lists = 55;
 	test_recall($lists, 200, 0.95, $operator, "parallel build L2 probes=lists rerank=200");
 
 	$node->safe_psql("postgres", "DROP INDEX idx;");
+}
+
+# ===========================================================================
+# Test configuration F: halfvec (tqivf #6 Plan 2).  Native halfvec k-means via
+# the reused ivfflat halfvec typeinfo (opclass FUNCTION 5).  Same recall bounds
+# as the vector L2/cosine configs; fp16 input adds only minor noise (input
+# coords are random()-0.5, well within fp16 range).  Separate tst_hv table so
+# the vector configs above are untouched.
+#
+# No tqivf-specific dim-cap test: HALFVEC_MAX_DIM == TQ_MAX_DIM == 16000, so
+# the halfvec type itself rejects over-sized columns before tqivf ever sees them.
+# ===========================================================================
+{
+	$node->safe_psql("postgres", "CREATE TABLE tst_hv (i int4, v halfvec($dim));");
+	$node->safe_psql("postgres",
+		"INSERT INTO tst_hv SELECT i, ARRAY[$array_sql]::vector($dim)::halfvec($dim) FROM generate_series(1, 3000) i;");
+
+	# ---- halfvec L2: probes=lists rerank=200 → recall ≥ 0.95 ----
+	{
+		my $operator = "<->";
+
+		@expected = ();
+		foreach my $q (@queries)
+		{
+			my $res = $node->safe_psql("postgres", qq(
+				SET enable_indexscan = off;
+				SELECT i FROM tst_hv ORDER BY v $operator '$q' LIMIT $limit;
+			));
+			push(@expected, $res);
+		}
+
+		$node->safe_psql("postgres",
+			"CREATE INDEX idx ON tst_hv USING tqivf (v halfvec_l2_ops) WITH (lists = $lists);");
+
+		test_recall($lists, 200, 0.95, $operator, "halfvec L2 probes=lists rerank=200", "tst_hv");
+		test_recall(1, 100, 0.20, $operator, "halfvec L2 probes=1 rerank=100 (low probes path)", "tst_hv");
+
+		$node->safe_psql("postgres", "DROP INDEX idx;");
+	}
+
+	# ---- halfvec cosine: probes=lists rerank=200 → recall ≥ 0.90 ----
+	{
+		my $operator = "<=>";
+
+		@expected = ();
+		foreach my $q (@queries)
+		{
+			my $res = $node->safe_psql("postgres", qq(
+				SET enable_indexscan = off;
+				SELECT i FROM tst_hv ORDER BY v $operator '$q' LIMIT $limit;
+			));
+			push(@expected, $res);
+		}
+
+		$node->safe_psql("postgres",
+			"CREATE INDEX idx ON tst_hv USING tqivf (v halfvec_cosine_ops) WITH (lists = $lists);");
+
+		test_recall($lists, 200, 0.90, $operator, "halfvec cosine probes=lists rerank=200", "tst_hv");
+		test_recall(1, 100, 0.20, $operator, "halfvec cosine probes=1 rerank=100 (low probes path)", "tst_hv");
+
+		$node->safe_psql("postgres", "DROP INDEX idx;");
+	}
+
+	$node->safe_psql("postgres", "DROP TABLE tst_hv;");
 }
 
 done_testing();
