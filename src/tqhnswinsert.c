@@ -590,23 +590,14 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 														 TqhnswPtrAccess(NULL, ne->rhat), dc, metric);
 		}
 
-		/* Re-select into the scratch slice (newElement competes). */
-		TqhnswUpdateConnection(NULL, &scratch, newElement, distance, lm, lc,
-							   dc, metric);
-
 		/*
-		 * Find newElement's slot in the pruned result.  If it is absent,
-		 * newElement lost the prune -> do not add (idx stays -1), mirroring
-		 * HNSW returning -1 when newElement is not selected.
+		 * Re-select with newElement competing.  TqhnswUpdateConnection replaces
+		 * the pruned-out item IN PLACE and sets idx to its index in the
+		 * loaded (on-disk slot order) slice -- the index the single-slot disk
+		 * write below needs.  If newElement loses the prune, idx stays -1.
 		 */
-		for (i = 0; i < sna->count; i++)
-		{
-			if (TqhnswPtrAccess(NULL, sna->items[i].element) == newElement)
-			{
-				idx = i;
-				break;
-			}
-		}
+		TqhnswUpdateConnection(NULL, &scratch, newElement, distance, lm, lc,
+							   dc, metric, &idx);
 	}
 
 	/* Restore the cached element's neighbor pointer (FIX 2). */
@@ -946,6 +937,14 @@ tqhnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	/* Skip nulls. */
 	if (isnull[0])
 		return false;
+
+	/*
+	 * Unlike hnsw, the on-disk insert path takes element LWLocks, so the
+	 * tranche must be valid here too.  Under shared_preload_libraries _PG_init
+	 * skips registration; do it lazily on first use (0 = never assigned).
+	 */
+	if (tqhnsw_lock_tranche_id == 0)
+		TqhnswInitLockTranche();
 
 	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
 									  "tqhnsw insert temporary context",

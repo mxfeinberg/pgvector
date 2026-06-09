@@ -66,10 +66,10 @@ typedef struct TqivfScanOpaqueData
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) for the LUT */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
-	/* Results. */
+	/* Results.  64-bit: a batch can cover lists totalling > INT_MAX rows. */
 	TqivfScanResult *results;
-	int			nresults;
-	int			cursor;
+	int64		nresults;
+	int64		cursor;
 
 	/* Heap access for rerank. */
 	Relation	heapRel;		/* opened here iff heapOpened */
@@ -237,10 +237,17 @@ TqivfGetScanLists(IndexScanDesc scan)
 			TqivfList	list = (TqivfList) PageGetItem(page, PageGetItemId(page, offno));
 			double		distance;
 
-			/* Exact query->centroid distance via FUNCTION 1. */
-			distance = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
-														PointerGetDatum(&list->center),
-														so->queryDatum));
+			/*
+			 * Exact query->centroid distance via FUNCTION 1.  A NULL order-by
+			 * key probes with zero distance for every list (mirrors ivfflat's
+			 * ZeroDistance), keeping the first maxProbes lists.
+			 */
+			if (so->haveQuery)
+				distance = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
+															PointerGetDatum(&list->center),
+															so->queryDatum));
+			else
+				distance = 0.0;
 
 			if (listCount < so->maxProbes)
 			{
@@ -314,26 +321,35 @@ TqivfGetScanLists(IndexScanDesc scan)
  */
 static void
 TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
-			   TqivfScanResult **presults, int *pn, int *pcapacity)
+			   TqivfScanResult **presults, int64 *pn, int64 *pcapacity)
 {
 	TqivfScanOpaque so = (TqivfScanOpaque) scan->opaque;
 	TqModel    *model = so->model;
 	Relation	index = scan->indexRelation;
 	int			dc = model->dimCodes;
 	TqivfScanResult *results = *presults;
-	int			n = *pn;
-	int			capacity = *pcapacity;
+	int64		n = *pn;
+	int64		capacity = *pcapacity;
 
 	/* Block scan: read this list's code-plane chain, walk its side chain. */
 	if (L->blockCount > 0 && BlockNumberIsValid(L->codeStart))
 	{
 		Size		blockCodeBytes = TQ_BLOCK_CODE_BYTES(dc);
 		Size		codeLen = (Size) L->blockCount * blockCodeBytes;
-		char	   *codeBuf = palloc(codeLen);
+		char	   *codeBuf = NULL;
 		BlockNumber sblk = L->sideStart;
 		uint32		b = 0;
 
-		TqReadBytes(index, L->codeStart, codeBuf, codeLen);
+		/*
+		 * A large list's code plane can exceed MaxAllocSize (same problem
+		 * tqscan's full-plane read has); use the huge variant.  Skipped for a
+		 * NULL order-by key (nothing is scored).
+		 */
+		if (so->haveQuery)
+		{
+			codeBuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, codeLen);
+			TqReadBytes(index, L->codeStart, codeBuf, codeLen);
+		}
 
 		while (BlockNumberIsValid(sblk))
 		{
@@ -350,9 +366,31 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 			for (soff = FirstOffsetNumber; soff <= smax; soff = OffsetNumberNext(soff))
 			{
 				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
-				const uint8 *plane = (const uint8 *) codeBuf + (Size) b * blockCodeBytes;
+				const uint8 *plane = so->haveQuery ?
+					(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
 
-				if (tqivf_force_scalar)
+				if (!so->haveQuery)
+				{
+					/*
+					 * NULL order-by key: every distance is NULL, but rows must
+					 * still be returned (mirrors ivfflat's ZeroDistance path).
+					 */
+					for (int j = 0; j < srec->nvecs; j++)
+					{
+						if (srec->deletedMask & (1u << j))
+							continue;
+
+						if (n >= capacity)
+						{
+							capacity *= 2;
+							results = repalloc_huge(results, sizeof(TqivfScanResult) * capacity);
+						}
+						results[n].dist = 0.0;
+						results[n].tid = srec->side[j].heaptid;
+						n++;
+					}
+				}
+				else if (tqivf_force_scalar)
 				{
 					int			nLevels = model->nLevels;
 					int			j;
@@ -382,7 +420,7 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 						if (n >= capacity)
 						{
 							capacity *= 2;
-							results = repalloc(results, sizeof(TqivfScanResult) * capacity);
+							results = repalloc_huge(results, sizeof(TqivfScanResult) * capacity);
 						}
 						results[n].dist = TqivfEstToDist(so->metric, so->qNormSq, sd->norm, est);
 						results[n].tid = sd->heaptid;
@@ -414,7 +452,7 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 						if (n >= capacity)
 						{
 							capacity *= 2;
-							results = repalloc(results, sizeof(TqivfScanResult) * capacity);
+							results = repalloc_huge(results, sizeof(TqivfScanResult) * capacity);
 						}
 						results[n].dist = TqivfEstToDist(so->metric, so->qNormSq, sd->norm, est);
 						results[n].tid = sd->heaptid;
@@ -430,7 +468,8 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 		}
 		Assert(b == L->blockCount);
 
-		pfree(codeBuf);
+		if (codeBuf != NULL)
+			pfree(codeBuf);
 	}
 
 	/* Tail scan: row-major insert tail (Invalid until first insert). */
@@ -453,19 +492,23 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 			for (toff = FirstOffsetNumber; toff <= tmax; toff = OffsetNumberNext(toff))
 			{
 				TqEntry    *entry = (TqEntry *) PageGetItem(tpage, PageGetItemId(tpage, toff));
-				float		est;
 
 				if (entry->deleted)
 					continue;
 
-				est = TqScoreEntry(model, so->lut, NULL, entry, entry->data);
-
 				if (n >= capacity)
 				{
 					capacity *= 2;
-					results = repalloc(results, sizeof(TqivfScanResult) * capacity);
+					results = repalloc_huge(results, sizeof(TqivfScanResult) * capacity);
 				}
-				results[n].dist = TqivfEstToDist(so->metric, so->qNormSq, entry->norm, est);
+				if (so->haveQuery)
+				{
+					float		est = TqScoreEntry(model, so->lut, NULL, entry, entry->data);
+
+					results[n].dist = TqivfEstToDist(so->metric, so->qNormSq, entry->norm, est);
+				}
+				else
+					results[n].dist = 0.0;	/* NULL order-by key */
 				results[n].tid = entry->heaptid;
 				n++;
 			}
@@ -503,9 +546,8 @@ static void
 TqivfLoadBatch(IndexScanDesc scan)
 {
 	TqivfScanOpaque so = (TqivfScanOpaque) scan->opaque;
-	int			capacity;
-	uint64		capacity64;
-	int			n = 0;
+	int64		capacity;
+	int64		n = 0;
 	int			batchEnd;
 	int			i;
 	TqivfScanResult *results;
@@ -517,20 +559,17 @@ TqivfLoadBatch(IndexScanDesc scan)
 	 * Estimate the initial capacity from the lists in this batch (nvectors is a
 	 * hint; the array grows by doubling in TqivfScoreList as needed).  Each
 	 * nvectors is a uint32 and the per-index cap is ~4.29B, so accumulate into a
-	 * uint64 to avoid signed-int overflow when many large lists are probed, then
-	 * clamp to INT_MAX so the (int) cast is well-defined.  The doubling repalloc
-	 * recovers any under-estimate.
+	 * 64-bit count; the allocation uses the huge variant since a large batch can
+	 * exceed MaxAllocSize.
 	 */
 	batchEnd = Min(so->listIndex + so->probes, so->nProbeLists);
-	capacity64 = 0;
+	capacity = 0;
 	for (i = so->listIndex; i < batchEnd; i++)
-		capacity64 += so->probeLists[i].nvectors;
-	if (capacity64 < 1)
-		capacity64 = 1;
-	if (capacity64 > INT_MAX)
-		capacity64 = INT_MAX;
-	capacity = (int) capacity64;
-	results = palloc(sizeof(TqivfScanResult) * capacity);
+		capacity += (int64) so->probeLists[i].nvectors;
+	if (capacity < 1)
+		capacity = 1;
+	results = (TqivfScanResult *) MemoryContextAllocHuge(CurrentMemoryContext,
+														 sizeof(TqivfScanResult) * capacity);
 
 	for (i = so->listIndex; i < batchEnd; i++)
 		TqivfScoreList(scan, &so->probeLists[i], &results, &n, &capacity);
@@ -544,24 +583,22 @@ TqivfLoadBatch(IndexScanDesc scan)
 	 *
 	 * Documented prototype tradeoff (inherited from tqflat): the reranked subset
 	 * carries an exact FUNCTION 1 distance while the rest carry the quantized
-	 * estimate, and the two are not on a perfectly comparable scale -- most
-	 * visibly for cosine, where the exact value is -cos(q, x) (range [-1, 1])
-	 * while the estimate-based distance is 1 - cos(q, x) (range [0, 2]).  The two
-	 * are monotone in cos(q, x) and the reranked (exact) values dominate the
-	 * front of the array, which is what matters for the returned neighbors when
-	 * rerank >= LIMIT.  Distances are never surfaced to the caller (the AM does
-	 * not set xs_orderbyvals), so the scale difference affects only internal
-	 * ordering.
+	 * estimate; the two scales match exactly for L2 and IP, and for cosine the
+	 * exact -cos(q, x) is shifted by +1 below so it sorts on the estimate's
+	 * 1 - cos(q, x) scale -- the remaining difference is quantization error
+	 * only.  Distances are never surfaced to the caller (the AM does not set
+	 * xs_orderbyvals), so this affects only internal ordering.
 	 */
-	if (tqivf_rerank > 0 && n > 0 && so->haveQuery)
+	if (tqivf_rerank > 0 && n > 0 && so->haveQuery &&
+		AttributeNumberIsValid(so->heapAttno))
 	{
-		int			k = Min(tqivf_rerank, n);
+		int64		k = Min((int64) tqivf_rerank, n);
 
 		qsort(results, n, sizeof(TqivfScanResult), CompareResults);
 
-		for (i = 0; i < k; i++)
+		for (int64 ri = 0; ri < k; ri++)
 		{
-			Datum		heapDatum = TqivfHeapFetchDatum(scan, so, &results[i].tid);
+			Datum		heapDatum = TqivfHeapFetchDatum(scan, so, &results[ri].tid);
 
 			if (heapDatum != (Datum) 0)
 			{
@@ -579,7 +616,16 @@ TqivfLoadBatch(IndexScanDesc scan)
 
 				d = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
 													 so->queryDatum, cmpDatum));
-				results[i].dist = d;
+
+				/*
+				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while the
+				 * quantized estimate scale is 1 - cos; shift by 1 so the two
+				 * populations sort on the same scale in the final qsort.
+				 */
+				if (so->metric == TQ_METRIC_COSINE)
+					d += 1.0;
+
+				results[ri].dist = d;
 
 				if (cmpDatum != heapDatum)
 					pfree(DatumGetPointer(cmpDatum));
@@ -588,7 +634,7 @@ TqivfLoadBatch(IndexScanDesc scan)
 			else
 			{
 				/* No longer visible: push to the end so it is not returned. */
-				results[i].dist = get_float8_infinity();
+				results[ri].dist = get_float8_infinity();
 			}
 		}
 	}
@@ -815,12 +861,10 @@ tqivfgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with tqivf");
 
-		if (so->lut == NULL)
-		{
-			so->first = false;
-			return false;		/* NULL order-by query: no results */
-		}
-
+		/*
+		 * A NULL order-by key still probes and returns tuples (with zero
+		 * distance), matching ivfflat's ZeroDistance path.
+		 */
 		TqivfGetScanLists(scan);
 		TqivfLoadBatch(scan);
 		so->first = false;

@@ -121,7 +121,9 @@ for (1 .. 20)
 }
 
 # ===========================================================================
-# Test configuration B: bits=2, L2, rerank=200  → expect recall ≥ 0.90
+# Test configuration B: bits=4, L2, unreranked path
+# (the v4 blocked layout supports only bits = 4, so the former bits=2
+# configuration is gone; this block keeps the rerank=0 path coverage)
 # ===========================================================================
 {
 	my $opclass  = "vector_l2_ops";
@@ -139,14 +141,12 @@ for (1 .. 20)
 	}
 
 	$node->safe_psql("postgres",
-		"CREATE INDEX idx ON tst USING tqflat (v $opclass) WITH (bits = 2);");
+		"CREATE INDEX idx ON tst USING tqflat (v $opclass) WITH (bits = 4);");
 
-	test_recall(200, 0.90, $operator, "bits=2 rerank=200 L2");
-
-	# Also assert the no-rerank path runs and returns something reasonable.
+	# Assert the no-rerank path runs and returns something reasonable.
 	# Threshold is loose (≥0.30) — it just proves the quantized path executes
-	# and returns plausible results; and that rerank>0 significantly improves it.
-	test_recall(0, 0.30, $operator, "bits=2 rerank=0 L2 (unreranked path)");
+	# and returns plausible results; rerank>0 (config A) significantly improves it.
+	test_recall(0, 0.30, $operator, "bits=4 rerank=0 L2 (unreranked path)");
 
 	$node->safe_psql("postgres", "DROP INDEX idx;");
 }

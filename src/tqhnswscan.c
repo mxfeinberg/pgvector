@@ -47,6 +47,7 @@ typedef struct TqhnswNeighborScore
 	BlockNumber blkno;
 	OffsetNumber offno;
 	uint8		level;
+	uint8		version;
 	ItemPointerData neighbortid;
 }			TqhnswNeighborScore;
 
@@ -116,6 +117,8 @@ typedef struct TqhnswScanCandidate
 	double		distance;
 	BlockNumber blkno;
 	OffsetNumber offno;
+	uint8		level;			/* element level (neighbor-slice math) */
+	uint8		version;		/* element version (slot-reuse detection) */
 	ItemPointerData heaptid;
 	ItemPointerData neighbortid;	/* the candidate's neighbor-tuple location */
 }			TqhnswScanCandidate;
@@ -207,25 +210,31 @@ TqhnswEstToDist(TqMetric metric, double qNormSq, float norm, float est)
 static double
 TqhnswScoreElement(TqhnswScanOpaque so, Relation index, BlockNumber blkno,
 				   OffsetNumber offno, ItemPointer heaptid_out, uint8 *level_out,
-				   ItemPointer neighbortid_out)
+				   ItemPointer neighbortid_out, uint8 *version_out)
 {
 	Buffer		buf = ReadBuffer(index, blkno);
 	Page		page;
 	TqhnswElementTuple etup;
 	double		dist;
-	float		est;
-	TqEntry		hdr;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	etup = (TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 
-	hdr.norm = etup->norm;
-	hdr.scale = etup->scale;
-	hdr.residualNorm = 0;
+	if (so->haveQuery)
+	{
+		float		est;
+		TqEntry		hdr;
 
-	est = TqScoreEntry(so->model, so->lut, NULL, &hdr, etup->codes);
-	dist = TqhnswEstToDist(so->metric, so->qNormSq, etup->norm, est);
+		hdr.norm = etup->norm;
+		hdr.scale = etup->scale;
+		hdr.residualNorm = 0;
+
+		est = TqScoreEntry(so->model, so->lut, NULL, &hdr, etup->codes);
+		dist = TqhnswEstToDist(so->metric, so->qNormSq, etup->norm, est);
+	}
+	else
+		dist = 0.0;				/* NULL order-by key (mirrors hnsw) */
 
 	if (heaptid_out)
 		*heaptid_out = etup->heaptid;
@@ -233,6 +242,8 @@ TqhnswScoreElement(TqhnswScanOpaque so, Relation index, BlockNumber blkno,
 		*level_out = etup->level;
 	if (neighbortid_out)
 		*neighbortid_out = etup->neighbortid;
+	if (version_out)
+		*version_out = etup->version;
 
 	UnlockReleaseBuffer(buf);
 	return dist;
@@ -240,29 +251,42 @@ TqhnswScoreElement(TqhnswScanOpaque so, Relation index, BlockNumber blkno,
 
 /*
  * Read the (level-lc)*m slice (size TqhnswGetLayerM(m,lc)) of an element's
- * neighbor tuple into indextids.  Mirrors HnswLoadNeighborTids, keyed by the
- * neighbor tuple's own level (the slice math matches what TqhnswFlushGraph
- * wrote: lc from level..0, lc's slice at (level-lc)*m).
+ * neighbor tuple into indextids.  Mirrors HnswLoadNeighborTids: the slice math
+ * matches what TqhnswFlushGraph wrote (lc from level..0, lc's slice at
+ * (level-lc)*m), keyed by the level/version the caller read from the ELEMENT
+ * tuple.  If the neighbor slot was reused or repaired since (type/version/count
+ * mismatch, or the expected level is below lc), return 0 ("no neighbors")
+ * rather than reading a slice that no longer exists.
  */
 static int
 TqhnswLoadNeighborTids(Relation index, BlockNumber neighborPage,
 					   OffsetNumber neighborOffno, int m, int lc,
+					   int level, uint8 version,
 					   ItemPointerData *indextids)
 {
 	Buffer		buf;
 	Page		page;
 	TqhnswNeighborTuple ntup;
-	int			level;
 	int			lm;
 	int			start;
+
+	if (lc > level)
+		return 0;
 
 	buf = ReadBuffer(index, neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	ntup = (TqhnswNeighborTuple) PageGetItem(page, PageGetItemId(page, neighborOffno));
 
-	/* count == (level + 2) * m  ->  recover level. */
-	level = (int) (ntup->count / m) - 2;
+	/* Reject a reused/repaired slot (mirrors HnswLoadNeighborTids). */
+	if (ntup->type != TQHNSW_NEIGHBOR_TUPLE_TYPE ||
+		ntup->version != version ||
+		(int) ntup->count != (level + 2) * m)
+	{
+		UnlockReleaseBuffer(buf);
+		return 0;
+	}
+
 	lm = TqhnswGetLayerM(m, lc);
 	start = (level - lc) * m;
 
@@ -348,6 +372,7 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 			o->blkno = blk;
 			o->offno = off;
 			o->level = etup->level;
+			o->version = etup->version;
 			o->neighbortid = etup->neighbortid;
 			k++;
 		}
@@ -398,13 +423,14 @@ TqhnswSearchGraph(IndexScanDesc scan)
 {
 	TqhnswScanOpaque so = (TqhnswScanOpaque) scan->opaque;
 	Relation	index = scan->indexRelation;
-	int			m = so->m;
+	int			m;
 	int			ef = tqhnsw_ef_search;
 	BlockNumber curBlkno;
 	OffsetNumber curOffno;
 	ItemPointerData curHeaptid;
 	ItemPointerData curNeighbortid;
 	uint8		curLevel;
+	uint8		curVersion;
 	double		curDist;
 	pairingheap *C;
 	pairingheap *W;
@@ -416,9 +442,23 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	TqhnswScanCandidate *entry;
 	int			lc;
 	int			n;
+	int			dim;
 
 	so->results = NULL;
 	so->nresults = 0;
+
+	/*
+	 * Re-read the entry point under the scan lock (the caller holds
+	 * TQHNSW_SCAN_LOCK).  Reading it once at beginscan would let a vacuum
+	 * between rescans replace the entry point -- a stale entry both degrades
+	 * recall and, if the old slot was reused by a lower-level element, breaks
+	 * the descent's slice math.  Mirrors hnsw, which re-reads the meta page
+	 * inside every search.
+	 */
+	TqhnswGetMetaInfo(index, &dim, &so->metric, &so->m,
+					  &so->entryBlkno, &so->entryOffno, &so->entryLevel,
+					  NULL, NULL);
+	m = so->m;
 
 	/* Empty index: no entry point. */
 	if (!BlockNumberIsValid(so->entryBlkno) || so->entryLevel < 0)
@@ -428,13 +468,14 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	curBlkno = so->entryBlkno;
 	curOffno = so->entryOffno;
 	curDist = TqhnswScoreElement(so, index, curBlkno, curOffno,
-								 &curHeaptid, &curLevel, &curNeighbortid);
+								 &curHeaptid, &curLevel, &curNeighbortid,
+								 &curVersion);
 
 	/*
-	 * Upper-level greedy descent (lc from entryLevel down to 1): move to the
-	 * nearest improving neighbor until none improves.
+	 * Upper-level greedy descent (lc from the entry element's level down to 1):
+	 * move to the nearest improving neighbor until none improves.
 	 */
-	for (lc = so->entryLevel; lc >= 1; lc--)
+	for (lc = curLevel; lc >= 1; lc--)
 	{
 		bool		changed = true;
 
@@ -447,9 +488,10 @@ TqhnswSearchGraph(IndexScanDesc scan)
 			int			i;
 
 			changed = false;
-			lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, lc, indextids);
+			lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, lc,
+										curLevel, curVersion, indextids);
 
-			if (tqhnsw_force_scalar)
+			if (tqhnsw_force_scalar || !so->haveQuery)
 			{
 				for (i = 0; i < lm; i++)
 				{
@@ -459,6 +501,7 @@ TqhnswSearchGraph(IndexScanDesc scan)
 					ItemPointerData nheaptid;
 					ItemPointerData nneighbortid;
 					uint8		nlevel;
+					uint8		nversion;
 					double		ndist;
 
 					if (!ItemPointerIsValid(indextid))
@@ -467,7 +510,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 					nblk = ItemPointerGetBlockNumber(indextid);
 					noff = ItemPointerGetOffsetNumber(indextid);
 					ndist = TqhnswScoreElement(so, index, nblk, noff,
-											   &nheaptid, &nlevel, &nneighbortid);
+											   &nheaptid, &nlevel, &nneighbortid,
+											   &nversion);
 
 					if (ndist < curDist)
 					{
@@ -477,6 +521,7 @@ TqhnswSearchGraph(IndexScanDesc scan)
 						curHeaptid = nheaptid;
 						curNeighbortid = nneighbortid;
 						curLevel = nlevel;
+						curVersion = nversion;
 						changed = true;
 					}
 				}
@@ -495,10 +540,18 @@ TqhnswSearchGraph(IndexScanDesc scan)
 						curHeaptid = so->expandOut[i].heaptid;
 						curNeighbortid = so->expandOut[i].neighbortid;
 						curLevel = so->expandOut[i].level;
+						curVersion = so->expandOut[i].version;
 						changed = true;
 					}
 				}
 			}
+
+			/*
+			 * If a neighbor moved us to a HIGHER level than the current layer,
+			 * the slice math stays valid (lc <= curLevel); a lower-level
+			 * element can only be reached via slot reuse, which the
+			 * version/count check in TqhnswLoadNeighborTids rejects.
+			 */
 		}
 	}
 
@@ -518,6 +571,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	entry->distance = curDist;
 	entry->blkno = curBlkno;
 	entry->offno = curOffno;
+	entry->level = curLevel;
+	entry->version = curVersion;
 	entry->heaptid = curHeaptid;
 	entry->neighbortid = curNeighbortid;
 	pairingheap_add(C, &entry->c_node);
@@ -546,9 +601,10 @@ TqhnswSearchGraph(IndexScanDesc scan)
 
 		nbrPage = ItemPointerGetBlockNumber(&c->neighbortid);
 		nbrOffno = ItemPointerGetOffsetNumber(&c->neighbortid);
-		lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, 0, indextids);
+		lm = TqhnswLoadNeighborTids(index, nbrPage, nbrOffno, m, 0,
+									c->level, c->version, indextids);
 
-		if (tqhnsw_force_scalar)
+		if (tqhnsw_force_scalar || !so->haveQuery)
 		{
 			for (i = 0; i < lm; i++)
 			{
@@ -558,6 +614,7 @@ TqhnswSearchGraph(IndexScanDesc scan)
 				ItemPointerData nheaptid;
 				ItemPointerData nneighbortid;
 				uint8		nlevel;
+				uint8		nversion;
 				double		ndist;
 				bool		alwaysAdd = wlen < ef;
 				TqhnswScanCandidate *e;
@@ -577,7 +634,7 @@ TqhnswSearchGraph(IndexScanDesc scan)
 				f = TqhnswGetCandidate(w_node, pairingheap_first(W));
 
 				ndist = TqhnswScoreElement(so, index, nblk, noff, &nheaptid,
-										   &nlevel, &nneighbortid);
+										   &nlevel, &nneighbortid, &nversion);
 
 				if (!(ndist < f->distance || alwaysAdd))
 					continue;
@@ -586,6 +643,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 				e->distance = ndist;
 				e->blkno = nblk;
 				e->offno = noff;
+				e->level = nlevel;
+				e->version = nversion;
 				e->heaptid = nheaptid;
 				e->neighbortid = nneighbortid;
 				pairingheap_add(C, &e->c_node);
@@ -623,6 +682,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 				e->distance = o->dist;
 				e->blkno = o->blkno;
 				e->offno = o->offno;
+				e->level = o->level;
+				e->version = o->version;
 				e->heaptid = o->heaptid;
 				e->neighbortid = o->neighbortid;
 				pairingheap_add(C, &e->c_node);
@@ -643,6 +704,15 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	while (!pairingheap_is_empty(W))
 	{
 		TqhnswScanCandidate *sc = TqhnswGetCandidate(w_node, pairingheap_remove_first(W));
+
+		/*
+		 * Vacuum pass 1 invalidates heap TIDs without draining scans; such
+		 * elements are being deleted and must not reach rerank (heap fetch on
+		 * an invalid TID) or be emitted.  Mirrors hnswgettuple's skip of
+		 * elements with no valid heap TIDs.
+		 */
+		if (!ItemPointerIsValid(&sc->heaptid))
+			continue;
 
 		so->results[n].dist = sc->distance;
 		so->results[n].heaptid = sc->heaptid;
@@ -707,7 +777,6 @@ tqhnswbeginscan(Relation index, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
 	TqhnswScanOpaque so;
-	int			dim;
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
@@ -731,10 +800,11 @@ tqhnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
 	so->haveQuery = false;
 
-	/* Entry point + m from the meta page. */
-	TqhnswGetMetaInfo(index, &dim, &so->metric, &so->m,
-					  &so->entryBlkno, &so->entryOffno, &so->entryLevel,
-					  NULL, NULL);
+	/*
+	 * Entry point + m are read per search inside TqhnswSearchGraph, under the
+	 * scan lock -- reading them here would go stale across rescans if vacuum
+	 * replaces the entry point.
+	 */
 
 	scan->opaque = so;
 
@@ -864,12 +934,10 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with tqhnsw");
 
-		if (so->lut == NULL)
-		{
-			so->first = false;
-			return false;		/* NULL order-by query: no results */
-		}
-
+		/*
+		 * A NULL order-by key still traverses the graph with zero distances
+		 * and returns up to ef candidates (mirrors hnsw's NULL-value path).
+		 */
 		oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
 		/*
@@ -896,7 +964,8 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * whose heap tuple is no longer visible get +inf and drop out (this is
 		 * how deletes are handled without graph mutation).
 		 */
-		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->haveQuery)
+		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->haveQuery &&
+			AttributeNumberIsValid(so->heapAttno))
 		{
 			int			k = Min(tqhnsw_rerank, so->nresults);
 			int			i;
@@ -925,6 +994,15 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 														 so->collation,
 														 so->queryDatum,
 														 cmpDatum));
+
+					/*
+					 * Cosine: FUNCTION 1 yields -cos on normalized inputs while
+					 * the quantized estimate scale is 1 - cos; shift by 1 so
+					 * the two populations sort on the same scale.
+					 */
+					if (so->metric == TQ_METRIC_COSINE)
+						d += 1.0;
+
 					so->results[i].dist = d;
 
 					if (cmpDatum != heapDatum)

@@ -655,6 +655,15 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 	buildstate->indexInfo = indexInfo;
 	buildstate->forkNum = forkNum;
 
+	/*
+	 * Rerank fetches the raw heap column (indkey.values[0]); an expression
+	 * index has no backing attribute (attno 0) and cannot be reranked.
+	 */
+	if (indexInfo->ii_Expressions != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tqflat indexes do not support expression index columns")));
+
 	/* Dimensions from the index column typmod (mirror ivfflat) */
 	buildstate->dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
 	if (buildstate->dim < 0)

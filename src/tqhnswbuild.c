@@ -112,6 +112,20 @@ TqhnswWriteModelAndMeta(Relation index, ForkNumber forkNum, int dim, TqMetric me
 	TqhnswMetaPage metap;
 
 	/*
+	 * Validate the element-tuple size against the page layout up front --
+	 * otherwise the whole in-memory graph is built before the flush fails with
+	 * a generic "failed to add index item".  fast_rotation pads dim to the next
+	 * power of two, so dims in (8192, 16000] overflow only in fast mode.
+	 */
+	if (TQHNSW_ELEMENT_TUPLE_SIZE(TQ_CODES_BYTES(dimCodes, bits)) >
+		TqPageCapacity() - sizeof(ItemIdData))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("tqhnsw element for %d dimensions (%d quantized) does not fit on an index page",
+						dim, dimCodes),
+				 errhint("Reduce the number of dimensions, or use fast_rotation = false to avoid power-of-two padding.")));
+
+	/*
 	 * Meta page is block 0; it must be the first block created in the fork.
 	 * Create the placeholder (with Invalid side-chain heads) and commit it so
 	 * the subsequent TqWriteBytes side pages land at blocks >= 1.  We
@@ -205,6 +219,11 @@ TqhnswResolveBuildParams(Relation index, int *dim, TqMetric *metric,
 	*m = opts ? opts->m : TQHNSW_DEFAULT_M;
 	*efc = opts ? opts->efConstruction : TQHNSW_DEFAULT_EF_CONSTRUCTION;
 	*fast = opts ? opts->fastRotation : TQ_DEFAULT_FAST_ROTATION;
+
+	if (*efc < 2 * *m)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ef_construction must be greater than or equal to 2 * m")));
 
 	*dim = TupleDescAttr(index->rd_att, 0)->atttypmod;	/* vector dim via typmod */
 	if (*dim < 0)
@@ -551,6 +570,13 @@ TqhnswBuildCallback(Relation index, ItemPointer tid, Datum *values,
 static void
 TqhnswInitGraph(TqhnswGraph *graph, char *base, Size memoryTotal)
 {
+	/*
+	 * Initialize the lock tranche if needed: when the library is loaded via
+	 * shared_preload_libraries, _PG_init skips it (shared memory is not set up
+	 * yet) and backends inherit an unset tranche id.  Mirrors hnsw InitGraph.
+	 */
+	TqhnswInitLockTranche();
+
 	SpinLockInit(&graph->lock);
 	TqhnswPtrStore(base, graph->head, (TqhnswElement *) NULL);
 	graph->nVectors = 0;
@@ -586,6 +612,7 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 	char	   *ntupBuf;
 	Size		etupAlloc;
 	Size		ntupAlloc;
+	BlockNumber lastElementPage;
 
 	/* Worst-case tuple sizes (level <= maxLevel). */
 	etupAlloc = TQHNSW_ELEMENT_TUPLE_SIZE(buildstate->codesBytes);
@@ -654,6 +681,8 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 				 RelationGetRelationName(index));
 	}
 
+	lastElementPage = BufferGetBlockNumber(buf);
+
 	TqCommitBuffer(buf, state);
 
 	/* Pass 2: fill neighbor tuples. */
@@ -720,7 +749,13 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 
 		metap->nVectors = (uint32) buildstate->graph->nVectors;
 		metap->firstElementPage = buildstate->firstElementPage;
-		metap->insertPage = buildstate->firstElementPage;
+
+		/*
+		 * Insert hint: the LAST element page (mirrors hnswbuild) -- earlier
+		 * pages are full, so hinting at the first would make the next insert
+		 * lock and walk the whole element chain.
+		 */
+		metap->insertPage = lastElementPage;
 		if (entryPoint != NULL)
 		{
 			metap->entryBlkno = entryPoint->blkno;
@@ -1160,6 +1195,15 @@ tqhnswbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	memset(&buildstate, 0, sizeof(buildstate));
 	buildstate.index = index;
+
+	/*
+	 * Rerank fetches the raw heap column (indkey.values[0]); an expression
+	 * index has no backing attribute (attno 0) and cannot be reranked.
+	 */
+	if (indexInfo->ii_Expressions != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tqhnsw indexes do not support expression index columns")));
 
 	TqhnswResolveBuildParams(index, &buildstate.dim, &buildstate.metric,
 							 &buildstate.m, &buildstate.efConstruction,

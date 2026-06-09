@@ -100,7 +100,7 @@ TqScoreBlockRangeDefault(const uint8 *lut8, const uint8 *codeRun,
 	}
 }
 
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(__aarch64__)
 #include <arm_neon.h>
 
 void
@@ -138,7 +138,7 @@ TqScoreBlockRangeNeon(const uint8 *lut8, const uint8 *codeRun,
 			fs_flush(acc);
 	}
 }
-#endif							/* __aarch64__ || __ARM_NEON */
+#endif							/* __aarch64__ */
 
 #if defined(USE_DISPATCH)
 #include <immintrin.h>

@@ -19,11 +19,12 @@ CREATE INDEX ON tqivf_ip USING tqivf (v vector_ip_ops) WITH (lists = 10);
 SET tqivf.probes = 10;
 SELECT id FROM tqivf_ip ORDER BY v <#> '[10,0,0,0]' LIMIT 3;
 
--- Cosine
+-- Cosine: angles to the query differ per row (low ids are nearest), so the
+-- expected order is meaningful rather than an arbitrary tie-break.
 CREATE TABLE tqivf_cos (id int, v vector(4));
-INSERT INTO tqivf_cos SELECT g, ARRAY[g, g, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
+INSERT INTO tqivf_cos SELECT g, ARRAY[g, 1, 0, 0]::real[]::vector FROM generate_series(1, 200) g;
 CREATE INDEX ON tqivf_cos USING tqivf (v vector_cosine_ops) WITH (lists = 10);
-SELECT id FROM tqivf_cos ORDER BY v <=> '[1,1,0,0]' LIMIT 3;
+SELECT id FROM tqivf_cos ORDER BY v <=> '[0,1,0,0]' LIMIT 3;
 
 DROP TABLE tqivf_ip, tqivf_cos;
 

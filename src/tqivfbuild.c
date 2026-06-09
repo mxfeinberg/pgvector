@@ -785,6 +785,15 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 	buildstate->indexInfo = indexInfo;
 	buildstate->forkNum = forkNum;
 
+	/*
+	 * Rerank fetches the raw heap column (indkey.values[0]); an expression
+	 * index has no backing attribute (attno 0) and cannot be reranked.
+	 */
+	if (indexInfo->ii_Expressions != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tqivf indexes do not support expression index columns")));
+
 	/* Dimensions from the index column typmod (mirror tqflat/ivfflat) */
 	buildstate->dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
 	if (buildstate->dim < 0)
@@ -832,6 +841,20 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 	 * centers->maxlen / centers->length and never touches reloptions.
 	 */
 	typeInfo = IvfflatGetTypeInfo(index);
+
+	/*
+	 * Each list-directory record stores the full-precision centroid inline in
+	 * a single page item; validate that up front rather than failing mid-build
+	 * with a generic "failed to add tqivf list item" (ivfflat avoids this with
+	 * its fixed IVFFLAT_MAX_DIM cap).
+	 */
+	if (MAXALIGN(offsetof(TqivfListData, center) + typeInfo->itemSize(buildstate->dim)) >
+		TqPageCapacity() - sizeof(ItemIdData))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("tqivf centroid for %d dimensions does not fit on an index page",
+						buildstate->dim)));
+
 	buildstate->centers = VectorArrayInit(buildstate->lists, buildstate->dim,
 										  typeInfo->itemSize(buildstate->dim));
 	buildstate->listInfo = palloc(sizeof(ListInfo) * buildstate->lists);
@@ -870,7 +893,7 @@ TqivfFreeBuildState(TqivfBuildState * buildstate)
 
 /*
  * Run sample + k-means to produce full-precision, un-rotated centers.  Reuses
- * ivfflat's SampleRows + IvfflatKmeans via a locally-populated
+ * ivfflat's IvfflatSampleRows + IvfflatKmeans via a locally-populated
  * IvfflatBuildState (only the fields those routines read are set).
  */
 static void
@@ -909,7 +932,7 @@ TqivfComputeCenters(TqivfBuildState * buildstate)
 	ivfstate.samples = VectorArrayInit(numSamples, buildstate->dim, buildstate->centers->itemsize);
 	if (buildstate->heap != NULL)
 	{
-		SampleRows(&ivfstate);
+		IvfflatSampleRows(&ivfstate);
 
 		if (ivfstate.samples->length < buildstate->lists)
 			ereport(NOTICE,

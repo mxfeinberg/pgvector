@@ -63,10 +63,10 @@ typedef struct TqScanOpaqueData
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
-	/* Results. */
+	/* Results.  64-bit: a flat scan visits every row (nVectors is uint32). */
 	TqScanResult *results;
-	int			nresults;
-	int			cursor;
+	int64		nresults;
+	int64		cursor;
 
 	/* Heap access for rerank. */
 	Relation	heapRel;		/* opened here iff heapOpened */
@@ -373,8 +373,8 @@ TqDoScan(IndexScanDesc scan)
 	BlockNumber sideStart;
 	BlockNumber tailStart;
 	uint32		blockCount;
-	int			capacity;
-	int			n = 0;
+	int64		capacity;
+	int64		n = 0;
 	TqScanResult *results;
 	MemoryContext oldCtx;
 
@@ -392,7 +392,7 @@ TqDoScan(IndexScanDesc scan)
 		sideStart = metap->sideStart;
 		tailStart = metap->tailStart;
 		blockCount = metap->blockCount;
-		capacity = (int) metap->nVectors;
+		capacity = (int64) metap->nVectors;
 		UnlockReleaseBuffer(metabuf);
 	}
 
@@ -400,7 +400,9 @@ TqDoScan(IndexScanDesc scan)
 
 	if (capacity < 1)
 		capacity = 1;
-	results = palloc(sizeof(TqScanResult) * capacity);
+	/* Huge variant: at nVectors near uint32 max this exceeds MaxAllocSize. */
+	results = (TqScanResult *) MemoryContextAllocHuge(CurrentMemoryContext,
+													  sizeof(TqScanResult) * capacity);
 
 	/*
 	 * Block scan: read the whole code-plane chain into one contiguous buffer,
@@ -412,16 +414,21 @@ TqDoScan(IndexScanDesc scan)
 	{
 		Size		blockCodeBytes = TQ_BLOCK_CODE_BYTES(dc);
 		Size		codeLen = (Size) blockCount * blockCodeBytes;
+		char	   *codeBuf = NULL;
+		BlockNumber sblk = sideStart;
+		uint32		b = 0;
+
 		/*
 		 * The whole code plane is read into one contiguous buffer. For a flat
 		 * index this grows with the table: at ~2M+ rows (high dim) it exceeds
 		 * the 1GB MaxAllocSize of a normal palloc, so use the huge variant.
+		 * Skipped for a NULL order-by key (nothing is scored).
 		 */
-		char	   *codeBuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, codeLen);
-		BlockNumber sblk = sideStart;
-		uint32		b = 0;
-
-		TqReadBytes(index, codeStart, codeBuf, codeLen);
+		if (so->haveQuery)
+		{
+			codeBuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, codeLen);
+			TqReadBytes(index, codeStart, codeBuf, codeLen);
+		}
 
 		while (BlockNumberIsValid(sblk))
 		{
@@ -431,6 +438,8 @@ TqDoScan(IndexScanDesc scan)
 						smax;
 			BlockNumber nextblk;
 
+			CHECK_FOR_INTERRUPTS();
+
 			LockBuffer(sbuf, BUFFER_LOCK_SHARE);
 			spage = BufferGetPage(sbuf);
 			smax = PageGetMaxOffsetNumber(spage);
@@ -438,9 +447,31 @@ TqDoScan(IndexScanDesc scan)
 			for (soff = FirstOffsetNumber; soff <= smax; soff = OffsetNumberNext(soff))
 			{
 				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
-				const uint8 *plane = (const uint8 *) codeBuf + (Size) b * blockCodeBytes;
+				const uint8 *plane = so->haveQuery ?
+					(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
 
-				if (tqflat_force_scalar)
+				if (!so->haveQuery)
+				{
+					/*
+					 * NULL order-by key: every distance is NULL, but rows must
+					 * still be returned (mirrors ivfflat's ZeroDistance path).
+					 */
+					for (int j = 0; j < srec->nvecs; j++)
+					{
+						if (srec->deletedMask & (1u << j))
+							continue;
+
+						if (n >= capacity)
+						{
+							capacity *= 2;
+							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
+						}
+						results[n].dist = 0.0;
+						results[n].tid = srec->side[j].heaptid;
+						n++;
+					}
+				}
+				else if (tqflat_force_scalar)
 				{
 					int			nLevels = model->nLevels;
 					int			j;
@@ -470,7 +501,7 @@ TqDoScan(IndexScanDesc scan)
 						if (n >= capacity)
 						{
 							capacity *= 2;
-							results = repalloc(results, sizeof(TqScanResult) * capacity);
+							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
 						}
 						results[n].dist = TqEstToDistSide(so, sd->norm, est);
 						results[n].tid = sd->heaptid;
@@ -502,7 +533,7 @@ TqDoScan(IndexScanDesc scan)
 						if (n >= capacity)
 						{
 							capacity *= 2;
-							results = repalloc(results, sizeof(TqScanResult) * capacity);
+							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
 						}
 						results[n].dist = TqEstToDistSide(so, sd->norm, est);
 						results[n].tid = sd->heaptid;
@@ -536,6 +567,8 @@ TqDoScan(IndexScanDesc scan)
 						tmax;
 			BlockNumber nextblk;
 
+			CHECK_FOR_INTERRUPTS();
+
 			LockBuffer(tbuf, BUFFER_LOCK_SHARE);
 			tpage = BufferGetPage(tbuf);
 			tmax = PageGetMaxOffsetNumber(tpage);
@@ -543,19 +576,23 @@ TqDoScan(IndexScanDesc scan)
 			for (toff = FirstOffsetNumber; toff <= tmax; toff = OffsetNumberNext(toff))
 			{
 				TqEntry    *entry = (TqEntry *) PageGetItem(tpage, PageGetItemId(tpage, toff));
-				float		est;
 
 				if (entry->deleted)
 					continue;
 
-				est = TqScoreEntry(model, so->lut, so->qjlQuery, entry, entry->data);
-
 				if (n >= capacity)
 				{
 					capacity *= 2;
-					results = repalloc(results, sizeof(TqScanResult) * capacity);
+					results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
 				}
-				results[n].dist = TqEstToDist(so, entry, est);
+				if (so->haveQuery)
+				{
+					float		est = TqScoreEntry(model, so->lut, so->qjlQuery, entry, entry->data);
+
+					results[n].dist = TqEstToDist(so, entry, est);
+				}
+				else
+					results[n].dist = 0.0;	/* NULL order-by key */
 				results[n].tid = entry->heaptid;
 				n++;
 			}
@@ -575,15 +612,18 @@ TqDoScan(IndexScanDesc scan)
 	 * perfectly comparable, but in the top-K region the exact values dominate,
 	 * which is what matters for the returned neighbors.
 	 */
-	if (tqflat_rerank > 0 && n > 0 && so->haveQuery)
+	if (tqflat_rerank > 0 && n > 0 && so->haveQuery &&
+		AttributeNumberIsValid(so->heapAttno))
 	{
-		int			k = Min(tqflat_rerank, n);
+		int64		k = Min((int64) tqflat_rerank, n);
 
 		qsort(results, n, sizeof(TqScanResult), CompareResults);
 
-		for (int i = 0; i < k; i++)
+		for (int64 i = 0; i < k; i++)
 		{
 			Datum		heapDatum = TqHeapFetchDatum(scan, so, &results[i].tid);
+
+			CHECK_FOR_INTERRUPTS();
 
 			if (heapDatum != (Datum) 0)
 			{
@@ -600,6 +640,15 @@ TqDoScan(IndexScanDesc scan)
 
 				d = DatumGetFloat8(FunctionCall2Coll(so->procinfo, so->collation,
 													 so->queryDatum, cmpDatum));
+
+				/*
+				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while the
+				 * quantized estimate scale is 1 - cos; shift by 1 so the two
+				 * populations sort on the same scale in the final qsort.
+				 */
+				if (so->metric == TQ_METRIC_COSINE)
+					d += 1.0;
+
 				results[i].dist = d;
 
 				if (cmpDatum != heapDatum)
@@ -646,12 +695,10 @@ tqgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with tqflat");
 
-		if (so->lut == NULL)
-		{
-			so->first = false;
-			return false;		/* NULL order-by query: no results */
-		}
-
+		/*
+		 * A NULL order-by key still returns every tuple (with zero distance),
+		 * matching ivfflat's ZeroDistance path -- TqDoScan handles it.
+		 */
 		TqDoScan(scan);
 		so->first = false;
 	}

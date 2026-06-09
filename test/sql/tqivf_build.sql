@@ -1,3 +1,11 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqivf_test_meta(regclass) RETURNS text
+	AS 'vector' LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION tqivf_test_list_counts(regclass) RETURNS int[]
+	AS 'vector' LANGUAGE C STABLE;
+
 SET enable_seqscan = off;
 
 CREATE TABLE tqivf_b (id int, v vector(8));

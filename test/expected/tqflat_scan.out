@@ -1,3 +1,8 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqflat_test_meta(regclass) RETURNS int[]
+	AS 'vector' LANGUAGE C STRICT;
 -- tqflat scan tests: M3.2 (full scan + heap-fetch rerank, L2 metric).
 -- Deterministic small data where the nearest neighbours are unambiguous, so
 -- the index result is stable regardless of quantization noise once reranked.

@@ -480,15 +480,22 @@ CheckElementCloser(char *base, TqhnswCandidate *e, List *r, int dc, TqMetric met
  * Algorithm 4 from the paper (SelectNeighbors heuristic).  Returns up to lm
  * selected neighbors as a List of TqhnswCandidate *.  c is a List of
  * TqhnswCandidate *.
+ *
+ * If pruned is non-NULL, it receives one candidate that was NOT selected
+ * (mirrors hnswutils.c SelectNeighbors); NULL when nothing was pruned.
  */
 static List *
-TqhnswSelectNeighbors(char *base, List *c, int lm, int dc, TqMetric metric)
+TqhnswSelectNeighbors(char *base, List *c, int lm, int dc, TqMetric metric,
+					  TqhnswCandidate **pruned)
 {
 	List	   *r = NIL;
 	List	   *w = list_copy(c);
 	TqhnswCandidate **wd;
 	int			wdlen = 0;
 	int			wdoff = 0;
+
+	if (pruned != NULL)
+		*pruned = NULL;
 
 	if (list_length(w) <= lm)
 		return w;
@@ -518,17 +525,35 @@ TqhnswSelectNeighbors(char *base, List *c, int lm, int dc, TqMetric metric)
 	while (wdoff < wdlen && list_length(r) < lm)
 		r = lappend(r, wd[wdoff++]);
 
+	/* Return one unselected candidate for update connections. */
+	if (pruned != NULL)
+	{
+		if (wdoff < wdlen)
+			*pruned = wd[wdoff];
+		else if (list_length(w) > 0)
+			*pruned = linitial(w);
+	}
+
 	return r;
 }
 
 /*
  * Add element as a neighbor of target at layer lc, pruning target's neighbor
  * list back to lm via SelectNeighbors if it overflows.  Mirrors
- * HnswUpdateConnection.
+ * HnswUpdateConnection: when the list is full, the candidate pruned OUT is
+ * replaced IN PLACE, so existing items keep their slot positions.
+ *
+ * If updateIdx is non-NULL it reports what changed: -2 when element was
+ * appended to a free slot; the (original-order) index of the replaced item
+ * when the list was full and element won the prune; untouched (caller
+ * initializes to -1) when element lost the prune.  The on-disk single-slot
+ * write in tqhnswinsert.c relies on this index matching the slot order of the
+ * live neighbor tuple.
  */
 void
 TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element,
-					   double distance, int lm, int lc, int dc, TqMetric metric)
+					   double distance, int lm, int lc, int dc, TqMetric metric,
+					   int *updateIdx)
 {
 	TqhnswNeighborArray *na;
 
@@ -540,15 +565,17 @@ TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element
 		TqhnswPtrStore(base, na->items[na->count].element, element);
 		na->items[na->count].distance = distance;
 		na->count++;
+
+		if (updateIdx != NULL)
+			*updateIdx = -2;
 	}
 	else
 	{
 		/* Full: rebuild the candidate set (existing + new) and re-select. */
 		List	   *c = NIL;
-		List	   *selected;
-		ListCell   *lc2;
 		int			i;
 		TqhnswCandidate *newCand;
+		TqhnswCandidate *pruned = NULL;
 
 		for (i = 0; i < na->count; i++)
 		{
@@ -565,17 +592,33 @@ TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element
 		newCand->distance = distance;
 		c = lappend(c, newCand);
 
-		selected = TqhnswSelectNeighbors(base, c, lm, dc, metric);
+		(void) TqhnswSelectNeighbors(base, c, lm, dc, metric, &pruned);
 
-		na->count = 0;
-		foreach(lc2, selected)
+		/* Should not happen */
+		if (pruned == NULL)
 		{
-			TqhnswCandidate *hc = lfirst(lc2);
+			LWLockRelease(&target->lock);
+			return;
+		}
 
-			TqhnswPtrStore(base, na->items[na->count].element,
-						   TqhnswPtrAccess(base, hc->element));
-			na->items[na->count].distance = hc->distance;
-			na->count++;
+		/* element lost the prune: leave the list untouched (updateIdx stays -1). */
+		if (pruned != newCand)
+		{
+			/* Replace the pruned element in place. */
+			for (i = 0; i < na->count; i++)
+			{
+				if (TqhnswPtrAccess(base, na->items[i].element) ==
+					TqhnswPtrAccess(base, pruned->element))
+				{
+					TqhnswPtrStore(base, na->items[i].element, element);
+					na->items[i].distance = distance;
+
+					if (updateIdx != NULL)
+						*updateIdx = i;
+
+					break;
+				}
+			}
 		}
 	}
 
@@ -853,7 +896,7 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 		if (index != NULL)
 			lw = TqhnswRemoveElements(lw, skipElement);
 
-		selected = TqhnswSelectNeighbors(base, lw, lm, dc, metric);
+		selected = TqhnswSelectNeighbors(base, lw, lm, dc, metric, NULL);
 
 		/* Store the forward neighbors (element -> selected) in element's own list. */
 		na = TqhnswGetNeighbors(base, element, lc);
@@ -900,7 +943,7 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 				TqhnswElement *neighbor = TqhnswPtrAccess(base, snapshot->items[i].element);
 
 				TqhnswUpdateConnection(base, neighbor, element, snapshot->items[i].distance,
-									   lm, lc, dc, metric);
+									   lm, lc, dc, metric, NULL);
 			}
 		}
 	}

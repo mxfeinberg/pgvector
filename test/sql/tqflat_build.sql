@@ -1,3 +1,9 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqflat_test_meta(regclass) RETURNS int[]
+	AS 'vector' LANGUAGE C STRICT;
+
 -- tqflat build tests: M2.1 (meta/side pages + loader), M2.2 (heap scan + data pages).
 -- v4 blocked layout: bits MUST be 4, tq_prod MUST be false (QJL unsupported).
 -- fast_rotation in {on (default), off} are both supported.

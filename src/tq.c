@@ -1013,6 +1013,14 @@ tqflat_test_ip_accuracy(PG_FUNCTION_ARGS)
 	if (nb < 1)
 		ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: base array must be non-empty")));
 
+	/* STRICT covers only a NULL array, not NULL elements within it. */
+	for (i = 0; i < nq; i++)
+		if (qnulls[i])
+			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: query array must not contain nulls")));
+	for (j = 0; j < nb; j++)
+		if (bnulls[j])
+			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: base array must not contain nulls")));
+
 	/* Determine dim from first query vector; validate all others match. */
 	{
 		Vector	   *v0 = DatumGetVector(qelems[0]);

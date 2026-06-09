@@ -1,3 +1,10 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqhnsw_test_meta(regclass) RETURNS text
+	AS 'vector' LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION tqhnsw_test_graph(regclass) RETURNS text
+	AS 'vector' LANGUAGE C STABLE;
 SET enable_seqscan = off;
 -- Empty (UNLOGGED -> ambuildempty path) index has a valid meta page.
 CREATE UNLOGGED TABLE tqhnsw_e (v vector(8));

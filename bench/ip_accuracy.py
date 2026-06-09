@@ -129,6 +129,22 @@ def vectors_to_pg_array(vecs):
 # Call tqflat_test_ip_accuracy
 # ---------------------------------------------------------------------------
 
+def ensure_accuracy_function(conn):
+    """
+    tqflat_test_ip_accuracy is a test-only C wrapper that is no longer shipped
+    in the extension SQL; define it from vector.so (requires superuser).
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION tqflat_test_ip_accuracy(
+                vector[], vector[], int, bool, bool) RETURNS float8[]
+            AS 'vector' LANGUAGE C IMMUTABLE STRICT
+        """)
+    finally:
+        cur.close()
+
+
 def run_accuracy(conn, queries, base, bits, tq_prod, fast):
     """
     Call tqflat_test_ip_accuracy for one (tq_prod, fast) configuration.
@@ -307,6 +323,8 @@ def main():
         print(f"ERROR: could not connect: {e}", file=sys.stderr)
         sys.exit(1)
     print("Connected.")
+
+    ensure_accuracy_function(conn)
 
     # ---- Run the 4 configurations ----
     configs = [

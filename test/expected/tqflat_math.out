@@ -1,3 +1,32 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqflat_test_codebook(int, int) RETURNS float8[]
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_codebook_mse(int, int) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_fwht_involution(int) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_ip_estimate(vector, vector, int, bool) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_lut8_recovery(int) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_pack_roundtrip(int, int) RETURNS int
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_qjl_estimate(vector, vector, int, int, bool) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_rht_coord_stats(int) RETURNS float8[]
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_rht_norm(int) RETURNS float8
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_rotation_coord_stats(int) RETURNS float8[]
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_score_block(int) RETURNS int
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_score_block_consistency(int) RETURNS int
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION tqflat_test_transpose_roundtrip(int, int) RETURNS int
+	AS 'vector' LANGUAGE C IMMUTABLE STRICT;
 -- tqflat math validation: ties the quantizer core to the TurboQuant paper's
 -- theoretical guarantees, independent of index structure.  These validate the
 -- reusable core (tqquant.c / tqdistance.c) that a future HNSW/IVF integration

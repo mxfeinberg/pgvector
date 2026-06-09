@@ -1,3 +1,8 @@
+-- Test-only C wrappers from vector.so, defined per test file rather than
+-- shipped in the extension SQL (they read index internals and are not part
+-- of the public surface).
+CREATE OR REPLACE FUNCTION tqflat_test_meta(regclass) RETURNS int[]
+	AS 'vector' LANGUAGE C STRICT;
 -- tqflat vacuum tests: M5.1 (tombstone-based bulk delete).
 --
 -- Strategy: small, deterministic data where the nearest-neighbor order is

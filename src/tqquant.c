@@ -2,6 +2,7 @@
 
 #include <math.h>
 
+#include "miscadmin.h"
 #include "tq.h"
 
 /*
@@ -81,8 +82,12 @@ TqBuildRotation(int dim, uint64 seed, float *rotation)
 				p,
 				r;
 
-	/* O(dim²) build-time scratch (~2 GB at TQ_MAX_DIM); M2 will persist to index pages. */
-	a = palloc(sizeof(double) * dim * dim);
+	/*
+	 * O(dim²) build-time scratch (~2 GB at TQ_MAX_DIM -- past MaxAllocSize from
+	 * dim ~11586, hence the huge variant); M2 will persist to index pages.
+	 */
+	a = (double *) MemoryContextAllocHuge(CurrentMemoryContext,
+										  sizeof(double) * (Size) dim * dim);
 
 	tq_rng_init(&rng, seed);
 	for (i = 0; i < dim * dim; i++)
@@ -93,6 +98,9 @@ TqBuildRotation(int dim, uint64 seed, float *rotation)
 	{
 		double	   *vc = a + (Size) c * dim;
 		double		nrm;
+
+		/* O(dim³) total: keep the build cancellable. */
+		CHECK_FOR_INTERRUPTS();
 
 		/* Subtract projection onto each already-orthonormal column. */
 		for (p = 0; p < c; p++)

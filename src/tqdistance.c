@@ -104,7 +104,7 @@ TqInitDispatch(void)
 {
 	TqScoreEntry = TqScoreEntryDefault;
 	TqScoreBlockRange = TqScoreBlockRangeDefault;
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(__aarch64__)
 	TqScoreBlockRange = TqScoreBlockRangeNeon;
 #endif
 #if defined(USE_DISPATCH) && defined(__x86_64__)
@@ -123,7 +123,7 @@ TqActiveKernelName(void)
 {
 	if (TqScoreBlockRange == TqScoreBlockRangeDefault)
 		return "default";
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(__aarch64__)
 	if (TqScoreBlockRange == TqScoreBlockRangeNeon)
 		return "neon";
 #endif

@@ -4,6 +4,9 @@
 `ivfflat`, and exact seqscan across four metrics: **recall@k**, **QPS / latency**,
 **build time**, and **index size**.
 
+The quantization scheme implemented by the TQ access methods is described in
+the TurboQuant paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874).
+
 ---
 
 ## Requirements

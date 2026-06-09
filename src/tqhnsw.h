@@ -342,10 +342,13 @@ extern double TqhnswBuildDistance(const float *a, const float *b, int dc,
 								  TqMetric metric);
 
 /* Add element as a neighbor of target at layer lc, pruning target's neighbor
- * list back to lm via SelectNeighbors if it overflows (HnswUpdateConnection). */
+ * list back to lm via SelectNeighbors if it overflows (HnswUpdateConnection).
+ * Replaces the pruned-out item IN PLACE; updateIdx (optional) reports -2 for
+ * append or the original-order index of the replaced item. */
 extern void TqhnswUpdateConnection(char *base, TqhnswElement *target,
 								   TqhnswElement *element, double distance,
-								   int lm, int lc, int dc, TqMetric metric);
+								   int lm, int lc, int dc, TqMetric metric,
+								   int *updateIdx);
 
 /* Insert element into the graph (paper Alg 1).  build path: base=NULL, index=NULL.
  * existing=true is used by vacuum repair: element is already in the graph and needs

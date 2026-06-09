@@ -9,6 +9,22 @@
 #include "tq.h"
 #include "vector.h"
 
+/*
+ * Ensure the value's dimensions match the index's.  The opclass distance
+ * functions never run on this path (the LUT is built from raw floats), so the
+ * converters themselves must reject mismatched dimensions -- otherwise a
+ * mismatched query or inserted value reads (or, for sparsevec, writes) past
+ * the scratch buffer.
+ */
+static inline void
+TqCheckDim(int valueDim, int dim)
+{
+	if (valueDim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("different vector dimensions %d and %d", valueDim, dim)));
+}
+
 /* vector: zero-copy passthrough of the detoasted ->x (scratch unused). */
 const float *
 TqVectorToFloat(Datum value, float *scratch, int dim)
@@ -16,7 +32,7 @@ TqVectorToFloat(Datum value, float *scratch, int dim)
 	Vector	   *v = DatumGetVector(value);
 
 	(void) scratch;
-	Assert(v->dim == dim);
+	TqCheckDim(v->dim, dim);
 	return v->x;
 }
 
@@ -26,7 +42,7 @@ TqHalfvecToFloat(Datum value, float *scratch, int dim)
 {
 	HalfVector *h = DatumGetHalfVector(value);
 
-	Assert(h->dim == dim);
+	TqCheckDim(h->dim, dim);
 	for (int i = 0; i < dim; i++)
 		scratch[i] = HalfToFloat4(h->x[i]);
 	return scratch;
@@ -39,7 +55,7 @@ TqSparsevecToFloat(Datum value, float *scratch, int dim)
 	SparseVector *s = DatumGetSparseVector(value);
 	float	   *vals = SPARSEVEC_VALUES(s);
 
-	Assert(s->dim == dim);
+	TqCheckDim(s->dim, dim);
 	memset(scratch, 0, sizeof(float) * dim);
 	for (int j = 0; j < s->nnz; j++)
 		scratch[s->indices[j]] = vals[j];
