@@ -1,0 +1,3 @@
+metric,method,build_s,idx_size,recall,qps,avg_ms
+cosine,"tqflat (bits=4,rerank=200) [8bit] [fast,noqjl]",193.6294717718847,3923.2 MB,1.0,0.24056185851623113,4156.934961210936
+cosine,"tqflat (bits=4,rerank=2000) [8bit] [fast,noqjl]",193.6294717718847,3923.2 MB,1.0,0.23805797111117322,4200.657492510509

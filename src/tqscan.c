@@ -412,7 +412,12 @@ TqDoScan(IndexScanDesc scan)
 	{
 		Size		blockCodeBytes = TQ_BLOCK_CODE_BYTES(dc);
 		Size		codeLen = (Size) blockCount * blockCodeBytes;
-		char	   *codeBuf = palloc(codeLen);
+		/*
+		 * The whole code plane is read into one contiguous buffer. For a flat
+		 * index this grows with the table: at ~2M+ rows (high dim) it exceeds
+		 * the 1GB MaxAllocSize of a normal palloc, so use the huge variant.
+		 */
+		char	   *codeBuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, codeLen);
 		BlockNumber sblk = sideStart;
 		uint32		b = 0;
 

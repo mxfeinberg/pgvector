@@ -15,3 +15,7 @@ regression.*
 /graphify-out
 agtalk_posts.sql
 /docs
+# roborev snapshots
+/.roborev/
+.DS_Store
+/.claude

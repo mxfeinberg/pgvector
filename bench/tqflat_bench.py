@@ -86,8 +86,16 @@ def load_synthetic(n, dim, nq, seed):
 
 
 def load_from_files(vec_path, q_path, gt_path=None):
-    """Load vectors from .npy files.  Returns (vectors, queries, gt_or_None)."""
-    vectors = np.load(vec_path).astype(np.float32)
+    """Load vectors from .npy files.  Returns (vectors, queries, gt_or_None).
+
+    The base array is mmap'd (never fully resident) and only copied if it isn't
+    already float32 — at large N the redundant ``.astype`` copy doubled RAM and
+    OOM-killed the loader (e.g. agtalk 7.7M x 768 is ~24 GB per copy).  ``load_vectors``
+    streams it row-by-row into a batched COPY, so the mmap is all that's needed.
+    """
+    vectors = np.load(vec_path, mmap_mode="r")
+    if vectors.dtype != np.float32:
+        vectors = vectors.astype(np.float32)
     queries = np.load(q_path).astype(np.float32)
     gt = None
     if gt_path and os.path.exists(gt_path):

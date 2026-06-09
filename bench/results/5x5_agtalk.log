@@ -1,0 +1,118 @@
+################ 5x5 SUITE START 2026-06-08 10:01:13 ################
+================ agtalk (cosine, 7.74M) 2026-06-08 10:01:13 ================
+Loading .npy dataset …
+Dataset: 7,735,045 vectors, dim=768, 1000 queries, k=10
+
+Connecting to max@/var/run/postgresql:5432/tqtest …
+Connected.
+  maintenance_work_mem=24GB, max_parallel_maintenance_workers=8
+
+--- Setup ---
+  Loading 7,735,045 vectors (dim=768) … done (3704.5s)
+
+========== metric: cosine  (op <=>, opclass vector_cosine_ops) ==========
+
+--- Ground truth (cosine) ---
+  Using pre-computed ground truth (from file).
+
+--- tqivf cosine lists=2781 probes=[10, 30, 99, 200, 400] reranks=[100, 200, 2000] ---
+  Building tqivf index (vector_cosine_ops, lists=2781, fast_rotation=true) … 948.78s
+  Querying probes=10 rerank=100 … 49 QPS, recall=0.8125
+  Querying probes=10 rerank=200 … 50 QPS, recall=0.8125
+  Querying probes=10 rerank=2000 … 13 QPS, recall=0.8125
+  Querying probes=30 rerank=100 … 25 QPS, recall=0.9081
+  Querying probes=30 rerank=200 … 24 QPS, recall=0.9081
+  Querying probes=30 rerank=2000 … 15 QPS, recall=0.9081
+  Querying probes=99 rerank=100 … 8 QPS, recall=0.9638
+  Querying probes=99 rerank=200 … 8 QPS, recall=0.9638
+  Querying probes=99 rerank=2000 … 7 QPS, recall=0.9638
+  Querying probes=200 rerank=100 … 4 QPS, recall=0.9832
+  Querying probes=200 rerank=200 … 4 QPS, recall=0.9832
+  Querying probes=200 rerank=2000 … 4 QPS, recall=0.9832
+  Querying probes=400 rerank=100 … 2 QPS, recall=0.9936
+  Querying probes=400 rerank=200 … 2 QPS, recall=0.9936
+  Querying probes=400 rerank=2000 … 2 QPS, recall=0.9936
+
+--- tqhnsw cosine m=16 ef_construction=64 ef_search=[40, 100, 200] reranks=[100, 200] ---
+  Building tqhnsw index (vector_cosine_ops, m=16, ef_construction=64, fast_rotation=true) … 5692.52s
+  Querying ef_search=40 rerank=100 … 114 QPS, recall=0.8340
+  Querying ef_search=40 rerank=200 … 186 QPS, recall=0.8340
+  Querying ef_search=100 rerank=100 … 69 QPS, recall=0.9164
+  Querying ef_search=100 rerank=200 … 98 QPS, recall=0.9164
+  Querying ef_search=200 rerank=100 … 56 QPS, recall=0.9449
+  Querying ef_search=200 rerank=200 … 43 QPS, recall=0.9449
+
+--- HNSW (cosine) ---
+  Building hnsw index (vector_cosine_ops, m=32, ef_construction=128) … 10781.4s
+
+--- IVFFlat (cosine) ---
+  Building ivfflat index (vector_cosine_ops, lists=2781) … 987.1s
+
+=== Results ===
+
+| Metric | Method                                                           | Build (s) | Index size | Recall@10 | QPS   | Avg latency (ms) |
+|--------|------------------------------------------------------------------|-----------|------------|-----------|-------|------------------|
+| cosine | tqivf (lists=2781,probes=10,rerank=100) [8bit]                   | 948.78    | 3979.7 MB  | 0.8125    | 49.4  | 20.24            |
+| cosine | tqivf (lists=2781,probes=10,rerank=200) [8bit]                   | 948.78    | 3979.7 MB  | 0.8125    | 50.2  | 19.91            |
+| cosine | tqivf (lists=2781,probes=10,rerank=2000) [8bit]                  | 948.78    | 3979.7 MB  | 0.8125    | 13.5  | 74.08            |
+| cosine | tqivf (lists=2781,probes=30,rerank=100) [8bit]                   | 948.78    | 3979.7 MB  | 0.9081    | 24.6  | 40.64            |
+| cosine | tqivf (lists=2781,probes=30,rerank=200) [8bit]                   | 948.78    | 3979.7 MB  | 0.9081    | 24.0  | 41.61            |
+| cosine | tqivf (lists=2781,probes=30,rerank=2000) [8bit]                  | 948.78    | 3979.7 MB  | 0.9081    | 15.1  | 66.33            |
+| cosine | tqivf (lists=2781,probes=99,rerank=100) [8bit]                   | 948.78    | 3979.7 MB  | 0.9638    | 7.7   | 129.45           |
+| cosine | tqivf (lists=2781,probes=99,rerank=200) [8bit]                   | 948.78    | 3979.7 MB  | 0.9638    | 7.7   | 130.25           |
+| cosine | tqivf (lists=2781,probes=99,rerank=2000) [8bit]                  | 948.78    | 3979.7 MB  | 0.9638    | 6.6   | 152.26           |
+| cosine | tqivf (lists=2781,probes=200,rerank=100) [8bit]                  | 948.78    | 3979.7 MB  | 0.9832    | 3.9   | 253.53           |
+| cosine | tqivf (lists=2781,probes=200,rerank=200) [8bit]                  | 948.78    | 3979.7 MB  | 0.9832    | 3.9   | 255.01           |
+| cosine | tqivf (lists=2781,probes=200,rerank=2000) [8bit]                 | 948.78    | 3979.7 MB  | 0.9832    | 3.6   | 275.61           |
+| cosine | tqivf (lists=2781,probes=400,rerank=100) [8bit]                  | 948.78    | 3979.7 MB  | 0.9936    | 2.0   | 492.83           |
+| cosine | tqivf (lists=2781,probes=400,rerank=200) [8bit]                  | 948.78    | 3979.7 MB  | 0.9936    | 2.0   | 494.27           |
+| cosine | tqivf (lists=2781,probes=400,rerank=2000) [8bit]                 | 948.78    | 3979.7 MB  | 0.9936    | 1.9   | 516.49           |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=40,rerank=100) [8bit]  | 5692.52   | 6043.0 MB  | 0.8340    | 113.6 | 8.80             |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=40,rerank=200) [8bit]  | 5692.52   | 6043.0 MB  | 0.8340    | 185.7 | 5.39             |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=100,rerank=100) [8bit] | 5692.52   | 6043.0 MB  | 0.9164    | 69.5  | 14.39            |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=100,rerank=200) [8bit] | 5692.52   | 6043.0 MB  | 0.9164    | 97.9  | 10.21            |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=200,rerank=100) [8bit] | 5692.52   | 6043.0 MB  | 0.9449    | 56.3  | 17.75            |
+| cosine | tqhnsw (m=16,ef_construction=64,ef_search=200,rerank=200) [8bit] | 5692.52   | 6043.0 MB  | 0.9449    | 42.9  | 23.32            |
+| cosine | hnsw (m=32,ef_construction=128,ef_search=100)                    | 10781.41  | 30214.9 MB | 0.9762    | 71.0  | 14.08            |
+| cosine | ivfflat (lists=2781,probes=278)                                  | 987.05    | 30231.2 MB | 0.9879    | 0.8   | 1243.32          |
+
+Results written to: bench/results/5x5_agtalk_main.csv
+
+Dropping scratch schema bench_tqflat …
+Done. Connection closed.
+agtalk main exit=0 2026-06-08 17:21:39
+Loading .npy dataset …
+Capped query set to first 200.
+Dataset: 7,735,045 vectors, dim=768, 200 queries, k=10
+
+Connecting to max@/var/run/postgresql:5432/tqtest …
+Connected.
+  maintenance_work_mem=24GB, max_parallel_maintenance_workers=8
+
+--- Setup ---
+  Loading 7,735,045 vectors (dim=768) … done (3722.8s)
+
+========== metric: cosine  (op <=>, opclass vector_cosine_ops) ==========
+
+--- Ground truth (cosine) ---
+  Using pre-computed ground truth (from file).
+
+--- tqflat cosine bits=4 ---
+  Building tqflat vector_cosine_ops bits=4 fast_rotation=true tq_prod=false index … 193.63s
+  Querying rerank=200 … 0 QPS, recall=1.0000
+  Querying rerank=2000 … 0 QPS, recall=1.0000
+
+=== Results ===
+
+| Metric | Method                                          | Build (s) | Index size | Recall@10 | QPS | Avg latency (ms) |
+|--------|-------------------------------------------------|-----------|------------|-----------|-----|------------------|
+| cosine | tqflat (bits=4,rerank=200) [8bit] [fast,noqjl]  | 193.63    | 3923.2 MB  | 1.0000    | 0.2 | 4156.93          |
+| cosine | tqflat (bits=4,rerank=2000) [8bit] [fast,noqjl] | 193.63    | 3923.2 MB  | 1.0000    | 0.2 | 4200.66          |
+
+Results written to: bench/results/5x5_agtalk_tqflat.csv
+
+Dropping scratch schema bench_tqflat …
+Done. Connection closed.
+agtalk tqflat exit=0 2026-06-08 18:54:50
+agtalk merged -> bench/results/5x5_agtalk.csv 2026-06-08 18:54:50
+################ 5x5 SUITE DONE 2026-06-08 18:54:50 ################
