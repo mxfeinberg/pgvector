@@ -109,6 +109,25 @@ RESET tqflat.rerank;
 RESET enable_seqscan;
 DROP TABLE tqmetrics;
 
+-- Zero-norm vectors are skipped under cosine at build and insert time (the
+-- <=> operator returns NaN for them; mirrors hnsw/ivfflat), so an indexed scan
+-- cannot rank a zero vector ahead of an anti-parallel one.
+CREATE TABLE tqzero (id int, v vector(4));
+INSERT INTO tqzero VALUES (1, '[1,1,0,0]'), (2, '[0,0,0,0]'), (3, '[-1,-1,0,0]');
+CREATE INDEX tqzero_cos_idx ON tqzero USING tqflat (v vector_cosine_ops) WITH (bits = 4);
+INSERT INTO tqzero VALUES (4, '[0,0,0,0]');
+SET enable_seqscan = off;
+SET tqflat.rerank = 100;
+-- Both zero rows (build path id 2, insert path id 4) are absent; the
+-- anti-parallel id 3 sorts after id 1.
+SELECT id FROM tqzero ORDER BY v <=> '[1,1,0,0]'::vector LIMIT 5;  -- expect 1, 3
+-- L2 still indexes zero vectors.
+CREATE INDEX tqzero_l2_idx ON tqzero USING tqflat (v vector_l2_ops) WITH (bits = 4);
+SELECT count(*) FROM (SELECT id FROM tqzero ORDER BY v <-> '[1,1,0,0]'::vector LIMIT 5) q;  -- expect 4
+RESET tqflat.rerank;
+RESET enable_seqscan;
+DROP TABLE tqzero;
+
 -- fast_rotation index returns the unambiguous nearest neighbour.
 CREATE TABLE tqfast (id int, v vector(8));
 INSERT INTO tqfast VALUES

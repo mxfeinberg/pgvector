@@ -560,6 +560,20 @@ TqivfLoadBatch(IndexScanDesc scan)
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
 	/*
+	 * Iterative scan re-enters here once per exhausted batch; release the
+	 * previous batch's result array so a long scan retains only one batch at
+	 * a time (the rest of tmpCtx -- probe lists, LUTs, heap-fetch state --
+	 * must survive across batches and is freed at rescan/endscan).
+	 */
+	if (so->results != NULL)
+	{
+		pfree(so->results);
+		so->results = NULL;
+		so->nresults = 0;
+		so->cursor = 0;
+	}
+
+	/*
 	 * Estimate the initial capacity from the lists in this batch (nvectors is
 	 * a hint; the array grows by doubling in TqivfScoreList as needed).  Each
 	 * nvectors is a uint32 and the per-index cap is ~4.29B, so accumulate

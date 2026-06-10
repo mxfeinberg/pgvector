@@ -303,6 +303,7 @@ extern void TqApplyRht(uint64 seed, int nstages, int dPadded,
 
 /* ---- tqquant.c ---- */
 extern void TqL2NormalizeFloat(float *v, int dim);
+extern bool TqCheckNorm(const float *v, int dim);
 extern void TqBuildCodebook(int dim, int bits, float *boundaries, float *centroids);
 extern void TqBuildRotation(int dim, uint64 seed, float *rotation);
 extern void TqBuildQjl(int dim, uint64 seed, float *qjl);

@@ -159,4 +159,23 @@ SELECT id FROM tqhnsw_cos2 ORDER BY v <=> '[1,0,0,0]' LIMIT 3;
 
 RESET tqhnsw.force_scalar;
 DROP TABLE tqhnsw_cos2;
+-- Zero-norm vectors are skipped under cosine at build and insert time (the
+-- <=> operator returns NaN for them; mirrors hnsw/ivfflat), so an indexed scan
+-- cannot rank a zero vector ahead of an anti-parallel one.
+CREATE TABLE tqhnsw_zero (id int, v vector(4));
+INSERT INTO tqhnsw_zero VALUES (1, '[1,1,0,0]'), (2, '[0,0,0,0]'), (3, '[-1,-1,0,0]');
+CREATE INDEX ON tqhnsw_zero USING tqhnsw (v vector_cosine_ops);
+INSERT INTO tqhnsw_zero VALUES (4, '[0,0,0,0]');
+SET tqhnsw.ef_search = 100;
+SET tqhnsw.rerank = 100;
+-- Both zero rows (build path id 2, insert path id 4) are absent; the
+-- anti-parallel id 3 sorts after id 1.
+SELECT id FROM tqhnsw_zero ORDER BY v <=> '[1,1,0,0]' LIMIT 5;  -- expect 1, 3
+ id 
+----
+  1
+  3
+(2 rows)
+
+DROP TABLE tqhnsw_zero;
 DROP TABLE tqhnsw_s, tqhnsw_empty;

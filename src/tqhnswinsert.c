@@ -873,6 +873,24 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	LOCKMODE	lockmode = ShareLock;
 
 	/*
+	 * Skip zero-norm vectors under cosine (the operator returns NaN for
+	 * them), mirroring hnsw/ivfflat.  The build callback already skips them
+	 * before routing here; this guards aminsert.  The scratch lives in the
+	 * caller's short-lived context (insertCtx / build tmpCtx reset).
+	 */
+	if (metric == TQ_METRIC_COSINE)
+	{
+		const TqTypeInfo *ti = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
+		float	   *vscratch = palloc(sizeof(float) * model->dim);
+		const float *fv;
+
+		value = PointerGetDatum(PG_DETOAST_DATUM(value));
+		fv = ti->toFloat(value, vscratch, model->dim);
+		if (!TqCheckNorm(fv, model->dim))
+			return;
+	}
+
+	/*
 	 * Take a shared page lock for the whole insert.  This lets a future
 	 * graph-mutating vacuum (#2) drain in-flight inserts before repairing the
 	 * graph.  A page lock is used so it does not interfere with buffer locks

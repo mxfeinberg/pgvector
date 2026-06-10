@@ -605,6 +605,18 @@ TqBuildCallback(Relation index, ItemPointer tid, Datum *values,
 														buildstate->vecScratch,
 														buildstate->dim);
 
+		/*
+		 * Skip zero-norm vectors under cosine (the operator returns NaN for
+		 * them), mirroring hnsw/ivfflat.
+		 */
+		if (buildstate->model.metric == TQ_METRIC_COSINE &&
+			!TqCheckNorm(fv, buildstate->dim))
+		{
+			MemoryContextSwitchTo(oldCtx);
+			MemoryContextReset(buildstate->tmpCtx);
+			return;
+		}
+
 		memset(buildstate->entry, 0, buildstate->entrySize);
 		TqEncode(&buildstate->model, fv, buildstate->entry);
 	}
@@ -962,6 +974,17 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		const TqTypeInfo *ti = TqGetTypeInfo(index, TQ_TYPE_INFO_PROC);
 		float	   *scratch = palloc(sizeof(float) * model->dim);
 		const float *fv = ti->toFloat(values[0], scratch, model->dim);
+
+		/*
+		 * Skip zero-norm vectors under cosine (the operator returns NaN for
+		 * them), mirroring hnsw/ivfflat.
+		 */
+		if (model->metric == TQ_METRIC_COSINE && !TqCheckNorm(fv, model->dim))
+		{
+			MemoryContextSwitchTo(oldCtx);
+			MemoryContextDelete(insertCtx);
+			return false;
+		}
 
 		TqEncode(model, fv, entry);
 	}

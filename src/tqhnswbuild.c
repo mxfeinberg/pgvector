@@ -565,6 +565,24 @@ TqhnswBuildCallback(Relation index, ItemPointer tid, Datum *values,
 	value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
 
 	/*
+	 * Skip zero-norm vectors under cosine (the operator returns NaN for
+	 * them), mirroring hnsw/ivfflat.
+	 */
+	if (buildstate->metric == TQ_METRIC_COSINE)
+	{
+		const float *fv = buildstate->typeInfo->toFloat(value,
+														buildstate->vecScratch,
+														buildstate->dim);
+
+		if (!TqCheckNorm(fv, buildstate->dim))
+		{
+			MemoryContextSwitchTo(oldCtx);
+			MemoryContextReset(buildstate->tmpCtx);
+			return;
+		}
+	}
+
+	/*
 	 * Detoast only -- normalization is done per encode path inside
 	 * TqhnswInsertTuple (in-memory) / TqhnswQuantizeElement (on-disk
 	 * fallback), so a value routed to disk on an OOM flush is normalized

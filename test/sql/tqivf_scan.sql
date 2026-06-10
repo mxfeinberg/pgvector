@@ -32,6 +32,21 @@ SELECT id FROM tqivf_cos ORDER BY v <=> '[0,1,0,0]' LIMIT 3;
 
 DROP TABLE tqivf_ip, tqivf_cos;
 
+-- Zero-norm vectors are skipped under cosine at build and insert time (the
+-- <=> operator returns NaN for them; mirrors ivfflat), so an indexed scan
+-- cannot rank a zero vector ahead of a near-anti-parallel one.  (id 3 is not
+-- exactly anti-parallel to id 1: an exact pair would average to a zero-norm
+-- k-means center, which the shared ivfflat kmeans guard rejects by design.)
+CREATE TABLE tqivf_zero (id int, v vector(4));
+INSERT INTO tqivf_zero VALUES (1, '[1,1,0,0]'), (2, '[0,0,0,0]'), (3, '[-1,-2,0,0]');
+CREATE INDEX ON tqivf_zero USING tqivf (v vector_cosine_ops) WITH (lists = 1);
+INSERT INTO tqivf_zero VALUES (4, '[0,0,0,0]');
+SET tqivf.probes = 1;
+-- Both zero rows (build path id 2, insert path id 4) are absent; the
+-- near-anti-parallel id 3 sorts after id 1.
+SELECT id FROM tqivf_zero ORDER BY v <=> '[1,1,0,0]' LIMIT 5;  -- expect 1, 3
+DROP TABLE tqivf_zero;
+
 -- Insert after build, then query (tail-chain path)
 CREATE TABLE tqivf_ins (id int, v vector(4));
 INSERT INTO tqivf_ins SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_series(1, 100) g;
@@ -59,6 +74,11 @@ SET tqivf.iterative_scan = relaxed_order;
 SET tqivf.max_probes = 100;
 SELECT count(*) AS iterative_count
   FROM (SELECT id FROM tqivf_it ORDER BY v <-> '[100,0,0,0]' LIMIT 10) q;
+-- Consume the scan to exhaustion (no LIMIT): with probes=1 each batch covers
+-- one list, so this walks all 100 batches and exercises the per-batch result
+-- release in TqivfLoadBatch.
+SELECT count(*) AS full_iterative_count
+  FROM (SELECT id FROM tqivf_it ORDER BY v <-> '[100,0,0,0]') q;
 RESET tqivf.iterative_scan;
 RESET tqivf.max_probes;
 RESET tqivf.probes;

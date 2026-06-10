@@ -188,6 +188,24 @@ TqL2NormalizeFloat(float *v, int dim)
 }
 
 /* ----------------------------------------------------------------
+ * TqCheckNorm
+ *
+ * Check if non-zero norm.  Mirrors HnswCheckNorm / IvfflatCheckNorm: cosine
+ * distance is undefined for zero vectors (the operator returns NaN), so
+ * build/insert skip tuples that fail this check under the cosine metric.
+ * ---------------------------------------------------------------- */
+bool
+TqCheckNorm(const float *v, int dim)
+{
+	double		norm = 0;
+
+	for (int i = 0; i < dim; i++)
+		norm += (double) v[i] * (double) v[i];
+
+	return norm > 0;
+}
+
+/* ----------------------------------------------------------------
  * M1.3: TqBuildCodebook
  *
  * Grid-based Lloyd-Max quantizer for the marginal coordinate density
