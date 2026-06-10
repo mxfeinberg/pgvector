@@ -428,7 +428,10 @@ TqhnswLoadModel(Relation index, MemoryContext ctx)
 
 	MemoryContextSwitchTo(oldCtx);
 
-	/* Read the rotation side page back (dense mode only; absent in fast mode). */
+	/*
+	 * Read the rotation side page back (dense mode only; absent in fast
+	 * mode).
+	 */
 	if (!fastRotation)
 	{
 		if (!BlockNumberIsValid(rotationStart))
@@ -650,9 +653,9 @@ tqhnsw_test_graph(PG_FUNCTION_ARGS)
 
 	/*
 	 * Count element tuples across all blocks (skip the meta page at block 0).
-	 * Codebook/rotation side pages share the page id, so additionally require the
-	 * item length to equal an element tuple's size to avoid miscounting raw
-	 * side-page chunks.
+	 * Codebook/rotation side pages share the page id, so additionally require
+	 * the item length to equal an element tuple's size to avoid miscounting
+	 * raw side-page chunks.
 	 */
 	nblocks = RelationGetNumberOfBlocks(index);
 	for (blkno = 1; blkno < nblocks; blkno++)
@@ -697,7 +700,7 @@ tqhnsw_test_graph(PG_FUNCTION_ARGS)
 		page = BufferGetPage(buf);
 		{
 			TqhnswElementTuple etup =
-				(TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, entryOffno));
+			(TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, entryOffno));
 
 			elevel = etup->level;
 			neighbortid = etup->neighbortid;
@@ -712,7 +715,7 @@ tqhnsw_test_graph(PG_FUNCTION_ARGS)
 		page = BufferGetPage(buf);
 		{
 			TqhnswNeighborTuple ntup =
-				(TqhnswNeighborTuple) PageGetItem(page, PageGetItemId(page, nbrOffno));
+			(TqhnswNeighborTuple) PageGetItem(page, PageGetItemId(page, nbrOffno));
 			int			start = (elevel - 0) * m;	/* level-0 slice start */
 			int			lm = TqhnswGetLayerM(m, 0);
 			int			i;

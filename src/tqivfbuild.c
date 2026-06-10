@@ -12,7 +12,7 @@
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
-#include "optimizer/optimizer.h"		/* plan_create_index_workers */
+#include "optimizer/optimizer.h"	/* plan_create_index_workers */
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
@@ -37,7 +37,7 @@
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xB000000000000005)
 
 /*
- * Per-list streaming cursor for emitting one list's TurboQuant v4 block stream.
+ * Per-list streaming cursor for emitting one list's TurboQuant block stream.
  *
  * tqflat keeps a single global code/side cursor in its TqBuildState; tqivf
  * needs one cursor per list (lists are written contiguously, one at a time, so
@@ -67,7 +67,7 @@ typedef struct TqivfListCursor
 	int			slot;			/* next free lane 0..TQ_BLOCK_WIDTH-1 */
 	uint32		blockCount;
 	uint32		nvectors;
-}			TqivfListCursor;
+} TqivfListCursor;
 
 /*
  * Shared state for a parallel tqivf build (mirror IvfflatShared).  Lives in the
@@ -91,7 +91,7 @@ typedef struct TqivfShared
 	int			nparticipantsdone;
 	double		reltuples;
 	double		indtuples;
-}			TqivfShared;
+} TqivfShared;
 
 #define ParallelTableScanFromTqivfShared(shared) \
 	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(TqivfShared)))
@@ -101,7 +101,7 @@ typedef struct TqivfSpool
 	Relation	heap;
 	Relation	index;
 	Tuplesortstate *sortstate;
-}			TqivfSpool;
+} TqivfSpool;
 
 typedef struct TqivfLeader
 {
@@ -112,7 +112,7 @@ typedef struct TqivfLeader
 	Snapshot	snapshot;
 	char	   *tqivfcenters;
 	char	   *tqivfmodel;
-}			TqivfLeader;
+} TqivfLeader;
 
 typedef struct TqivfBuildState
 {
@@ -130,7 +130,7 @@ typedef struct TqivfBuildState
 	int			dimPadded;
 	int			dimCodes;		/* dim, or next_pow2(dim) in fast mode */
 	TqModel		model;
-	const TqTypeInfo *typeInfo;	/* tqivf type-info vtable (extractor + metric) */
+	const TqTypeInfo *typeInfo; /* tqivf type-info vtable (extractor + metric) */
 	float	   *vecScratch;		/* dim floats, reused per tuple at encode */
 
 	/* Clustering (full-precision, un-rotated centers) */
@@ -157,7 +157,7 @@ typedef struct TqivfBuildState
 	TqivfLeader *tqivfleader;
 
 	MemoryContext tmpCtx;
-}			TqivfBuildState;
+} TqivfBuildState;
 
 /*
  * Append raw bytes to a list's streaming code-plane chain (replicated from
@@ -165,7 +165,7 @@ typedef struct TqivfBuildState
  * chunking logic byte-identical so the reassembled stream matches tqflat's.
  */
 static void
-TqIvfCodeAppend(Relation index, ForkNumber forkNum, TqivfListCursor * cur,
+TqIvfCodeAppend(Relation index, ForkNumber forkNum, TqivfListCursor *cur,
 				const char *bytes, Size nbytes)
 {
 	Size		offset = 0;
@@ -217,7 +217,7 @@ TqIvfCodeAppend(Relation index, ForkNumber forkNum, TqivfListCursor * cur,
  * TqAppendSideRec, operating on the per-list cursor).
  */
 static void
-TqIvfAppendSideRec(Relation index, ForkNumber forkNum, TqivfListCursor * cur,
+TqIvfAppendSideRec(Relation index, ForkNumber forkNum, TqivfListCursor *cur,
 				   const TqBlockSideRec *rec)
 {
 	OffsetNumber offno;
@@ -246,7 +246,7 @@ TqIvfAppendSideRec(Relation index, ForkNumber forkNum, TqivfListCursor * cur,
  * tqbuild.c's TqFlushBlock).
  */
 static void
-TqIvfFlushBlock(TqivfBuildState * buildstate, TqivfListCursor * cur)
+TqIvfFlushBlock(TqivfBuildState *buildstate, TqivfListCursor *cur)
 {
 	int			dc = buildstate->dimCodes;
 
@@ -280,7 +280,7 @@ typedef struct TqivfModelHeader
 	int			dimCodes;
 	uint64		rotSeed;
 	uint64		qjlSeed;
-}			TqivfModelHeader;
+} TqivfModelHeader;
 
 /* Size of the serialized model for the given model. */
 static Size
@@ -322,7 +322,7 @@ TqivfSerializeModel(const TqModel *model, char *buf)
 /*
  * Reconstruct a TqModel from a serialized buffer into model-> fields, palloc'ing
  * boundaries/centroids/rotation in the current memory context.  Sets tqProd off
- * and qjl NULL (tqivf v4 layout).
+ * and qjl NULL (tqivf blocked layout).
  */
 static void
 TqivfDeserializeModel(const char *buf, TqModel *model)
@@ -379,7 +379,7 @@ ParallelEstimateShared(Relation heap, Snapshot snapshot)
  * collect the tuple counts.  Mirrors ivfbuild.c's ParallelHeapScan.
  */
 static double
-ParallelHeapScan(TqivfBuildState * buildstate)
+ParallelHeapScan(TqivfBuildState *buildstate)
 {
 	TqivfShared *tqivfshared = buildstate->tqivfleader->tqivfshared;
 	int			nparticipanttuplesorts;
@@ -413,7 +413,7 @@ ParallelHeapScan(TqivfBuildState * buildstate)
  * model rebuild happen here), then runs the shared TqivfBuildCallback.
  */
 static void
-TqivfParallelScanAndSort(TqivfSpool * spool, TqivfShared * tqivfshared,
+TqivfParallelScanAndSort(TqivfSpool *spool, TqivfShared *tqivfshared,
 						 Sharedsort *sharedsort, char *tqivfcenters,
 						 char *tqivfmodel, int sortmem, bool progress)
 {
@@ -538,7 +538,7 @@ TqivfParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 
 /* Leader runs one participant's share of the scan + sort. */
 static void
-TqivfLeaderParticipateAsWorker(TqivfBuildState * buildstate)
+TqivfLeaderParticipateAsWorker(TqivfBuildState *buildstate)
 {
 	TqivfLeader *leader = buildstate->tqivfleader;
 	TqivfSpool *leaderworker;
@@ -555,7 +555,7 @@ TqivfLeaderParticipateAsWorker(TqivfBuildState * buildstate)
 
 /* Tear down the parallel context. */
 static void
-TqivfEndParallel(TqivfLeader * leader)
+TqivfEndParallel(TqivfLeader *leader)
 {
 	WaitForParallelWorkersToFinish(leader->pcxt);
 	if (IsMVCCSnapshot(leader->snapshot))
@@ -570,7 +570,7 @@ TqivfEndParallel(TqivfLeader * leader)
  * Leaves buildstate->tqivfleader NULL if no workers could be launched.
  */
 static void
-TqivfBeginParallel(TqivfBuildState * buildstate, bool isconcurrent, int request)
+TqivfBeginParallel(TqivfBuildState *buildstate, bool isconcurrent, int request)
 {
 	ParallelContext *pcxt;
 	int			scantuplesortstates;
@@ -709,11 +709,11 @@ TqivfBeginParallel(TqivfBuildState * buildstate, bool isconcurrent, int request)
  * data-OBLIVIOUS, list-independent model: ONE rotation + ONE codebook shared by
  * every list.  Replicated from tqbuild.c's TqBuildModelAndSidePages (the model
  * fields it writes into TqBuildState live in TqivfBuildState here, and it uses
- * the now-exported TqWriteBytes).  tqProd / QJL are unsupported in the v4
+ * the now-exported TqWriteBytes).  tqProd / QJL are unsupported in the blocked
  * blocked layout, so the QJL branch is omitted.
  */
 static void
-TqivfBuildModelAndSidePages(TqivfBuildState * buildstate, BlockNumber *rotStart,
+TqivfBuildModelAndSidePages(TqivfBuildState *buildstate, BlockNumber *rotStart,
 							BlockNumber *cbStart)
 {
 	int			dim = buildstate->dim;
@@ -774,11 +774,11 @@ TqivfBuildModelAndSidePages(TqivfBuildState * buildstate, BlockNumber *rotStart,
  * TqInitBuildState (model params) + InitBuildState (clustering params).
  */
 static void
-TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
+TqivfInitBuildState(TqivfBuildState *buildstate, Relation heap, Relation index,
 					IndexInfo *indexInfo, ForkNumber forkNum)
 {
 	TqivfOptions *opts = (TqivfOptions *) index->rd_options;
-	const		IvfflatTypeInfo *typeInfo;
+	const IvfflatTypeInfo *typeInfo;
 
 	buildstate->heap = heap;
 	buildstate->index = index;
@@ -805,7 +805,7 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("tqivf index requires at least 3 dimensions")));
 
-	/* Options.  bits is FIXED at 4 (the v4 blocked layout). */
+	/* Options.  bits is FIXED at 4 (the blocked layout). */
 	buildstate->bits = 4;
 	buildstate->fastRotation = opts ? opts->fastRotation : TQ_DEFAULT_FAST_ROTATION;
 	buildstate->lists = opts ? opts->lists : TQIVF_DEFAULT_LISTS;
@@ -823,7 +823,8 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 
 	/*
 	 * vecScratch lives in this (parent) context, NOT tmpCtx, so it persists
-	 * and is reused across all build-callback tuples (tmpCtx is reset per tuple).
+	 * and is reused across all build-callback tuples (tmpCtx is reset per
+	 * tuple).
 	 */
 	buildstate->vecScratch = palloc(sizeof(float) * buildstate->dim);
 
@@ -833,20 +834,21 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 	buildstate->collation = index->rd_indcollation[0];
 
 	/*
-	 * Clustering typeInfo from the opclass: the vector opclasses omit FUNCTION
-	 * slot 5 so IvfflatGetTypeInfo() returns the default Vector typeInfo, while
-	 * the halfvec opclasses register slot 5 (ivfflat_halfvec_support) so
-	 * sampling / k-means / centroid storage run natively on halfvec.  Centers
-	 * are sized to `lists` via typeInfo->itemSize; IvfflatKmeans reads k from
-	 * centers->maxlen / centers->length and never touches reloptions.
+	 * Clustering typeInfo from the opclass: the vector opclasses omit
+	 * FUNCTION slot 5 so IvfflatGetTypeInfo() returns the default Vector
+	 * typeInfo, while the halfvec opclasses register slot 5
+	 * (ivfflat_halfvec_support) so sampling / k-means / centroid storage run
+	 * natively on halfvec.  Centers are sized to `lists` via
+	 * typeInfo->itemSize; IvfflatKmeans reads k from centers->maxlen /
+	 * centers->length and never touches reloptions.
 	 */
 	typeInfo = IvfflatGetTypeInfo(index);
 
 	/*
 	 * Each list-directory record stores the full-precision centroid inline in
-	 * a single page item; validate that up front rather than failing mid-build
-	 * with a generic "failed to add tqivf list item" (ivfflat avoids this with
-	 * its fixed IVFFLAT_MAX_DIM cap).
+	 * a single page item; validate that up front rather than failing
+	 * mid-build with a generic "failed to add tqivf list item" (ivfflat
+	 * avoids this with its fixed IVFFLAT_MAX_DIM cap).
 	 */
 	if (MAXALIGN(offsetof(TqivfListData, center) + typeInfo->itemSize(buildstate->dim)) >
 		TqPageCapacity() - sizeof(ItemIdData))
@@ -861,10 +863,11 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 
 	/*
 	 * Sort tuple descriptor: (list int4, entry bytea) keyed by list.  The
-	 * callback encodes each vector into a row-major TqEntry and carries it as a
-	 * bytea payload; TqivfEmitLists unwraps it and packs blocks (no encode).
-	 * The 4-bit codes are far smaller than the source float vector, so the sort
-	 * volume is much smaller than ivfflat's (which sorts the raw vectors).
+	 * callback encodes each vector into a row-major TqEntry and carries it as
+	 * a bytea payload; TqivfEmitLists unwraps it and packs blocks (no
+	 * encode). The 4-bit codes are far smaller than the source float vector,
+	 * so the sort volume is much smaller than ivfflat's (which sorts the raw
+	 * vectors).
 	 */
 	buildstate->tupdesc = RelationGetDescr(index);
 	buildstate->sortdesc = CreateTemplateTupleDesc(2);
@@ -884,7 +887,7 @@ TqivfInitBuildState(TqivfBuildState * buildstate, Relation heap, Relation index,
 }
 
 static void
-TqivfFreeBuildState(TqivfBuildState * buildstate)
+TqivfFreeBuildState(TqivfBuildState *buildstate)
 {
 	VectorArrayFree(buildstate->centers);
 	pfree(buildstate->listInfo);
@@ -897,10 +900,10 @@ TqivfFreeBuildState(TqivfBuildState * buildstate)
  * IvfflatBuildState (only the fields those routines read are set).
  */
 static void
-TqivfComputeCenters(TqivfBuildState * buildstate)
+TqivfComputeCenters(TqivfBuildState *buildstate)
 {
 	IvfflatBuildState ivfstate;
-	const		IvfflatTypeInfo *typeInfo = IvfflatGetTypeInfo(buildstate->index);
+	const IvfflatTypeInfo *typeInfo = IvfflatGetTypeInfo(buildstate->index);
 	int			numSamples;
 
 	MemSet(&ivfstate, 0, sizeof(ivfstate));
@@ -922,7 +925,10 @@ TqivfComputeCenters(TqivfBuildState * buildstate)
 											"Tqivf kmeans sample context",
 											ALLOCSET_DEFAULT_SIZES);
 
-	/* Target 50 samples per list, with at least 10000 samples (mirror ivfflat) */
+	/*
+	 * Target 50 samples per list, with at least 10000 samples (mirror
+	 * ivfflat)
+	 */
 	numSamples = buildstate->lists * 50;
 	if (numSamples < 10000)
 		numSamples = 10000;
@@ -954,7 +960,7 @@ TqivfComputeCenters(TqivfBuildState * buildstate)
  * itemSize (offsetof(center) + itemSize(dim)).
  */
 static BlockNumber
-TqivfCreateListPages(TqivfBuildState * buildstate)
+TqivfCreateListPages(TqivfBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
@@ -962,7 +968,7 @@ TqivfCreateListPages(TqivfBuildState * buildstate)
 	Page		page;
 	GenericXLogState *state;
 	BlockNumber listStart;
-	const		IvfflatTypeInfo *ivfTypeInfo = IvfflatGetTypeInfo(buildstate->index);
+	const IvfflatTypeInfo *ivfTypeInfo = IvfflatGetTypeInfo(buildstate->index);
 	Size		listSize = MAXALIGN(offsetof(TqivfListData, center) +
 									ivfTypeInfo->itemSize(buildstate->dim));
 	TqivfList	list = palloc0(listSize);
@@ -1057,7 +1063,7 @@ TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
 														buildstate->vecScratch,
 														buildstate->dim);
 		Size		entrySize = TqEntrySize(buildstate->model.dimCodes,
-										   buildstate->model.bits, false);
+											buildstate->model.bits, false);
 		Size		byteaSize = VARHDRSZ + entrySize;
 		bytea	   *payload = (bytea *) palloc0(byteaSize);
 		TqEntry    *entry = (TqEntry *) VARDATA(payload);
@@ -1088,7 +1094,7 @@ TqivfBuildCallback(Relation index, ItemPointer tid, Datum *values,
  * directory record.  Replicates tqflat's per-block flush over a per-list cursor.
  */
 static void
-TqivfEmitLists(TqivfBuildState * buildstate)
+TqivfEmitLists(TqivfBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
@@ -1103,7 +1109,10 @@ TqivfEmitLists(TqivfBuildState * buildstate)
 
 	cur.codeStage = palloc0(TQ_BLOCK_CODE_BYTES(dc));
 
-	/* Aligned scratch entry for reading sorted bytea payloads (see memcpy below). */
+	/*
+	 * Aligned scratch entry for reading sorted bytea payloads (see memcpy
+	 * below).
+	 */
 	rdEntrySize = TqEntrySize(buildstate->model.dimCodes, buildstate->model.bits, false);
 	rdEntry = palloc(rdEntrySize);
 
@@ -1139,10 +1148,11 @@ TqivfEmitLists(TqivfBuildState * buildstate)
 			int			lane;
 
 			/*
-			 * Copy into an aligned scratch entry first: the tuplesort may return
-			 * the bytea with a 1-byte short varlena header, so VARDATA_ANY can
-			 * point at an unaligned address -- dereferencing the float/tid fields
-			 * in place would be unaligned access (UB on strict-alignment targets).
+			 * Copy into an aligned scratch entry first: the tuplesort may
+			 * return the bytea with a 1-byte short varlena header, so
+			 * VARDATA_ANY can point at an unaligned address -- dereferencing
+			 * the float/tid fields in place would be unaligned access (UB on
+			 * strict-alignment targets).
 			 */
 			memcpy(rdEntry, VARDATA_ANY(payload), rdEntrySize);
 
@@ -1208,7 +1218,7 @@ TqivfEmitLists(TqivfBuildState * buildstate)
  * nVectors are back-patched after the side pages and lists are written.
  */
 static void
-TqivfCreateMetaPage(TqivfBuildState * buildstate)
+TqivfCreateMetaPage(TqivfBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	Buffer		buf;
@@ -1249,7 +1259,7 @@ TqivfCreateMetaPage(TqivfBuildState * buildstate)
  * pages are written.
  */
 static void
-TqivfUpdateMeta(TqivfBuildState * buildstate, BlockNumber listStart,
+TqivfUpdateMeta(TqivfBuildState *buildstate, BlockNumber listStart,
 				BlockNumber codebookStart, BlockNumber rotationStart,
 				uint32 nVectors)
 {
@@ -1271,8 +1281,8 @@ TqivfUpdateMeta(TqivfBuildState * buildstate, BlockNumber listStart,
 	metap->nVectors = nVectors;
 
 	/*
-	 * dimPadded is only known after TqivfBuildModelAndSidePages runs, which is
-	 * after the meta page is first written; back-patch it here.
+	 * dimPadded is only known after TqivfBuildModelAndSidePages runs, which
+	 * is after the meta page is first written; back-patch it here.
 	 */
 	metap->dimPadded = (uint16) buildstate->dimPadded;
 
@@ -1284,7 +1294,7 @@ TqivfUpdateMeta(TqivfBuildState * buildstate, BlockNumber listStart,
  */
 static void
 TqivfBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
-				TqivfBuildState * buildstate, ForkNumber forkNum)
+				TqivfBuildState *buildstate, ForkNumber forkNum)
 {
 	BlockNumber rotStart;
 	BlockNumber cbStart;
@@ -1308,8 +1318,8 @@ TqivfBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	/*
 	 * Assign + sort by list id, in parallel when the planner grants workers.
-	 * The leader computes the model + centers serially (above); workers receive
-	 * both via shared memory and encode + assign in parallel.
+	 * The leader computes the model + centers serially (above); workers
+	 * receive both via shared memory and encode + assign in parallel.
 	 */
 	{
 		int			parallel_workers = 0;
@@ -1317,8 +1327,8 @@ TqivfBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 		/*
 		 * Only plan workers for a non-empty, multi-list build: a single list
-		 * has no per-list parallelism to gain (the leader still emits serially),
-		 * and tqivfbuildempty (heap == NULL) is always serial.
+		 * has no per-list parallelism to gain (the leader still emits
+		 * serially), and tqivfbuildempty (heap == NULL) is always serial.
 		 */
 		if (heap != NULL && buildstate->lists > 1)
 			parallel_workers = plan_create_index_workers(RelationGetRelid(heap),
@@ -1476,7 +1486,7 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	normprocinfo = IvfflatOptionalProcInfo(index, TQIVF_NORM_PROC);
 	if (normprocinfo != NULL)
 	{
-		const		IvfflatTypeInfo *typeInfo = IvfflatGetTypeInfo(index);
+		const IvfflatTypeInfo *typeInfo = IvfflatGetTypeInfo(index);
 
 		collation = index->rd_indcollation[0];
 
@@ -1494,8 +1504,8 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	 * Find the nearest list: walk the list-directory chain and compute the
 	 * exact FUNCTION 1 distance from the vector to each centroid.  Record the
 	 * directory location (blkno/offno) and the tail-chain pointers of the
-	 * best list.  Mirrors ivfinsert's FindInsertPage but reading TqivfListData
-	 * instead of IvfflatListData.
+	 * best list.  Mirrors ivfinsert's FindInsertPage but reading
+	 * TqivfListData instead of IvfflatListData.
 	 */
 	{
 		double		minDistance = DBL_MAX;
@@ -1559,9 +1569,9 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 	/*
 	 * Encode: allocate a row-major TqEntry (same format TqScoreEntry reads in
-	 * the tail scan path).  bits is fixed at 4 and tqProd is off in the tqivf v4
-	 * layout; take them from the model so the size tracks the model if that ever
-	 * changes.
+	 * the tail scan path).  bits is fixed at 4 and tqProd is off in the tqivf
+	 * blocked layout; take them from the model so the size tracks the model
+	 * if that ever changes.
 	 */
 	ti = TqGetTypeInfo(index, TQIVF_TYPE_INFO_PROC);
 	vecScratch = palloc(sizeof(float) * model->dim);
@@ -1576,21 +1586,20 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	/*
 	 * ---- Append to the list's tail chain ----
 	 *
-	 * Two cases:
-	 *   A. No tail chain yet (tailStart == Invalid): allocate the first page,
-	 *      add the entry, then under the directory lock set tailStart (if it is
-	 *      still Invalid — another session may have won the race) and update
-	 *      tailInsertPage.  If we lose the race, the just-allocated page becomes
-	 *      a stranded page (reclaimed at REINDEX), and we fall through to Case B
-	 *      to insert our entry into the winner's chain so no row is lost.
-	 *   B. Tail chain exists: go to tailInsertPage; if there is room, add and
-	 *      we are done; if full, walk/extend the chain (mirrors tqinsert's
-	 *      append_entry loop), then update tailInsertPage in the directory.
+	 * Two cases: A. No tail chain yet (tailStart == Invalid): allocate the
+	 * first page, add the entry, then under the directory lock set tailStart
+	 * (if it is still Invalid — another session may have won the race) and
+	 * update tailInsertPage.  If we lose the race, the just-allocated page
+	 * becomes a stranded page (reclaimed at REINDEX), and we fall through to
+	 * Case B to insert our entry into the winner's chain so no row is lost.
+	 * B. Tail chain exists: go to tailInsertPage; if there is room, add and
+	 * we are done; if full, walk/extend the chain (mirrors tqinsert's
+	 * append_entry loop), then update tailInsertPage in the directory.
 	 *
 	 * Chain invariant: every tail page that holds an entry MUST be reachable
-	 * from the directory's tailStart by following nextblkno.  tailInsertPage is
-	 * only a hint (the scan never uses it directly) and may be stale — it just
-	 * saves walking the whole chain on the next insert.
+	 * from the directory's tailStart by following nextblkno.  tailInsertPage
+	 * is only a hint (the scan never uses it directly) and may be stale —
+	 * it just saves walking the whole chain on the next insert.
 	 *
 	 * We track whether tailInsertPage actually changed so we only write the
 	 * directory record when needed.
@@ -1604,8 +1613,8 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			/*
 			 * Case A: first insert into this list's tail chain.
 			 *
-			 * Allocate and populate a new page before taking the directory lock
-			 * (mirrors tqinsert's first-insert path).
+			 * Allocate and populate a new page before taking the directory
+			 * lock (mirrors tqinsert's first-insert path).
 			 */
 			Buffer		newbuf;
 			Page		newpage;
@@ -1636,9 +1645,9 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			UnlockReleaseBuffer(newbuf);
 
 			/*
-			 * Now take the directory lock and try to claim tailStart.  Another
-			 * session may have won the race and already set tailStart while we
-			 * were allocating and writing newblk.
+			 * Now take the directory lock and try to claim tailStart.
+			 * Another session may have won the race and already set tailStart
+			 * while we were allocating and writing newblk.
 			 */
 			{
 				Buffer		dbuf;
@@ -1662,9 +1671,9 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 					 * newblk page is committed but not linked into the chain —
 					 * it becomes a stranded page (reclaimed at REINDEX), the
 					 * same trade-off as tqinsert / ivfinsert.  Abort our
-					 * directory xlog, capture the winner's tailInsertPage, and
-					 * fall through to Case B so our entry is inserted into the
-					 * winner's chain and is not lost.
+					 * directory xlog, capture the winner's tailInsertPage,
+					 * and fall through to Case B so our entry is inserted
+					 * into the winner's chain and is not lost.
 					 */
 					newTailInsertPage = dirlist->tailInsertPage;
 					GenericXLogAbort(dstate);
@@ -1733,8 +1742,8 @@ append_to_existing_chain:
 					/*
 					 * Concurrent inserter already extended; follow the link
 					 * rather than overwriting it (mirrors tqinsert).  Both
-					 * pages remain linked via nextblkno and are reachable from
-					 * tailStart, preserving the chain invariant.
+					 * pages remain linked via nextblkno and are reachable
+					 * from tailStart, preserving the chain invariant.
 					 */
 					GenericXLogAbort(state);
 					UnlockReleaseBuffer(buf);
@@ -1799,10 +1808,10 @@ append_to_existing_chain:
 
 		/*
 		 * Update the list directory record if tailInsertPage changed (i.e. we
-		 * extended the chain).  tailStart is already valid at this point (Case B
-		 * only runs when a chain exists), so we never overwrite it.  This is a
-		 * separate GenericXLog after all data-page locks have been released
-		 * (mirrors IvfflatUpdateList's lock ordering).
+		 * extended the chain).  tailStart is already valid at this point
+		 * (Case B only runs when a chain exists), so we never overwrite it.
+		 * This is a separate GenericXLog after all data-page locks have been
+		 * released (mirrors IvfflatUpdateList's lock ordering).
 		 */
 		if (dirtyDir)
 		{
@@ -1821,8 +1830,8 @@ append_to_existing_chain:
 
 			/*
 			 * tailStart is guaranteed valid here (Case B path).  Only update
-			 * tailInsertPage — it is a hint and may be stale, but must point
-			 * to a page that is reachable from tailStart via nextblkno.
+			 * tailInsertPage — it is a hint and may be stale, but must
+			 * point to a page that is reachable from tailStart via nextblkno.
 			 */
 			Assert(BlockNumberIsValid(dirlist->tailStart));
 			dirlist->tailInsertPage = newTailInsertPage;

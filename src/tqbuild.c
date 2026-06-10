@@ -55,8 +55,9 @@ typedef struct TqBuildState
 
 	MemoryContext tmpCtx;
 
-	/* Blocked build staging (v4 format) */
-	uint8	   *codeStage;		/* TQ_BLOCK_CODE_BYTES(dimCodes), reused per block */
+	/* Blocked build staging */
+	uint8	   *codeStage;		/* TQ_BLOCK_CODE_BYTES(dimCodes), reused per
+								 * block */
 	TqBlockSideRec sideStage;	/* staged side record for the current block */
 	int			slot;			/* next free lane 0..TQ_BLOCK_WIDTH-1 */
 	uint32		blockCount;		/* blocks flushed */
@@ -65,22 +66,24 @@ typedef struct TqBuildState
 	 * Streaming code-plane chain cursor.  Each block's code-plane is appended
 	 * straight to this page chain as it flushes, rather than accumulated in a
 	 * single in-memory buffer: a StringInfo caps at MaxAllocSize (~1 GB) and
-	 * would error out a large build (~2M rows at dim=768) well before the meta
-	 * page's 2^32 nVectors limit.  The reassembled byte stream is independent
-	 * of how blocks are split across page items (TqReadBytes concatenates item
-	 * contents in chain order), so this is on-disk-identical to a one-shot
-	 * write of the whole stream.
+	 * would error out a large build (~2M rows at dim=768) well before the
+	 * meta page's 2^32 nVectors limit.  The reassembled byte stream is
+	 * independent of how blocks are split across page items (TqReadBytes
+	 * concatenates item contents in chain order), so this is
+	 * on-disk-identical to a one-shot write of the whole stream.
 	 */
-	BlockNumber codeStart;		/* first code-chain block (set on first append) */
+	BlockNumber codeStart;		/* first code-chain block (set on first
+								 * append) */
 	Buffer		codeBuf;		/* code-chain page cursor */
 	Page		codePage;
 	GenericXLogState *codeState;
 
-	BlockNumber sideStart;		/* first side-chain block (set on first append) */
+	BlockNumber sideStart;		/* first side-chain block (set on first
+								 * append) */
 	Buffer		sideBuf;		/* side-chain page cursor */
 	Page		sidePage;
 	GenericXLogState *sideState;
-}			TqBuildState;
+} TqBuildState;
 
 /*
  * Get a new buffer with an exclusive lock (mirrors IvfflatNewBuffer).
@@ -176,7 +179,7 @@ TqPageCapacity(void)
  * after the side pages are written via TqUpdateMeta.
  */
 static void
-TqCreateMetaPage(TqBuildState * buildstate)
+TqCreateMetaPage(TqBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	Buffer		buf;
@@ -283,7 +286,7 @@ TqWriteBytes(Relation index, ForkNumber forkNum, const char *bytes, Size nbytes,
  * full concatenation, regardless of item boundaries.
  */
 static void
-TqCodeAppend(TqBuildState * buildstate, const char *bytes, Size nbytes)
+TqCodeAppend(TqBuildState *buildstate, const char *bytes, Size nbytes)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
@@ -419,7 +422,7 @@ TqUpdateMeta(Relation index, ForkNumber forkNum, BlockNumber rotationStart,
  * Records the rotation and codebook start blocks in rotStart and cbStart.
  */
 static void
-TqBuildModelAndSidePages(TqBuildState * buildstate, BlockNumber *rotStart,
+TqBuildModelAndSidePages(TqBuildState *buildstate, BlockNumber *rotStart,
 						 BlockNumber *cbStart, BlockNumber *qjlStart, float *qjlScale)
 {
 	int			dim = buildstate->dim;
@@ -488,14 +491,14 @@ TqBuildModelAndSidePages(TqBuildState * buildstate, BlockNumber *rotStart,
 	pfree(cbBuf);
 
 	/*
-	 * QJL matrix + estimator scale (tqProd only).  The sign estimator
-	 *   <q,r> ~= qjlScale * ||r|| * <S q, sign(S r)>
-	 * is unbiased for a DENSE Gaussian sketch S iff qjlScale = sqrt(pi/2)/dimPadded
-	 * (dimPadded == dimCodes here; derived from E[X sign(Y)] = sqrt(2/pi)
-	 * Cov(X,Y)/sqrt(Var(Y)) for jointly Gaussian (X,Y), summed over dimPadded
-	 * QJL coordinates).  Matches turboquant TurboQuantProd.qjl_scale.  NOTE: in
-	 * fast mode the structured RHT sketch is not i.i.d. Gaussian, so this estimate
-	 * is biased (see the note in TqEncode); tq_prod defaults off accordingly.
+	 * QJL matrix + estimator scale (tqProd only).  The sign estimator <q,r>
+	 * ~= qjlScale * ||r|| * <S q, sign(S r)> is unbiased for a DENSE Gaussian
+	 * sketch S iff qjlScale = sqrt(pi/2)/dimPadded (dimPadded == dimCodes
+	 * here; derived from E[X sign(Y)] = sqrt(2/pi) Cov(X,Y)/sqrt(Var(Y)) for
+	 * jointly Gaussian (X,Y), summed over dimPadded QJL coordinates).
+	 * Matches turboquant TurboQuantProd.qjl_scale.  NOTE: in fast mode the
+	 * structured RHT sketch is not i.i.d. Gaussian, so this estimate is
+	 * biased (see the note in TqEncode); tq_prod defaults off accordingly.
 	 */
 	if (buildstate->tqProd)
 	{
@@ -523,30 +526,12 @@ TqBuildModelAndSidePages(TqBuildState * buildstate, BlockNumber *rotStart,
 }
 
 /*
- * Append the current scratch entry (entrySize bytes) to the data page chain.
- */
-static void
-TqAppendEntry(TqBuildState * buildstate)
-{
-	Relation	index = buildstate->index;
-	OffsetNumber offno;
-
-	if (PageGetFreeSpace(buildstate->page) < buildstate->entrySize)
-		TqAppendPage(index, &buildstate->buf, &buildstate->page, &buildstate->state, buildstate->forkNum, TQ_PAGE_ID);
-
-	offno = PageAddItem(buildstate->page, (Item) buildstate->entry, buildstate->entrySize,
-						InvalidOffsetNumber, false, false);
-	if (offno == InvalidOffsetNumber)
-		elog(ERROR, "failed to add tqflat data item to \"%s\"", RelationGetRelationName(index));
-}
-
-/*
  * Append one TqBlockSideRec to the side-chain page cursor.  Records the first
  * block into *sideStart on the first append.  The side chain is page-addressable
  * (one PageAddItem item per block), unlike the raw code-plane byte stream.
  */
 static void
-TqAppendSideRec(TqBuildState * buildstate, BlockNumber *sideStart,
+TqAppendSideRec(TqBuildState *buildstate, BlockNumber *sideStart,
 				const TqBlockSideRec *rec)
 {
 	Relation	index = buildstate->index;
@@ -577,7 +562,7 @@ TqAppendSideRec(TqBuildState * buildstate, BlockNumber *sideStart,
  * code byte stream and its side record to the side chain.
  */
 static void
-TqFlushBlock(TqBuildState * buildstate)
+TqFlushBlock(TqBuildState *buildstate)
 {
 	int			dc = buildstate->dimCodes;
 
@@ -645,7 +630,7 @@ TqBuildCallback(Relation index, ItemPointer tid, Datum *values,
  * Initialize the build state from index relation / options.
  */
 static void
-TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
+TqInitBuildState(TqBuildState *buildstate, Relation heap, Relation index,
 				 IndexInfo *indexInfo, ForkNumber forkNum)
 {
 	TqOptions  *opts = (TqOptions *) index->rd_options;
@@ -681,8 +666,11 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("tqflat blocked layout supports only bits = 4")));
-	/* Defaults single-sourced with the reloption registration in tq.c so the
-	 * no-WITH-clause path can't drift from `WITH (...)`. */
+
+	/*
+	 * Defaults single-sourced with the reloption registration in tq.c so the
+	 * no-WITH-clause path can't drift from `WITH (...)`.
+	 */
 	buildstate->tqProd = opts ? opts->tqProd : TQ_DEFAULT_TQPROD;
 	if (buildstate->tqProd)
 		ereport(ERROR,
@@ -729,7 +717,7 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->entry = palloc0(buildstate->entrySize);
 
-	/* Blocked build staging (v4 format) */
+	/* Blocked build staging */
 	buildstate->codeStage = palloc0(TQ_BLOCK_CODE_BYTES(buildstate->dimCodes));
 	buildstate->slot = 0;
 	buildstate->blockCount = 0;
@@ -755,7 +743,7 @@ TqInitBuildState(TqBuildState * buildstate, Relation heap, Relation index,
  * Free build state resources.
  */
 static void
-TqFreeBuildState(TqBuildState * buildstate)
+TqFreeBuildState(TqBuildState *buildstate)
 {
 	MemoryContextDelete(buildstate->tmpCtx);
 }
@@ -765,7 +753,7 @@ TqFreeBuildState(TqBuildState * buildstate)
  */
 static void
 TqBuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
-			 TqBuildState * buildstate, ForkNumber forkNum)
+			 TqBuildState *buildstate, ForkNumber forkNum)
 {
 	BlockNumber rotStart;
 	BlockNumber cbStart;
@@ -979,7 +967,7 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 	/*
 	 * ---- Find the head of the row-major insert tail chain ----
 	 *
-	 * In the v4 blocked format the built rows live in the block code-plane /
+	 * In the blocked format the built rows live in the block code-plane /
 	 * side chains; freshly inserted rows go to a separate row-major "tail"
 	 * chain (metap->tailStart) that the scan reads with TqScoreEntry.  The
 	 * tail chain is created lazily on the first insert, so tailStart is
@@ -1133,7 +1121,10 @@ append_entry:
 			continue;
 		}
 
-		/* No room and no concurrent extension: allocate a new page and link it. */
+		/*
+		 * No room and no concurrent extension: allocate a new page and link
+		 * it.
+		 */
 		{
 			Buffer		newbuf;
 			Page		newpage;
@@ -1256,8 +1247,11 @@ TqLoadModel(Relation index, MemoryContext ctx)
 	codebookStart = metap->codebookStart;
 	qjlStart = metap->qjlStart;
 	qjlScale = metap->qjlScale;
-	/* v3 metas always store a positive dimPadded (= dim in dense mode); the
-	 * fallback is defensive for any zero-valued legacy/partial meta. */
+
+	/*
+	 * v3 metas always store a positive dimPadded (= dim in dense mode); the
+	 * fallback is defensive for any zero-valued legacy/partial meta.
+	 */
 	Assert(metap->dimPadded > 0);
 	dimPadded = metap->dimPadded ? (int) metap->dimPadded : dim;
 	UnlockReleaseBuffer(buf);
@@ -1295,13 +1289,16 @@ TqLoadModel(Relation index, MemoryContext ctx)
 	MemoryContextSwitchTo(oldCtx);
 
 	/*
-	 * Codebook coordinate density depends on the working dimension: the padded
-	 * dim in fast mode, else dim.
+	 * Codebook coordinate density depends on the working dimension: the
+	 * padded dim in fast mode, else dim.
 	 */
 	if (fastRotation)
 		model->qjlScale = tqProd ? (float) (sqrt(M_PI / 2.0) / (double) dimPadded) : 0.0f;
 
-	/* Read the rotation side page back (dense mode only; absent in fast mode). */
+	/*
+	 * Read the rotation side page back (dense mode only; absent in fast
+	 * mode).
+	 */
 	if (!fastRotation)
 	{
 		if (!BlockNumberIsValid(rotationStart))
@@ -1311,7 +1308,11 @@ TqLoadModel(Relation index, MemoryContext ctx)
 
 	if (!BlockNumberIsValid(codebookStart))
 		elog(ERROR, "tqflat index has no codebook");
-	/* cbBuf scratch lands in the caller's current context and is pfree'd before return. */
+
+	/*
+	 * cbBuf scratch lands in the caller's current context and is pfree'd
+	 * before return.
+	 */
 	cbBuf = palloc(cbBytes);
 	TqReadBytes(index, codebookStart, cbBuf, cbBytes);
 	memcpy(model->boundaries, cbBuf, sizeof(float) * nBnd);
@@ -1401,7 +1402,10 @@ tqflat_test_meta(PG_FUNCTION_ARGS)
 
 	TqGetMetaInfo(index, &dim, &bits, &metric, &tqProd);
 
-	/* nVectors, fastRotation, dimPadded not returned by TqGetMetaInfo; read directly */
+	/*
+	 * nVectors, fastRotation, dimPadded not returned by TqGetMetaInfo; read
+	 * directly
+	 */
 	buf = ReadBuffer(index, TQ_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -1426,69 +1430,6 @@ tqflat_test_meta(PG_FUNCTION_ARGS)
 	elems[8] = Int32GetDatum((int) blockCount);
 
 	result = construct_array(elems, 9, INT4OID, sizeof(int32), true, TYPALIGN_INT);
-
-	PG_RETURN_ARRAYTYPE_P(result);
-}
-
-/*
- * tqflat_test_qjl(regclass) RETURNS float8[]
- *
- * Test-only wrapper: loads the model via TqLoadModel and returns
- * {tqProd, qjlScale, qjl[0], frobeniusNorm} where the QJL matrix is read back
- * from its side pages.  Verifies the qjl matrix round-trips through load by
- * comparing the reloaded matrix against a freshly recomputed TqBuildQjl (the
- * 4th element is the max absolute reload-vs-recompute difference, expected 0).
- * In fast_rotation mode there is no QJL side matrix (qjl == NULL), so elements
- * 3 and 4 are 0; only call this on dense-mode indexes.
- * Prototype; drop before upstream.
- */
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_qjl);
-Datum
-tqflat_test_qjl(PG_FUNCTION_ARGS)
-{
-	Oid			indexoid = PG_GETARG_OID(0);
-	Relation	index;
-	TqModel    *model;
-	Datum		elems[4];
-	ArrayType  *result;
-	double		frob = 0.0;
-	double		maxdiff = 0.0;
-	double		first = 0.0;
-
-	index = index_open(indexoid, AccessShareLock);
-
-	model = TqLoadModel(index, CurrentMemoryContext);
-
-	if (model->tqProd && model->qjl != NULL)
-	{
-		Size		n = (Size) model->dim * model->dim;
-		Size		i;
-		float	   *fresh = palloc(sizeof(float) * n);
-
-		TqBuildQjl(model->dim, TQ_QJL_SEED, fresh);
-
-		first = (double) model->qjl[0];
-		for (i = 0; i < n; i++)
-		{
-			double		v = (double) model->qjl[i];
-			double		d = fabs(v - (double) fresh[i]);
-
-			frob += v * v;
-			if (d > maxdiff)
-				maxdiff = d;
-		}
-		frob = sqrt(frob);
-		pfree(fresh);
-	}
-
-	index_close(index, AccessShareLock);
-
-	elems[0] = Float8GetDatum(model->tqProd ? 1.0 : 0.0);
-	elems[1] = Float8GetDatum((double) model->qjlScale);
-	elems[2] = Float8GetDatum(first);
-	elems[3] = Float8GetDatum(maxdiff);
-
-	result = construct_array(elems, 4, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }

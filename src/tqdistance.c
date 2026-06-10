@@ -112,24 +112,3 @@ TqInitDispatch(void)
 		TqScoreBlockRange = TqScoreBlockRangeAvx512;
 #endif
 }
-
-/*
- * TqActiveKernelName -- name of the block-scorer variant TqInitDispatch selected
- * ("default", "neon", or "avx512").  Lets a caller positively confirm which
- * kernel is live, rather than inferring it from output-consistency alone.
- */
-const char *
-TqActiveKernelName(void)
-{
-	if (TqScoreBlockRange == TqScoreBlockRangeDefault)
-		return "default";
-#if defined(__aarch64__)
-	if (TqScoreBlockRange == TqScoreBlockRangeNeon)
-		return "neon";
-#endif
-#if defined(USE_DISPATCH) && defined(__x86_64__)
-	if (TqScoreBlockRange == TqScoreBlockRangeAvx512)
-		return "avx512";
-#endif
-	return "unknown";
-}

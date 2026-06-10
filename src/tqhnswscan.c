@@ -37,9 +37,9 @@ typedef struct TqhnswScanResult
 	ItemPointerData heaptid;
 	BlockNumber blkno;
 	OffsetNumber offno;
-}			TqhnswScanResult;
+} TqhnswScanResult;
 
-/* One scored neighbor produced by TqhnswExpandNode (block path, sub-project #5). */
+/* One scored neighbor produced by TqhnswExpandNode (block path). */
 typedef struct TqhnswNeighborScore
 {
 	double		dist;			/* value to MINIMIZE (quantized estimate) */
@@ -49,7 +49,7 @@ typedef struct TqhnswNeighborScore
 	uint8		level;
 	uint8		version;
 	ItemPointerData neighbortid;
-}			TqhnswNeighborScore;
+} TqhnswNeighborScore;
 
 /*
  * Scan state.  Combines tqscan.c's LUT/rerank fields with HNSW scan state (the
@@ -75,19 +75,24 @@ typedef struct TqhnswScanOpaqueData
 
 	/* Per-query state (rebuilt on each rescan). */
 	float	   *lut;			/* dimCodes * nLevels */
-	Datum		queryDatum;		/* native query (normalized for cosine), for rerank */
+	Datum		queryDatum;		/* native query (normalized for cosine), for
+								 * rerank */
 	bool		haveQuery;
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
-	/* 8-bit query LUT for the block kernel (built each rescan, mirrors tqivf). */
+	/*
+	 * 8-bit query LUT for the block kernel (built each rescan, mirrors
+	 * tqivf).
+	 */
 	uint8	   *lut8;			/* dimCodes * nLevels */
 	float		lutBias;
 	float		lutScale;
 
 	/* Block-expansion scratch, allocated once per rescan, reused per node. */
-	TqhnswNeighborScore *expandOut;	/* >= TQHNSW_MAX_M*2 entries */
-	char	   *expandCodes;	/* codesBytes * TQHNSW_MAX_M*2 (gathered row-major codes) */
+	TqhnswNeighborScore *expandOut; /* >= TQHNSW_MAX_M*2 entries */
+	char	   *expandCodes;	/* codesBytes * TQHNSW_MAX_M*2 (gathered
+								 * row-major codes) */
 	uint8	   *expandPlane;	/* TQ_BLOCK_CODE_BYTES(dimCodes) */
 
 	/* Results + rerank. */
@@ -102,9 +107,9 @@ typedef struct TqhnswScanOpaqueData
 	TupleTableSlot *slot;
 
 	MemoryContext tmpCtx;
-}			TqhnswScanOpaqueData;
+} TqhnswScanOpaqueData;
 
-typedef TqhnswScanOpaqueData * TqhnswScanOpaque;
+typedef TqhnswScanOpaqueData *TqhnswScanOpaque;
 
 /*
  * One traversal candidate.  Lives in both the min-heap C (nearest first) and the
@@ -121,7 +126,7 @@ typedef struct TqhnswScanCandidate
 	uint8		version;		/* element version (slot-reuse detection) */
 	ItemPointerData heaptid;
 	ItemPointerData neighbortid;	/* the candidate's neighbor-tuple location */
-}			TqhnswScanCandidate;
+} TqhnswScanCandidate;
 
 #define TqhnswGetCandidate(membername, ptr) \
 	pairingheap_container(TqhnswScanCandidate, membername, ptr)
@@ -133,7 +138,7 @@ typedef struct TqhnswVisitedKey
 {
 	BlockNumber blkno;
 	OffsetNumber offno;
-}			TqhnswVisitedKey;
+} TqhnswVisitedKey;
 
 /*
  * qsort comparator: ascending distance.  Replicated from CompareResults in
@@ -321,7 +326,10 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 				k,
 				chunk;
 
-	/* 1. Collect valid TIDs (stop at first invalid, matching the scalar loops). */
+	/*
+	 * 1. Collect valid TIDs (stop at first invalid, matching the scalar
+	 * loops).
+	 */
 	for (i = 0; i < lm; i++)
 	{
 		if (!ItemPointerIsValid(&indextids[i]))
@@ -331,7 +339,10 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 	if (nv == 0)
 		return 0;
 
-	/* 2. Sort the collected indices by block number (insertion sort; nv is small). */
+	/*
+	 * 2. Sort the collected indices by block number (insertion sort; nv is
+	 * small).
+	 */
 	for (i = 1; i < nv; i++)
 	{
 		int			key = order[i];
@@ -346,7 +357,10 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 		order[j + 1] = key;
 	}
 
-	/* 3. Page-grouped gather: one buffer SHARE lock per distinct page at a time. */
+	/*
+	 * 3. Page-grouped gather: one buffer SHARE lock per distinct page at a
+	 * time.
+	 */
 	k = 0;
 	while (k < nv)
 	{
@@ -362,7 +376,7 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 			int			orig = order[k];
 			OffsetNumber off = ItemPointerGetOffsetNumber(&indextids[orig]);
 			TqhnswElementTuple etup =
-				(TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, off));
+			(TqhnswElementTuple) PageGetItem(page, PageGetItemId(page, off));
 			TqhnswNeighborScore *o = &out[orig];
 
 			memcpy(so->expandCodes + (Size) orig * codesBytes, etup->codes, codesBytes);
@@ -379,7 +393,10 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 		UnlockReleaseBuffer(buf);
 	}
 
-	/* 4. Scatter + score in chunks of TQ_BLOCK_WIDTH; convert lane -> est -> dist. */
+	/*
+	 * 4. Scatter + score in chunks of TQ_BLOCK_WIDTH; convert lane -> est ->
+	 * dist.
+	 */
 	for (chunk = 0; chunk < nv; chunk += TQ_BLOCK_WIDTH)
 	{
 		int			n = Min(TQ_BLOCK_WIDTH, nv - chunk);
@@ -400,15 +417,17 @@ TqhnswExpandNode(TqhnswScanOpaque so, Relation index,
 		{
 			int			idx = chunk + lane;
 			double		mse = (double) so->lutScale * acc.acc32[lane]
-				+ (double) dc * so->lutBias;
+			+ (double) dc * so->lutBias;
 			float		est = (float) ((double) scales[idx] * mse);
 
 			out[idx].dist = TqhnswEstToDist(so->metric, so->qNormSq, norms[idx], est);
 		}
 	}
 
-	/* expandOut[i] corresponds to indextids[i] (original neighbor order), so the
-	 * block beam admits neighbors in the same order as the scalar path. */
+	/*
+	 * expandOut[i] corresponds to indextids[i] (original neighbor order), so
+	 * the block beam admits neighbors in the same order as the scalar path.
+	 */
 	return nv;
 }
 
@@ -472,8 +491,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 								 &curVersion);
 
 	/*
-	 * Upper-level greedy descent (lc from the entry element's level down to 1):
-	 * move to the nearest improving neighbor until none improves.
+	 * Upper-level greedy descent (lc from the entry element's level down to
+	 * 1): move to the nearest improving neighbor until none improves.
 	 */
 	for (lc = curLevel; lc >= 1; lc--)
 	{
@@ -547,10 +566,10 @@ TqhnswSearchGraph(IndexScanDesc scan)
 			}
 
 			/*
-			 * If a neighbor moved us to a HIGHER level than the current layer,
-			 * the slice math stays valid (lc <= curLevel); a lower-level
-			 * element can only be reached via slot reuse, which the
-			 * version/count check in TqhnswLoadNeighborTids rejects.
+			 * If a neighbor moved us to a HIGHER level than the current
+			 * layer, the slice math stays valid (lc <= curLevel); a
+			 * lower-level element can only be reached via slot reuse, which
+			 * the version/count check in TqhnswLoadNeighborTids rejects.
 			 */
 		}
 	}
@@ -874,7 +893,10 @@ tqhnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
 			value = DirectFunctionCall1Coll(so->typeInfo->normalize, so->collation, value);
 
-		/* Keep the native (normalized for cosine) query for native-Datum rerank. */
+		/*
+		 * Keep the native (normalized for cosine) query for native-Datum
+		 * rerank.
+		 */
 		so->queryDatum = value;
 		so->haveQuery = true;
 
@@ -960,9 +982,9 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		UnlockPage(scan->indexRelation, TQHNSW_SCAN_LOCK, ShareLock);
 
 		/*
-		 * Rerank the top candidates against full-precision heap vectors.  Rows
-		 * whose heap tuple is no longer visible get +inf and drop out (this is
-		 * how deletes are handled without graph mutation).
+		 * Rerank the top candidates against full-precision heap vectors.
+		 * Rows whose heap tuple is no longer visible get +inf and drop out
+		 * (this is how deletes are handled without graph mutation).
 		 */
 		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->haveQuery &&
 			AttributeNumberIsValid(so->heapAttno))
@@ -996,9 +1018,9 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 														 cmpDatum));
 
 					/*
-					 * Cosine: FUNCTION 1 yields -cos on normalized inputs while
-					 * the quantized estimate scale is 1 - cos; shift by 1 so
-					 * the two populations sort on the same scale.
+					 * Cosine: FUNCTION 1 yields -cos on normalized inputs
+					 * while the quantized estimate scale is 1 - cos; shift by
+					 * 1 so the two populations sort on the same scale.
 					 */
 					if (so->metric == TQ_METRIC_COSINE)
 						d += 1.0;

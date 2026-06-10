@@ -32,7 +32,7 @@ typedef struct TqScanResult
 {
 	double		dist;
 	ItemPointerData tid;
-}			TqScanResult;
+} TqScanResult;
 
 /*
  * Scan state.  Mirrors IvfflatScanOpaqueData: the loaded model, the per-query
@@ -55,10 +55,12 @@ typedef struct TqScanOpaqueData
 	/* Per-query state (rebuilt on each rescan). */
 	float	   *lut;			/* dim * nLevels */
 	uint8	   *lut8;			/* 8-bit query LUT for the block kernel */
-	float		lutBias;		/* affine recovery: mse = lutScale*sum + dc*lutBias */
+	float		lutBias;		/* affine recovery: mse = lutScale*sum +
+								 * dc*lutBias */
 	float		lutScale;
 	float	   *qjlQuery;		/* dim, or NULL when !tqProd */
-	Datum		queryDatum;		/* native query (normalized for cosine), for rerank */
+	Datum		queryDatum;		/* native query (normalized for cosine), for
+								 * rerank */
 	bool		haveQuery;
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
@@ -76,9 +78,9 @@ typedef struct TqScanOpaqueData
 	AttrNumber	heapAttno;		/* heap attribute backing the index column */
 
 	MemoryContext tmpCtx;
-}			TqScanOpaqueData;
+} TqScanOpaqueData;
 
-typedef TqScanOpaqueData * TqScanOpaque;
+typedef TqScanOpaqueData *TqScanOpaque;
 
 /*
  * qsort comparator: ascending distance.
@@ -232,7 +234,10 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
 			value = DirectFunctionCall1Coll(so->typeInfo->normalize, so->collation, value);
 
-		/* Keep the native (normalized for cosine) query for native-Datum rerank. */
+		/*
+		 * Keep the native (normalized for cosine) query for native-Datum
+		 * rerank.
+		 */
 		so->queryDatum = value;
 		so->haveQuery = true;
 
@@ -407,8 +412,9 @@ TqDoScan(IndexScanDesc scan)
 	/*
 	 * Block scan: read the whole code-plane chain into one contiguous buffer,
 	 * then walk the side chain in block order.  For each block, fold its
-	 * code-plane into the 32-lane accumulator with the SIMD kernel and recover
-	 * each live lane's estimate from the side record's per-lane scale/norm.
+	 * code-plane into the 32-lane accumulator with the SIMD kernel and
+	 * recover each live lane's estimate from the side record's per-lane
+	 * scale/norm.
 	 */
 	if (blockCount > 0 && BlockNumberIsValid(codeStart))
 	{
@@ -448,13 +454,14 @@ TqDoScan(IndexScanDesc scan)
 			{
 				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
 				const uint8 *plane = so->haveQuery ?
-					(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
+				(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
 
 				if (!so->haveQuery)
 				{
 					/*
-					 * NULL order-by key: every distance is NULL, but rows must
-					 * still be returned (mirrors ivfflat's ZeroDistance path).
+					 * NULL order-by key: every distance is NULL, but rows
+					 * must still be returned (mirrors ivfflat's ZeroDistance
+					 * path).
 					 */
 					for (int j = 0; j < srec->nvecs; j++)
 					{
@@ -552,8 +559,8 @@ TqDoScan(IndexScanDesc scan)
 
 	/*
 	 * Tail scan: rows inserted post-build live in the row-major tail chain
-	 * (Invalid until the first insert).  Score them with the scalar kernel over
-	 * the float LUT, exactly as the pre-block layout did.
+	 * (Invalid until the first insert).  Score them with the scalar kernel
+	 * over the float LUT, exactly as the pre-block layout did.
 	 */
 	if (BlockNumberIsValid(tailStart))
 	{
@@ -607,10 +614,10 @@ TqDoScan(IndexScanDesc scan)
 	 * Rerank: for the top-K candidates by estimate, fetch the original vector
 	 * and replace the estimate with the exact FUNCTION 1 distance.
 	 *
-	 * Approach (documented prototype tradeoff): rerank the top-K exactly, then
-	 * sort the whole array by distance.  Exact and estimated distances are not
-	 * perfectly comparable, but in the top-K region the exact values dominate,
-	 * which is what matters for the returned neighbors.
+	 * Approach (documented prototype tradeoff): rerank the top-K exactly,
+	 * then sort the whole array by distance.  Exact and estimated distances
+	 * are not perfectly comparable, but in the top-K region the exact values
+	 * dominate, which is what matters for the returned neighbors.
 	 */
 	if (tqflat_rerank > 0 && n > 0 && so->haveQuery &&
 		AttributeNumberIsValid(so->heapAttno))
@@ -631,8 +638,9 @@ TqDoScan(IndexScanDesc scan)
 				double		d;
 
 				/*
-				 * Cosine: normalize the heap value (type-specific) so FUNCTION 1
-				 * (-inner_product) computes -cos, matching the estimate ranking.
+				 * Cosine: normalize the heap value (type-specific) so
+				 * FUNCTION 1 (-inner_product) computes -cos, matching the
+				 * estimate ranking.
 				 */
 				if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
 					cmpDatum = DirectFunctionCall1Coll(so->typeInfo->normalize,
@@ -642,9 +650,9 @@ TqDoScan(IndexScanDesc scan)
 													 so->queryDatum, cmpDatum));
 
 				/*
-				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while the
-				 * quantized estimate scale is 1 - cos; shift by 1 so the two
-				 * populations sort on the same scale in the final qsort.
+				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while
+				 * the quantized estimate scale is 1 - cos; shift by 1 so the
+				 * two populations sort on the same scale in the final qsort.
 				 */
 				if (so->metric == TQ_METRIC_COSINE)
 					d += 1.0;

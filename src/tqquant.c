@@ -21,7 +21,7 @@ typedef struct
 {
 	uint64		s0,
 				s1;
-}			TqRng;
+} TqRng;
 
 static void
 tq_rng_init(TqRng *r, uint64 seed)
@@ -83,8 +83,9 @@ TqBuildRotation(int dim, uint64 seed, float *rotation)
 				r;
 
 	/*
-	 * O(dim²) build-time scratch (~2 GB at TQ_MAX_DIM -- past MaxAllocSize from
-	 * dim ~11586, hence the huge variant); M2 will persist to index pages.
+	 * O(dim²) build-time scratch (~2 GB at TQ_MAX_DIM -- past MaxAllocSize
+	 * from dim ~11586, hence the huge variant); M2 will persist to index
+	 * pages.
 	 */
 	a = (double *) MemoryContextAllocHuge(CurrentMemoryContext,
 										  sizeof(double) * (Size) dim * dim);
@@ -128,7 +129,10 @@ TqBuildRotation(int dim, uint64 seed, float *rotation)
 			vc[r] /= nrm;
 	}
 
-	/* Transpose into row-major output: rotation[row*dim+col] = a[col*dim+row]. */
+	/*
+	 * Transpose into row-major output: rotation[row*dim+col] =
+	 * a[col*dim+row].
+	 */
 	for (r = 0; r < dim; r++)
 		for (c = 0; c < dim; c++)
 			rotation[(Size) r * dim + c] = (float) a[(Size) c * dim + r];
@@ -340,7 +344,8 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 	double		norm;
 	float	   *u;
 	float	   *y;
-	uint8	   *codeOf = NULL;	/* per-coordinate code (kept for tqProd residual) */
+	uint8	   *codeOf = NULL;	/* per-coordinate code (kept for tqProd
+								 * residual) */
 	double		ip;
 	int			i,
 				r,
@@ -361,9 +366,9 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 		u[i] = (float) (vec[i] * inv);
 
 	/*
-	 * 3. Rotate to y (length dc).  Fast mode: structured RHT producing dimPadded
-	 * (== dc) coords from the dim-length unit vector (zero-padded internally).
-	 * Dense mode: y = R * u over dim (dc == dim).
+	 * 3. Rotate to y (length dc).  Fast mode: structured RHT producing
+	 * dimPadded (== dc) coords from the dim-length unit vector (zero-padded
+	 * internally). Dense mode: y = R * u over dim (dc == dim).
 	 */
 	y = palloc(sizeof(float) * dc);
 	if (model->fastRotation)
@@ -383,7 +388,10 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 		}
 	}
 
-	/* 4. Quantize and pack codes into entry->data; accumulate <y, yhat> for scale. */
+	/*
+	 * 4. Quantize and pack codes into entry->data; accumulate <y, yhat> for
+	 * scale.
+	 */
 	if (model->tqProd)
 		codeOf = palloc(sizeof(uint8) * dc);
 
@@ -405,12 +413,12 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 
 	/*
 	 * 6. QJL residual stage (tqProd only).  Build the rotated-space residual
-	 * ry[i] = y[i] - centroids[code_i], project the unit residual onto the QJL
-	 * matrix, and store the sign bits after the codes in entry->data.
+	 * ry[i] = y[i] - centroids[code_i], project the unit residual onto the
+	 * QJL matrix, and store the sign bits after the codes in entry->data.
 	 */
 	if (model->tqProd)
 	{
-		int			signsBytes = TQ_SIGNS_BYTES(dc);
+		Size		signsBytes = TQ_SIGNS_BYTES((Size) dc);
 		char	   *signs = entry->data + codesBytes;
 		float	   *ry = palloc(sizeof(float) * dc);
 		double		rnorm;
@@ -438,18 +446,18 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 			if (model->fastRotation)
 			{
 				/*
-				 * Structured QJL over the padded residual.  ry is already in the
-				 * padded rotated space (length dc == dimPadded), so no padding
-				 * occurs; project the UNIT residual and store sign bits.
+				 * Structured QJL over the padded residual.  ry is already in
+				 * the padded rotated space (length dc == dimPadded), so no
+				 * padding occurs; project the UNIT residual and store sign
+				 * bits.
 				 *
-				 * KNOWN LIMITATION: the QJL sign estimator + qjlScale=sqrt(pi/2)/d
-				 * assume i.i.d. Gaussian sketch rows; the orthonormal RHT here is
-				 * NOT Gaussian, so this estimate is biased (bias grows with dim:
-				 * ~20% at d=128 -- see tqflat_test_qjl_estimate fast vs dense).
-				 * Whether the QJL second stage is worth keeping in fast mode is
-				 * being decided by recall measurement (bench A/B fast tq_prod
-				 * on/off vs dense); a correct structured-QJL sketch (non-orthonormal
-				 * Hadamard/Rademacher) is the fix if it proves worthwhile.
+				 * KNOWN LIMITATION: the QJL sign estimator +
+				 * qjlScale=sqrt(pi/2)/d assume i.i.d. Gaussian sketch rows;
+				 * the orthonormal RHT here is NOT Gaussian, so this estimate
+				 * is biased (bias grows with dim: ~20% at d=128).  A
+				 * structured-QJL sketch over a non-orthonormal
+				 * Hadamard/Rademacher transform would remove the bias if the
+				 * QJL second stage proves worthwhile in fast mode.
 				 */
 				float	   *ru = palloc(sizeof(float) * dc);
 				float	   *p = palloc(sizeof(float) * dc);

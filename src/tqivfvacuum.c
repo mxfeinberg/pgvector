@@ -46,9 +46,10 @@ tqivfbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	/*
 	 * Walk the list-directory chain.  Mirror ivfvacuum: read each directory
-	 * page under a share lock, collect all list chain heads on that page, then
-	 * release the directory page before processing the per-list chains to avoid
-	 * holding the directory lock while doing potentially-blocking cleanup work.
+	 * page under a share lock, collect all list chain heads on that page,
+	 * then release the directory page before processing the per-list chains
+	 * to avoid holding the directory lock while doing potentially-blocking
+	 * cleanup work.
 	 */
 	while (BlockNumberIsValid(listBlkno))
 	{
@@ -108,9 +109,9 @@ tqivfbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 				/*
 				 * ambulkdelete cannot delete entries from pages that are
-				 * pinned by other backends.  LockBufferForCleanup waits
-				 * until no other backend holds a pin on this buffer
-				 * (mirrors ivfvacuum.c).
+				 * pinned by other backends.  LockBufferForCleanup waits until
+				 * no other backend holds a pin on this buffer (mirrors
+				 * ivfvacuum.c).
 				 */
 				LockBufferForCleanup(buf);
 
@@ -126,7 +127,10 @@ tqivfbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 					for (j = 0; j < srec->nvecs; j++)
 					{
-						/* Skip already-tombstoned lanes (avoids double-counting). */
+						/*
+						 * Skip already-tombstoned lanes (avoids
+						 * double-counting).
+						 */
 						if (srec->deletedMask & (1u << j))
 							continue;
 
@@ -192,7 +196,10 @@ tqivfbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				{
 					TqEntry    *entry = (TqEntry *) PageGetItem(page, PageGetItemId(page, offno));
 
-					/* Skip already-tombstoned entries (avoids double-counting). */
+					/*
+					 * Skip already-tombstoned entries (avoids
+					 * double-counting).
+					 */
 					if (entry->deleted)
 						continue;
 

@@ -202,6 +202,9 @@ Supported index types are:
 
 - [HNSW](#hnsw)
 - [IVFFlat](#ivfflat)
+- [TQFlat](#tqflat)
+- [TQIVF](#tqivf)
+- [TQHNSW](#tqhnsw)
 
 ## HNSW
 
@@ -420,6 +423,196 @@ The phases for IVFFlat are:
 4. `loading tuples`
 
 Note: `%` is only populated during the `loading tuples` phase
+
+## TQFlat
+
+TQFlat, TQIVF, and TQHNSW indexes store [TurboQuant](https://arxiv.org/abs/2504.19874)-quantized vectors (4 bits per dimension) instead of full-precision vectors, making them typically 3-10x smaller than the corresponding full-precision index. Queries score the quantized codes with a SIMD kernel and then rerank the best candidates with exact distances from the table, so recall stays high.
+
+A TQFlat index scans all of the quantized codes (there is no clustering or graph), so it provides near-exact recall at a fraction of the memory of a full-precision scan. It is a good fit for smaller tables or as a baseline for the other TurboQuant index types.
+
+Add an index for each distance function you want to use.
+
+L2 distance
+
+```sql
+CREATE INDEX ON items USING tqflat (embedding vector_l2_ops);
+```
+
+Note: Use `halfvec_l2_ops` for `halfvec` and `sparsevec_l2_ops` for `sparsevec` (and similar with the other distance functions)
+
+Inner product
+
+```sql
+CREATE INDEX ON items USING tqflat (embedding vector_ip_ops);
+```
+
+Cosine distance
+
+```sql
+CREATE INDEX ON items USING tqflat (embedding vector_cosine_ops);
+```
+
+Supported types are:
+
+- `vector` - up to 16,000 dimensions
+- `halfvec` - up to 16,000 dimensions
+- `sparsevec` - up to 16,000 dimensions
+
+### Index Options
+
+Specify TQFlat parameters
+
+- `fast_rotation` - use the structured randomized Hadamard rotation (`true` by default); set to `false` for a dense random rotation
+
+```sql
+CREATE INDEX ON items USING tqflat (embedding vector_l2_ops) WITH (fast_rotation = true);
+```
+
+### Query Options
+
+Specify the number of candidates to rerank with exact distances (100 by default, 0 disables reranking)
+
+```sql
+SET tqflat.rerank = 100;
+```
+
+A higher value provides better recall at the cost of speed.
+
+## TQIVF
+
+A TQIVF index divides [TurboQuant](https://arxiv.org/abs/2504.19874)-quantized vectors into lists like IVFFlat. It is typically several times smaller and faster to query than IVFFlat at the same recall. Like IVFFlat, create the index *after* the table has some data, and use the same guidance for choosing `lists` and `probes`.
+
+Add an index for each distance function you want to use.
+
+L2 distance
+
+```sql
+CREATE INDEX ON items USING tqivf (embedding vector_l2_ops) WITH (lists = 100);
+```
+
+Note: Use `halfvec_l2_ops` for `halfvec` (and similar with the other distance functions)
+
+Inner product
+
+```sql
+CREATE INDEX ON items USING tqivf (embedding vector_ip_ops) WITH (lists = 100);
+```
+
+Cosine distance
+
+```sql
+CREATE INDEX ON items USING tqivf (embedding vector_cosine_ops) WITH (lists = 100);
+```
+
+Supported types are:
+
+- `vector` - up to 16,000 dimensions
+- `halfvec` - up to 16,000 dimensions
+
+### Index Options
+
+Specify TQIVF parameters
+
+- `lists` - the number of inverted lists (100 by default)
+- `fast_rotation` - use the structured randomized Hadamard rotation (`true` by default)
+
+### Query Options
+
+Specify the number of probes (1 by default)
+
+```sql
+SET tqivf.probes = 10;
+```
+
+Specify the number of candidates to rerank with exact distances (100 by default, 0 disables reranking)
+
+```sql
+SET tqivf.rerank = 100;
+```
+
+Use iterative scans to scan additional lists on demand when filtering discards results
+
+```sql
+SET tqivf.iterative_scan = relaxed_order;
+SET tqivf.max_probes = 100;
+```
+
+### Index Build Time
+
+Speed up index creation on large tables by increasing the number of parallel workers (2 by default)
+
+```sql
+SET max_parallel_maintenance_workers = 7; -- plus leader
+```
+
+## TQHNSW
+
+A TQHNSW index creates a multilayer graph like HNSW over [TurboQuant](https://arxiv.org/abs/2504.19874)-quantized vectors. It matches HNSW recall at the same graph parameters while using a fraction of the memory (the advantage grows with dimension), in exchange for slower builds and somewhat lower query throughput at high recall.
+
+Add an index for each distance function you want to use.
+
+L2 distance
+
+```sql
+CREATE INDEX ON items USING tqhnsw (embedding vector_l2_ops);
+```
+
+Note: Use `halfvec_l2_ops` for `halfvec` and `sparsevec_l2_ops` for `sparsevec` (and similar with the other distance functions)
+
+Inner product
+
+```sql
+CREATE INDEX ON items USING tqhnsw (embedding vector_ip_ops);
+```
+
+Cosine distance
+
+```sql
+CREATE INDEX ON items USING tqhnsw (embedding vector_cosine_ops);
+```
+
+Supported types are:
+
+- `vector` - up to 16,000 dimensions
+- `halfvec` - up to 16,000 dimensions
+- `sparsevec` - up to 16,000 dimensions
+
+### Index Options
+
+Specify TQHNSW parameters
+
+- `m` - the max number of connections per layer (16 by default)
+- `ef_construction` - the size of the dynamic candidate list for constructing the graph (64 by default)
+- `fast_rotation` - use the structured randomized Hadamard rotation (`true` by default)
+
+```sql
+CREATE INDEX ON items USING tqhnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
+```
+
+### Query Options
+
+Specify the size of the dynamic candidate list for search (40 by default)
+
+```sql
+SET tqhnsw.ef_search = 100;
+```
+
+Specify the number of candidates to rerank with exact distances (100 by default, 0 disables reranking)
+
+```sql
+SET tqhnsw.rerank = 100;
+```
+
+A higher value of `ef_search` provides better recall at the cost of speed.
+
+### Index Build Time
+
+Like HNSW, indexes build significantly faster when the graph fits into `maintenance_work_mem`, and parallel workers speed up creation
+
+```sql
+SET maintenance_work_mem = '8GB';
+SET max_parallel_maintenance_workers = 7; -- plus leader
+```
 
 ## Filtering
 

@@ -62,7 +62,8 @@ typedef struct TqhnswBuildState
 	float	   *vecScratch;		/* dim floats, reused per tuple */
 
 	TqhnswGraph graphData;		/* serial: graph lives here */
-	TqhnswGraph *graph;			/* points at graphData (serial) or DSM (parallel) */
+	TqhnswGraph *graph;			/* points at graphData (serial) or DSM
+								 * (parallel) */
 	BlockNumber firstElementPage;	/* first element page written during flush */
 
 	MemoryContext graphCtx;		/* owns all in-memory graph nodes */
@@ -71,14 +72,15 @@ typedef struct TqhnswBuildState
 	char	   *base;			/* relptr base: NULL serial, DSM area parallel */
 
 	Relation	heap;
-	int64		indtuples;		/* captured graph->nVectors before DSM teardown */
+	int64		indtuples;		/* captured graph->nVectors before DSM
+								 * teardown */
 	/* Parallel build coordination (NULL/unused in serial build) */
 	TqhnswLeader *tqhnswleader;
 	TqhnswShared *tqhnswshared;
 	char	   *tqhnswarea;
-}			TqhnswBuildState;
+} TqhnswBuildState;
 
-static void TqhnswFlushGraph(TqhnswBuildState * buildstate);
+static void TqhnswFlushGraph(TqhnswBuildState *buildstate);
 
 /*
  * TqhnswWriteModelAndMeta -- build the codebook (+ dense rotation), write the
@@ -89,7 +91,7 @@ static void TqhnswFlushGraph(TqhnswBuildState * buildstate);
  * FIRST (so it is always the first block in the fork), THEN the side pages
  * append at blocks >= 1, THEN the meta page is back-patched with the side-chain
  * heads and header fields.  The entry point is written "empty" (entryLevel =
- * -1); the real build (Task 4) back-patches it.
+ * -1); the real build back-patches it.
  *
  * modelOut->boundaries / modelOut->centroids must be preallocated by the caller.
  */
@@ -113,9 +115,10 @@ TqhnswWriteModelAndMeta(Relation index, ForkNumber forkNum, int dim, TqMetric me
 
 	/*
 	 * Validate the element-tuple size against the page layout up front --
-	 * otherwise the whole in-memory graph is built before the flush fails with
-	 * a generic "failed to add index item".  fast_rotation pads dim to the next
-	 * power of two, so dims in (8192, 16000] overflow only in fast mode.
+	 * otherwise the whole in-memory graph is built before the flush fails
+	 * with a generic "failed to add index item".  fast_rotation pads dim to
+	 * the next power of two, so dims in (8192, 16000] overflow only in fast
+	 * mode.
 	 */
 	if (TQHNSW_ELEMENT_TUPLE_SIZE(TQ_CODES_BYTES(dimCodes, bits)) >
 		TqPageCapacity() - sizeof(ItemIdData))
@@ -129,8 +132,8 @@ TqhnswWriteModelAndMeta(Relation index, ForkNumber forkNum, int dim, TqMetric me
 	 * Meta page is block 0; it must be the first block created in the fork.
 	 * Create the placeholder (with Invalid side-chain heads) and commit it so
 	 * the subsequent TqWriteBytes side pages land at blocks >= 1.  We
-	 * back-patch the meta page below (mirror tqbuild.c's
-	 * TqCreateMetaPage + TqUpdateMeta ordering).
+	 * back-patch the meta page below (mirror tqbuild.c's TqCreateMetaPage +
+	 * TqUpdateMeta ordering).
 	 */
 	metabuf = TqNewBuffer(index, forkNum);
 	Assert(BufferGetBlockNumber(metabuf) == TQHNSW_METAPAGE_BLKNO);
@@ -296,9 +299,9 @@ TqhnswMemoryContextAlloc(Size size, void *state)
 
 	/*
 	 * memoryUsed is refreshed once per element by the caller (after all of an
-	 * element's sub-allocations) rather than here -- MemoryContextMemAllocated
-	 * walks the context block list, so doing it per sub-allocation costs ~5-6x
-	 * the walks per inserted tuple for no benefit.
+	 * element's sub-allocations) rather than here --
+	 * MemoryContextMemAllocated walks the context block list, so doing it per
+	 * sub-allocation costs ~5-6x the walks per inserted tuple for no benefit.
 	 */
 	return MemoryContextAlloc(buildstate->graphCtx, size);
 }
@@ -325,7 +328,7 @@ TqhnswSharedMemoryAlloc(Size size, void *state)
  * per layer (level 0 doubled) and zero-initialized.  Allocated in graphCtx.
  */
 static TqhnswElement *
-TqhnswAllocElement(TqhnswBuildState * buildstate, ItemPointer tid, int level)
+TqhnswAllocElement(TqhnswBuildState *buildstate, ItemPointer tid, int level)
 {
 	char	   *base = buildstate->base;
 	TqhnswElement *element = TqhnswAlloc(&buildstate->allocator, sizeof(TqhnswElement));
@@ -343,7 +346,7 @@ TqhnswAllocElement(TqhnswBuildState * buildstate, ItemPointer tid, int level)
 	}
 	{
 		TqhnswNeighborArrayPtr *neighbors =
-			TqhnswAlloc(&buildstate->allocator, sizeof(TqhnswNeighborArrayPtr) * (level + 1));
+		TqhnswAlloc(&buildstate->allocator, sizeof(TqhnswNeighborArrayPtr) * (level + 1));
 
 		TqhnswPtrStore(base, element->neighbors, neighbors);
 		for (lc = 0; lc <= level; lc++)
@@ -371,7 +374,7 @@ TqhnswAllocElement(TqhnswBuildState * buildstate, ItemPointer tid, int level)
  * under flushLock EXCLUSIVE and all workers fall through to the on-disk insert.
  */
 static bool
-TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
+TqhnswInsertTuple(TqhnswBuildState *buildstate, Datum value, ItemPointer tid)
 {
 	TqhnswGraph *graph = buildstate->graph;
 	char	   *base = buildstate->base;
@@ -415,20 +418,26 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 		return true;
 	}
 
-	/* Allocate the element under the allocator lock (allocator no longer self-locks). */
+	/*
+	 * Allocate the element under the allocator lock (allocator no longer
+	 * self-locks).
+	 */
 	level = TqhnswRandomLevel(buildstate->ml, buildstate->maxLevel);
 	element = TqhnswAllocElement(buildstate, tid, level);
 
 	/*
-	 * Serial path: refresh the running memory total once, now that the element
-	 * and all its sub-allocations are in graphCtx (the parallel bump allocator
-	 * tracks memoryUsed exactly as it allocates, so skip it there).
+	 * Serial path: refresh the running memory total once, now that the
+	 * element and all its sub-allocations are in graphCtx (the parallel bump
+	 * allocator tracks memoryUsed exactly as it allocates, so skip it there).
 	 */
 	if (base == NULL)
 		graph->memoryUsed = MemoryContextMemAllocated(buildstate->graphCtx, false);
 	LWLockRelease(&graph->allocatorLock);
 
-	/* Encode the value into the element (codes/norm/scale + reconstructed rhat). */
+	/*
+	 * Encode the value into the element (codes/norm/scale + reconstructed
+	 * rhat).
+	 */
 	{
 		const float *fv = TqExtractForEncode(buildstate->typeInfo, value,
 											 buildstate->metric,
@@ -449,10 +458,11 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 	}
 
 	/*
-	 * Insert into the in-memory graph.  Mirrors hnswbuild.c InsertTupleInMemory:
-	 * a single unified path (no separate bootstrap branch), with the entry lock
-	 * held across the whole search+connect so a concurrent entry-point raise
-	 * blocks searchers mid-descent (entry -> element -> spinlock ordering).
+	 * Insert into the in-memory graph.  Mirrors hnswbuild.c
+	 * InsertTupleInMemory: a single unified path (no separate bootstrap
+	 * branch), with the entry lock held across the whole search+connect so a
+	 * concurrent entry-point raise blocks searchers mid-descent (entry ->
+	 * element -> spinlock ordering).
 	 */
 	{
 		TqhnswElement *entryPoint;
@@ -481,14 +491,14 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 
 		/*
 		 * Add to the build list + count under the graph spinlock BEFORE
-		 * publishing the element's reciprocal edges (below).  This mirrors the
-		 * hnsw oracle's UpdateGraphInMemory order (AddElementInMemory then
-		 * UpdateNeighborsInMemory): an element must be on graph->head before any
-		 * neighbor edge can make it discoverable, so a flush walk over
-		 * graph->head never misses an element another node already references.
-		 * (A concurrent flush cannot interleave here regardless -- flushLock is
-		 * held SHARED for the whole insert -- but preserving the oracle's
-		 * invariant means correctness does not depend on that.)
+		 * publishing the element's reciprocal edges (below).  This mirrors
+		 * the hnsw UpdateGraphInMemory order (AddElementInMemory then
+		 * UpdateNeighborsInMemory): an element must be on graph->head before
+		 * any neighbor edge can make it discoverable, so a flush walk over
+		 * graph->head never misses an element another node already
+		 * references. (A concurrent flush cannot interleave here regardless
+		 * -- flushLock is held SHARED for the whole insert -- but preserving
+		 * hnsw's invariant means correctness does not depend on that.)
 		 */
 		SpinLockAcquire(&graph->lock);
 		TqhnswPtrStore(base, element->next, TqhnswPtrAccess(base, graph->head));
@@ -497,11 +507,12 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 		SpinLockRelease(&graph->lock);
 
 		/*
-		 * Search + connect against the current entry point.  entryPoint may be
-		 * NULL for the very first element, in which case TqhnswInsertElement
-		 * returns immediately and the element keeps empty neighbors -- it is
-		 * already on the build list and is (below) made the entry point, so a
-		 * lost entry-point race never orphans an element.
+		 * Search + connect against the current entry point.  entryPoint may
+		 * be NULL for the very first element, in which case
+		 * TqhnswInsertElement returns immediately and the element keeps empty
+		 * neighbors -- it is already on the build list and is (below) made
+		 * the entry point, so a lost entry-point race never orphans an
+		 * element.
 		 */
 		TqhnswInsertElement(base, NULL, NULL, NULL, CurrentMemoryContext,
 							element, entryPoint, buildstate->m,
@@ -509,9 +520,10 @@ TqhnswInsertTuple(TqhnswBuildState * buildstate, Datum value, ItemPointer tid)
 							buildstate->metric, false);
 
 		/*
-		 * Update the entry point if needed.  We still hold the entry lock; it is
-		 * exclusive whenever this condition can be true (a shared holder read an
-		 * entryPoint that cannot have changed under it), so the store is safe.
+		 * Update the entry point if needed.  We still hold the entry lock; it
+		 * is exclusive whenever this condition can be true (a shared holder
+		 * read an entryPoint that cannot have changed under it), so the store
+		 * is safe.
 		 */
 		if (entryPoint == NULL || element->level > entryPoint->level)
 			TqhnswPtrStore(base, graph->entryPoint, element);
@@ -546,8 +558,9 @@ TqhnswBuildCallback(Relation index, ItemPointer tid, Datum *values,
 
 	/*
 	 * Detoast only -- normalization is done per encode path inside
-	 * TqhnswInsertTuple (in-memory) / TqhnswQuantizeElement (on-disk fallback),
-	 * so a value routed to disk on an OOM flush is normalized exactly once.
+	 * TqhnswInsertTuple (in-memory) / TqhnswQuantizeElement (on-disk
+	 * fallback), so a value routed to disk on an OOM flush is normalized
+	 * exactly once.
 	 */
 	if (TqhnswInsertTuple(buildstate, value, tid))
 	{
@@ -572,8 +585,9 @@ TqhnswInitGraph(TqhnswGraph *graph, char *base, Size memoryTotal)
 {
 	/*
 	 * Initialize the lock tranche if needed: when the library is loaded via
-	 * shared_preload_libraries, _PG_init skips it (shared memory is not set up
-	 * yet) and backends inherit an unset tranche id.  Mirrors hnsw InitGraph.
+	 * shared_preload_libraries, _PG_init skips it (shared memory is not set
+	 * up yet) and backends inherit an unset tranche id.  Mirrors hnsw
+	 * InitGraph.
 	 */
 	TqhnswInitLockTranche();
 
@@ -598,7 +612,7 @@ TqhnswInitGraph(TqhnswGraph *graph, char *base, Size memoryTotal)
  * WriteNeighborTuples + HnswUpdateMetaPage.
  */
 static void
-TqhnswFlushGraph(TqhnswBuildState * buildstate)
+TqhnswFlushGraph(TqhnswBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	int			m = buildstate->m;
@@ -769,12 +783,12 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
 	pfree(ntupBuf);
 
 	/*
-	 * Serial path: free the in-memory graph now that it is on disk (mirrors the
-	 * oracle's MemoryContextReset in FlushPages).  On a mid-build OOM flush this
-	 * is what actually reclaims maintenance_work_mem -- the caller sets
-	 * graph->flushed so graph->head is never walked again.  The parallel build
-	 * keeps its graph in the DSM area (not graphCtx) and tears it down via
-	 * TqhnswEndParallel, so skip the reset there.
+	 * Serial path: free the in-memory graph now that it is on disk (mirrors
+	 * the MemoryContextReset in hnsw's FlushPages).  On a mid-build OOM flush
+	 * this is what actually reclaims maintenance_work_mem -- the caller sets
+	 * graph->flushed so graph->head is never walked again.  The parallel
+	 * build keeps its graph in the DSM area (not graphCtx) and tears it down
+	 * via TqhnswEndParallel, so skip the reset there.
 	 */
 	if (buildstate->base == NULL)
 	{
@@ -791,7 +805,7 @@ TqhnswFlushGraph(TqhnswBuildState * buildstate)
  * scratch + memory contexts.  The caller wires up the shared graph + DSM allocator.
  */
 static void
-TqhnswInitWorkerBuildState(TqhnswBuildState * buildstate, Relation index)
+TqhnswInitWorkerBuildState(TqhnswBuildState *buildstate, Relation index)
 {
 	int			bits = TQ_DEFAULT_BITS;
 
@@ -823,7 +837,7 @@ TqhnswInitWorkerBuildState(TqhnswBuildState * buildstate, Relation index)
  */
 static void
 TqhnswParallelScanAndInsert(Relation heapRel, Relation indexRel,
-							TqhnswShared * tqhnswshared, char *tqhnswarea, bool progress)
+							TqhnswShared *tqhnswshared, char *tqhnswarea, bool progress)
 {
 	TqhnswBuildState buildstate;
 	TableScanDesc scan;
@@ -911,7 +925,7 @@ TqhnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
  * subsequent flush resolves relptrs correctly (tqhnsw-specific base field).
  */
 static double
-ParallelTqhnswHeapScan(TqhnswBuildState * buildstate)
+ParallelTqhnswHeapScan(TqhnswBuildState *buildstate)
 {
 	TqhnswShared *tqhnswshared = buildstate->tqhnswleader->tqhnswshared;
 	int			nparticipanttuplesorts;
@@ -944,7 +958,7 @@ ParallelTqhnswHeapScan(TqhnswBuildState * buildstate)
  * End parallel build.  Mirrors HnswEndParallel.
  */
 static void
-TqhnswEndParallel(TqhnswLeader * tqhnswleader)
+TqhnswEndParallel(TqhnswLeader *tqhnswleader)
 {
 	/* Shutdown worker processes */
 	WaitForParallelWorkersToFinish(tqhnswleader->pcxt);
@@ -971,7 +985,7 @@ ParallelEstimateShared(Relation heap, Snapshot snapshot)
  * HnswLeaderParticipateAsWorker.
  */
 static void
-TqhnswLeaderParticipateAsWorker(TqhnswBuildState * buildstate)
+TqhnswLeaderParticipateAsWorker(TqhnswBuildState *buildstate)
 {
 	TqhnswLeader *tqhnswleader = buildstate->tqhnswleader;
 
@@ -984,7 +998,7 @@ TqhnswLeaderParticipateAsWorker(TqhnswBuildState * buildstate)
  * Begin parallel build.  Mirrors HnswBeginParallel.
  */
 static void
-TqhnswBeginParallel(TqhnswBuildState * buildstate, bool isconcurrent, int request)
+TqhnswBeginParallel(TqhnswBuildState *buildstate, bool isconcurrent, int request)
 {
 	ParallelContext *pcxt;
 	Snapshot	snapshot;
@@ -1148,7 +1162,7 @@ ComputeParallelWorkers(Relation heap, Relation index)
  * serially.  Flushes the graph to disk before any DSM teardown.
  */
 static double
-TqhnswBuildGraph(TqhnswBuildState * buildstate, Relation heap, Relation index,
+TqhnswBuildGraph(TqhnswBuildState *buildstate, Relation heap, Relation index,
 				 IndexInfo *indexInfo)
 {
 	int			parallel_workers = 0;
@@ -1252,8 +1266,9 @@ tqhnswbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
 	/*
 	 * The callback manages contexts itself: durable graph nodes are allocated
-	 * into graphCtx, while the per-insert search/select scratch goes into tmpCtx
-	 * and is reset after every tuple.  Run the scan in the build context.
+	 * into graphCtx, while the per-insert search/select scratch goes into
+	 * tmpCtx and is reset after every tuple.  Run the scan in the build
+	 * context.
 	 */
 	reltuples = TqhnswBuildGraph(&buildstate, heap, index, indexInfo);
 	/* TqhnswBuildGraph flushes internally (before any DSM teardown). */

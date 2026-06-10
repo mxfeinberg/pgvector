@@ -131,7 +131,8 @@ tqbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * --- Tail chain: tombstone row-major TqEntry items ---
 	 *
 	 * Rows inserted after the build live in the row-major tail chain as
-	 * TqEntry items; tombstone them via entry->deleted (the scan skips those).
+	 * TqEntry items; tombstone them via entry->deleted (the scan skips
+	 * those).
 	 */
 	blkno = tailStart;
 	while (BlockNumberIsValid(blkno))

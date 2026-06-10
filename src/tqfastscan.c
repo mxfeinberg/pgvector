@@ -116,7 +116,7 @@ TqScoreBlockRangeNeon(const uint8 *lut8, const uint8 *codeRun,
 		uint8x16_t	tbl = vld1q_u8(lut8 + (Size) i * 16);
 		uint8x16_t	codes = vld1q_u8(cell);
 		uint8x16_t	lo = vandq_u8(codes, mask);
-		uint8x16_t	hi = vshrq_n_u8(codes, 4); /* per-byte shift -> 0..15 */
+		uint8x16_t	hi = vshrq_n_u8(codes, 4);	/* per-byte shift -> 0..15 */
 		uint8x16_t	r0 = vqtbl1q_u8(tbl, lo);	/* lanes 0..15 (low nibble) */
 		uint8x16_t	r1 = vqtbl1q_u8(tbl, hi);	/* lanes 16..31 (high nibble) */
 		uint16x8_t	a0 = vld1q_u16(acc->acc16 + 0);
@@ -156,9 +156,9 @@ TqScoreBlockRangeNeon(const uint8 *lut8, const uint8 *codeRun,
 #define TARGET_TQ_XSAVE  __attribute__((target("xsave")))
 #endif
 
-#define TQ_CPU_OSXSAVE   (1u << 27)	/* CPUID leaf 1 ECX bit 27 */
-#define TQ_CPU_AVX512F   (1u << 16)	/* CPUID leaf 7,0 EBX bit 16 */
-#define TQ_CPU_AVX512BW  (1u << 30)	/* CPUID leaf 7,0 EBX bit 30 */
+#define TQ_CPU_OSXSAVE   (1u << 27) /* CPUID leaf 1 ECX bit 27 */
+#define TQ_CPU_AVX512F   (1u << 16) /* CPUID leaf 7,0 EBX bit 16 */
+#define TQ_CPU_AVX512BW  (1u << 30) /* CPUID leaf 7,0 EBX bit 30 */
 
 /*
  * TqSupportsAvx512 -- runtime probe for AVX-512F + AVX-512BW, gated by
@@ -245,7 +245,7 @@ TARGET_TQ_AVX512 void
 TqScoreBlockRangeAvx512(const uint8 *lut8, const uint8 *codeRun,
 						int c0, int c1, TqBlockAccum *acc)
 {
-	const __m256i mask = _mm256_set1_epi8(0x0F);
+	const		__m256i mask = _mm256_set1_epi8(0x0F);
 	__m512i		va16 = _mm512_loadu_si512((const void *) acc->acc16);
 	__m512i		va32lo = _mm512_loadu_si512((const void *) (acc->acc32));
 	__m512i		va32hi = _mm512_loadu_si512((const void *) (acc->acc32 + 16));
@@ -261,11 +261,11 @@ TqScoreBlockRangeAvx512(const uint8 *lut8, const uint8 *codeRun,
 		__m256i		sh = _mm256_srli_epi16(bc, 4);
 
 		/*
-		 * idx lane 0 = cell (-> lo nibbles after the mask), lane 1 = cell >> 4
-		 * (-> hi nibbles).  _mm256_blend_epi32 control 0xF0 takes the upper four
-		 * dwords (the high 128-bit lane) from `sh` and the lower four from `bc`.
-		 * The 0x0F mask then strips the shift's cross-byte bleed in lane 1 and
-		 * isolates the low nibble in lane 0.
+		 * idx lane 0 = cell (-> lo nibbles after the mask), lane 1 = cell >>
+		 * 4 (-> hi nibbles).  _mm256_blend_epi32 control 0xF0 takes the upper
+		 * four dwords (the high 128-bit lane) from `sh` and the lower four
+		 * from `bc`. The 0x0F mask then strips the shift's cross-byte bleed
+		 * in lane 1 and isolates the low nibble in lane 0.
 		 */
 		__m256i		idx = _mm256_and_si256(_mm256_blend_epi32(bc, sh, 0xF0), mask);
 		__m256i		tbl = _mm256_broadcastsi128_si256(tbl128);

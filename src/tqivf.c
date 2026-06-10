@@ -287,7 +287,7 @@ tqivf_halfvec_cosine_support(PG_FUNCTION_ARGS)
  *
  * Adapted from tqbuild.c's TqLoadModel for the tqivf meta layout.  TurboQuant
  * is data-oblivious: ONE global rotation + ONE global codebook, shared by all
- * lists.  bits is fixed at 4 and tqProd/QJL are unused in the v4 layout.
+ * lists.  bits is fixed at 4 and tqProd/QJL are unused in the blocked layout.
  */
 TqModel *
 TqivfLoadModel(Relation index, MemoryContext ctx)
@@ -367,7 +367,10 @@ TqivfLoadModel(Relation index, MemoryContext ctx)
 
 	MemoryContextSwitchTo(oldCtx);
 
-	/* Read the rotation side page back (dense mode only; absent in fast mode). */
+	/*
+	 * Read the rotation side page back (dense mode only; absent in fast
+	 * mode).
+	 */
 	if (!fastRotation)
 	{
 		if (!BlockNumberIsValid(rotationStart))

@@ -18,7 +18,8 @@
 #include "storage/shm_toc.h"
 #include "utils/relcache.h"
 #include "utils/relptr.h"
-#include "tq.h"						/* TqModel, TqEntry, TqMetric, TqTypeInfo, TqPackCode */
+#include "tq.h"					/* TqModel, TqEntry, TqMetric, TqTypeInfo,
+								 * TqPackCode */
 #include "vector.h"
 
 /*
@@ -51,9 +52,10 @@ TqhnswPtrDeclare(char, TqhnswCodesRelptr, TqhnswCodesPtr);
 typedef struct TqhnswCandidate
 {
 	TqhnswElementPtr element;
-	ItemPointerData tid;		/* disk-path: TID before element is materialized */
+	ItemPointerData tid;		/* disk-path: TID before element is
+								 * materialized */
 	double		distance;
-}			TqhnswCandidate;
+} TqhnswCandidate;
 
 struct TqhnswNeighborArray
 {
@@ -95,18 +97,19 @@ struct TqhnswNeighborArray
 
 /* Page layout */
 #define TQHNSW_METAPAGE_BLKNO 0
-#define TQHNSW_MAGIC_NUMBER 0x71685451	/* distinct from tqflat 0x71665451 / tqivf 0x71715451 */
-#define TQHNSW_VERSION 2
-#define TQHNSW_PAGE_ID 0xFF94			/* distinct from tqflat 0xFF92 / tqivf 0xFF93 */
+#define TQHNSW_MAGIC_NUMBER 0x71685451	/* distinct from tqflat 0x71665451 /
+										 * tqivf 0x71715451 */
+#define TQHNSW_VERSION 1
+#define TQHNSW_PAGE_ID 0xFF94	/* distinct from tqflat 0xFF92 / tqivf 0xFF93 */
 
 /* Tuple type tags */
 #define TQHNSW_ELEMENT_TUPLE_TYPE 1
 #define TQHNSW_NEIGHBOR_TUPLE_TYPE 2
 
 /* Support function numbers (opclass FUNCTION slots) */
-#define TQHNSW_DISTANCE_PROC 1		/* exact distance, used by rerank */
-#define TQHNSW_NORM_PROC 2			/* l2 norm (cosine/ip parity; mirrors hnsw) */
-#define TQHNSW_TYPE_INFO_PROC 3		/* tqhnsw_*_support -> TqTypeInfo.metric */
+#define TQHNSW_DISTANCE_PROC 1	/* exact distance, used by rerank */
+#define TQHNSW_NORM_PROC 2		/* l2 norm (cosine/ip parity; mirrors hnsw) */
+#define TQHNSW_TYPE_INFO_PROC 3 /* tqhnsw_*_support -> TqTypeInfo.metric */
 
 /* Per-level fanout: level 0 gets 2*m, upper levels m (HNSW convention). */
 #define TqhnswGetLayerM(m, lc) ((lc) == 0 ? (m) * 2 : (m))
@@ -130,7 +133,7 @@ typedef struct TqhnswOptions
 	int			m;				/* graph connectivity */
 	int			efConstruction; /* build-time candidate list size */
 	bool		fastRotation;	/* structured randomized Hadamard rotation */
-}			TqhnswOptions;
+} TqhnswOptions;
 
 /* Standard page opaque (mirrors HnswPageOpaqueData / TqPageOpaqueData). */
 typedef struct TqhnswPageOpaqueData
@@ -138,9 +141,9 @@ typedef struct TqhnswPageOpaqueData
 	BlockNumber nextblkno;
 	uint16		unused;
 	uint16		page_id;		/* TQHNSW_PAGE_ID */
-}			TqhnswPageOpaqueData;
+} TqhnswPageOpaqueData;
 
-typedef TqhnswPageOpaqueData * TqhnswPageOpaque;
+typedef TqhnswPageOpaqueData *TqhnswPageOpaque;
 
 #define TqhnswPageGetOpaque(page) ((TqhnswPageOpaque) PageGetSpecialPointer(page))
 
@@ -169,12 +172,12 @@ typedef struct TqhnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;		/* -1 when empty */
 	BlockNumber insertPage;		/* element-page hint for inserts */
-	BlockNumber firstElementPage;	/* head of the element-page nextblkno chain
-									 * (after meta + codebook/rotation side pages);
-									 * vacuum walks this chain */
-}			TqhnswMetaPageData;
+	BlockNumber firstElementPage;	/* head of the element-page nextblkno
+									 * chain (after meta + codebook/rotation
+									 * side pages); vacuum walks this chain */
+} TqhnswMetaPageData;
 
-typedef TqhnswMetaPageData * TqhnswMetaPage;
+typedef TqhnswMetaPageData *TqhnswMetaPage;
 
 #define TqhnswPageGetMeta(page) ((TqhnswMetaPage) PageGetContents(page))
 
@@ -187,16 +190,19 @@ typedef struct TqhnswElementTupleData
 {
 	uint8		type;			/* TQHNSW_ELEMENT_TUPLE_TYPE */
 	uint8		level;
-	uint8		deleted;		/* tombstone: set by vacuum MarkDeleted; slot reusable by insert */
-	uint8		version;		/* bumped on tombstone (1..15 wrap); carried on slot reuse */
-	ItemPointerData heaptid;	/* the indexed heap row (single; no dup-merge in MVP) */
+	uint8		deleted;		/* tombstone: set by vacuum MarkDeleted; slot
+								 * reusable by insert */
+	uint8		version;		/* bumped on tombstone (1..15 wrap); carried
+								 * on slot reuse */
+	ItemPointerData heaptid;	/* the indexed heap row (single; duplicates
+								 * not merged, unlike hnsw) */
 	ItemPointerData neighbortid;
 	float		norm;			/* stripped L2 length */
 	float		scale;			/* renormalization correction */
 	char		codes[FLEXIBLE_ARRAY_MEMBER];
-}			TqhnswElementTupleData;
+} TqhnswElementTupleData;
 
-typedef TqhnswElementTupleData * TqhnswElementTuple;
+typedef TqhnswElementTupleData *TqhnswElementTuple;
 
 #define TQHNSW_ELEMENT_TUPLE_SIZE(_codesBytes) \
 	MAXALIGN(offsetof(TqhnswElementTupleData, codes) + (_codesBytes))
@@ -212,9 +218,9 @@ typedef struct TqhnswNeighborTupleData
 	uint8		version;
 	uint16		count;			/* (level+2)*m */
 	ItemPointerData indextids[FLEXIBLE_ARRAY_MEMBER];
-}			TqhnswNeighborTupleData;
+} TqhnswNeighborTupleData;
 
-typedef TqhnswNeighborTupleData * TqhnswNeighborTuple;
+typedef TqhnswNeighborTupleData *TqhnswNeighborTuple;
 
 #define TQHNSW_NEIGHBOR_TUPLE_SIZE(level, m) \
 	MAXALIGN(offsetof(TqhnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
@@ -237,13 +243,14 @@ extern void TqhnswGetMetaInfo(Relation index, int *dim, TqMetric *metric, int *m
  * build-time distance (unit-normalized for cosine).  blkno/offno/neighborPage/
  * neighborOffno are assigned during the flush-to-disk pass.
  */
-typedef struct TqhnswElementData TqhnswElement;	/* keep the existing name */
+typedef struct TqhnswElementData TqhnswElement; /* keep the existing name */
 
 struct TqhnswElementData
 {
 	ItemPointerData heaptid;
 	uint8		level;
-	TqhnswRhatPtr rhat;			/* reconstructed rotated vector, dimCodes floats */
+	TqhnswRhatPtr rhat;			/* reconstructed rotated vector, dimCodes
+								 * floats */
 	TqhnswCodesPtr codes;		/* packed codes (flushed to disk) */
 	float		norm;
 	float		scale;
@@ -270,7 +277,7 @@ typedef struct TqhnswAllocator
 {
 	void	   *(*alloc) (Size size, void *state);
 	void	   *state;
-}			TqhnswAllocator;
+} TqhnswAllocator;
 
 #define TqhnswAlloc(allocator, size) ((allocator)->alloc((size), (allocator)->state))
 
@@ -293,9 +300,10 @@ typedef struct TqhnswGraph
 	Size		memoryUsed;
 	Size		memoryTotal;
 	LWLock		flushLock;		/* serialize the in-memory -> on-disk flush */
-	bool		flushed;		/* true once the graph has been flushed to disk */
+	bool		flushed;		/* true once the graph has been flushed to
+								 * disk */
 	int64		indtuples;		/* total tuples inserted (in-memory + on-disk) */
-}			TqhnswGraph;
+} TqhnswGraph;
 
 #define TQHNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
 
@@ -312,9 +320,12 @@ typedef struct TqhnswShared
 	int			nparticipantsdone;
 	double		reltuples;
 
-	/* Shared graph (the ParallelTableScanDesc is BUFFERALIGN'd after this struct) */
+	/*
+	 * Shared graph (the ParallelTableScanDesc is BUFFERALIGN'd after this
+	 * struct)
+	 */
 	TqhnswGraph graphData;
-}			TqhnswShared;
+} TqhnswShared;
 
 #define ParallelTableScanFromTqhnswShared(shared) \
 	(ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(TqhnswShared)))
@@ -326,13 +337,13 @@ typedef struct TqhnswLeader
 	TqhnswShared *tqhnswshared;
 	char	   *tqhnswarea;
 	Snapshot	snapshot;
-}			TqhnswLeader;
+} TqhnswLeader;
 
 /* ---- tqhnswutils.c ---- */
 /* Reconstruct the rotated full-magnitude vector from an entry's codes (no inverse
  * rotation: distances are computed in rotated space, which is orthonormal). */
 extern void TqhnswReconstruct(const TqModel *model, const char *codes,
-							  float norm, float scale, float *rhat /* dimCodes */);
+							  float norm, float scale, float *rhat /* dimCodes */ );
 
 /* Cosine: unit-normalize a reconstructed rhat vector in place. */
 extern void TqhnswNormalizeRhat(float *rhat, int dimCodes);
@@ -421,13 +432,15 @@ typedef struct TqhnswVacuumState
 	int			efConstruction;
 	int			dimCodes;
 	BlockNumber firstElementPage;
-	HTAB	   *deleted;			/* set of dead element TIDs (key = ItemPointerData) */
-	BlockNumber highestBlkno;		/* highest live non-entry-point element; Invalid when none */
+	HTAB	   *deleted;		/* set of dead element TIDs (key =
+								 * ItemPointerData) */
+	BlockNumber highestBlkno;	/* highest live non-entry-point element;
+								 * Invalid when none */
 	OffsetNumber highestOffno;
 	int			highestLevel;
 	MemoryContext tmpCtx;
 	BufferAccessStrategy bas;
-}			TqhnswVacuumState;
+} TqhnswVacuumState;
 
 extern IndexBulkDeleteResult *tqhnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 											   IndexBulkDeleteCallback callback, void *callback_state);
@@ -440,10 +453,12 @@ extern void TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetr
 
 typedef enum TqhnswEntryUpdate
 {
-	TQHNSW_ENTRY_NO_UPDATE = 0,	/* leave entry point unchanged */
-	TQHNSW_ENTRY_GREATER,		/* set only if newElement->level > current entry level */
-	TQHNSW_ENTRY_ALWAYS			/* force entry point to newElement (may be NULL -> empty) */
-}			TqhnswEntryUpdate;
+	TQHNSW_ENTRY_NO_UPDATE = 0, /* leave entry point unchanged */
+	TQHNSW_ENTRY_GREATER,		/* set only if newElement->level > current
+								 * entry level */
+	TQHNSW_ENTRY_ALWAYS			/* force entry point to newElement (may be
+								 * NULL -> empty) */
+} TqhnswEntryUpdate;
 
 /* exposed for vacuum repair (full neighbor-tuple overwrite) */
 extern void TqhnswSetNeighborTuple(TqhnswNeighborTuple ntup, TqhnswElement *e, int m);

@@ -398,8 +398,8 @@ tqflat_test_rotation_orthogonality(PG_FUNCTION_ARGS)
 	TqBuildRotation(dim, TQ_ROTATION_SEED, rotation);
 
 	/*
-	 * Compute max |( R * R^T )_{ij} - I_{ij}|.  R is row-major, so
-	 * (R * R^T)_{ij} = sum_k R[i*dim+k] * R[j*dim+k].
+	 * Compute max |( R * R^T )_{ij} - I_{ij}|.  R is row-major, so (R *
+	 * R^T)_{ij} = sum_k R[i*dim+k] * R[j*dim+k].
 	 */
 	maxerr = 0.0;
 	for (i = 0; i < dim; i++)
@@ -446,7 +446,7 @@ tqflat_test_roundtrip(PG_FUNCTION_ARGS)
 	int			nBnd = nLevels - 1;
 	int			codesBytes = TQ_CODES_BYTES(dim, bits);
 	TqModel		model;
-	TqEntry	   *entry;
+	TqEntry    *entry;
 	float	   *yhat;
 	float	   *vhat;
 	double		numerr;
@@ -479,14 +479,17 @@ tqflat_test_roundtrip(PG_FUNCTION_ARGS)
 	TqBuildRotation(dim, TQ_ROTATION_SEED, model.rotation);
 	TqBuildCodebook(dim, bits, model.boundaries, model.centroids);
 
-	/* Allocate a scratch TqEntry (full size: codes + no signs since tqProd=false). */
+	/*
+	 * Allocate a scratch TqEntry (full size: codes + no signs since
+	 * tqProd=false).
+	 */
 	entry = palloc0(TqEntrySize(dim, bits, false));
 
 	TqEncode(&model, vec->x, entry);
 
 	/*
-	 * Decode: yhat[i] = centroids[code_i].
-	 * Reconstruct: vhat[c] = entry->scale * sum_r rotation[r*dim+c] * yhat[r].
+	 * Decode: yhat[i] = centroids[code_i]. Reconstruct: vhat[c] =
+	 * entry->scale * sum_r rotation[r*dim+c] * yhat[r].
 	 */
 	yhat = palloc(sizeof(float) * dim);
 	for (i = 0; i < dim; i++)
@@ -831,7 +834,10 @@ tqflat_test_qjl_estimate(PG_FUNCTION_ARGS)
 		TqBuildCodebook(model.dimPadded, bits, model.boundaries, model.centroids);
 	}
 
-	/* Size buffers by dimCodes so fast mode (dimCodes > dim) doesn't under-allocate. */
+	/*
+	 * Size buffers by dimCodes so fast mode (dimCodes > dim) doesn't
+	 * under-allocate.
+	 */
 	entry = palloc0(TqEntrySize(model.dimCodes, bits, true));
 	TqEncode(&model, b->x, entry);
 
@@ -921,263 +927,6 @@ tqflat_test_rht_norm(PG_FUNCTION_ARGS)
 }
 
 /*
- * tqflat_test_ip_accuracy(qarr vector[], barr vector[], bits int, tq_prod bool, fast bool)
- * RETURNS float8[]
- *
- * Over all query×base pairs, computes IP-estimation accuracy statistics for a
- * single transient TqModel configuration and returns a 5-element float8 array:
- *   {bias, rmse, mean_abs_true, pearson, n_pairs}
- * where, with est = TqScoreEntry estimate of <q,x> and true = exact <q,x>:
- *   bias           = mean(est - true)
- *   rmse           = sqrt(mean((est - true)^2))
- *   mean_abs_true  = mean(|true|)   (scale reference)
- *   pearson        = Pearson correlation between est and true
- *   n_pairs        = (double) nq * nb
- *
- * tq_prod=true uses the QJL residual stage (unbiased for inner product per
- * Theorem 2); fast=true uses structured RHT instead of dense rotation.
- */
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_ip_accuracy);
-Datum
-tqflat_test_ip_accuracy(PG_FUNCTION_ARGS)
-{
-	ArrayType  *qarr = PG_GETARG_ARRAYTYPE_P(0);
-	ArrayType  *barr = PG_GETARG_ARRAYTYPE_P(1);
-	int			bits = PG_GETARG_INT32(2);
-	bool		tqProd = PG_GETARG_BOOL(3);
-	bool		fast = PG_GETARG_BOOL(4);
-
-	/* Deconstruct the two vector[] arrays. */
-	Datum	   *qelems,
-			   *belems;
-	bool	   *qnulls,
-			   *bnulls;
-	int			nq,
-				nb;
-	Oid			vecTypeOid;
-	int16		elmlen;
-	bool		elmbyval;
-	char		elmalign;
-
-	int			dim;
-	int			nLevels;
-	int			nBnd;
-	TqModel		model;
-	TqEntry   **entries;
-	float	   *lut;
-	float	   *qjlQuery = NULL;
-
-	/* Statistics accumulators (all double). */
-	double		S_diff = 0.0;
-	double		S_diff2 = 0.0;
-	double		S_abs_true = 0.0;
-	double		S_est = 0.0;
-	double		S_true = 0.0;
-	double		S_est2 = 0.0;
-	double		S_true2 = 0.0;
-	double		S_est_true = 0.0;
-	double		n_pairs = 0.0;
-
-	double		bias,
-				rmse,
-				mean_abs_true,
-				pearson,
-				denom_pearson;
-	Datum		elems5[5];
-	ArrayType  *result;
-	int			i,
-				j;
-
-	if (bits < TQ_MIN_BITS || bits > TQ_MAX_BITS)
-		ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: bits must be %d..%d",
-							   TQ_MIN_BITS, TQ_MAX_BITS)));
-
-	/*
-	 * Vectors are varlena (variable-length), so elmlen=-1, elmbyval=false,
-	 * elmalign=TYPALIGN_INT (4-byte alignment).  Read the element type OID
-	 * directly from the array header with ARR_ELEMTYPE (same pattern as
-	 * vector.c, halfvec.c).
-	 */
-	vecTypeOid = ARR_ELEMTYPE(qarr);
-	elmlen = -1;
-	elmbyval = false;
-	elmalign = TYPALIGN_INT;
-
-	deconstruct_array(qarr, vecTypeOid, elmlen, elmbyval, elmalign,
-					  &qelems, &qnulls, &nq);
-	deconstruct_array(barr, ARR_ELEMTYPE(barr), elmlen, elmbyval, elmalign,
-					  &belems, &bnulls, &nb);
-
-	if (nq < 1)
-		ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: query array must be non-empty")));
-	if (nb < 1)
-		ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: base array must be non-empty")));
-
-	/* STRICT covers only a NULL array, not NULL elements within it. */
-	for (i = 0; i < nq; i++)
-		if (qnulls[i])
-			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: query array must not contain nulls")));
-	for (j = 0; j < nb; j++)
-		if (bnulls[j])
-			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: base array must not contain nulls")));
-
-	/* Determine dim from first query vector; validate all others match. */
-	{
-		Vector	   *v0 = DatumGetVector(qelems[0]);
-
-		dim = v0->dim;
-	}
-	for (i = 0; i < nq; i++)
-	{
-		Vector	   *v = DatumGetVector(qelems[i]);
-
-		if (v->dim != dim)
-			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: all query vectors must have dim %d", dim)));
-	}
-	for (j = 0; j < nb; j++)
-	{
-		Vector	   *v = DatumGetVector(belems[j]);
-
-		if (v->dim != dim)
-			ereport(ERROR, (errmsg("tqflat_test_ip_accuracy: all base vectors must have dim %d", dim)));
-	}
-
-	nLevels = 1 << bits;
-	nBnd = nLevels - 1;
-
-	/* Build the transient TqModel (mirrors tqflat_test_qjl_estimate). */
-	model.dim = dim;
-	model.bits = bits;
-	model.nLevels = nLevels;
-	model.metric = TQ_METRIC_IP;
-	model.tqProd = tqProd;
-	model.boundaries = palloc(sizeof(float) * nBnd);
-	model.centroids = palloc(sizeof(float) * nLevels);
-
-	if (!fast)
-	{
-		model.fastRotation = false;
-		model.dimPadded = dim;
-		model.dimCodes = dim;
-		model.rotation = palloc(sizeof(float) * dim * dim);
-		model.qjl = NULL;
-		model.qjlScale = 0.0f;
-		model.rotSeed = TQ_ROTATION_SEED;
-		model.qjlSeed = TQ_QJL_SEED;
-
-		TqBuildRotation(dim, TQ_ROTATION_SEED, model.rotation);
-		TqBuildCodebook(dim, bits, model.boundaries, model.centroids);
-
-		if (tqProd)
-		{
-			model.qjl = palloc(sizeof(float) * dim * dim);
-			TqBuildQjl(dim, TQ_QJL_SEED, model.qjl);
-			model.qjlScale = (float) (sqrt(M_PI / 2.0) / (double) dim);
-		}
-	}
-	else
-	{
-		model.fastRotation = true;
-		model.dimPadded = TqNextPow2(dim);
-		model.dimCodes = model.dimPadded;
-		model.rotation = NULL;
-		model.qjl = NULL;
-		model.qjlScale = tqProd ? (float) (sqrt(M_PI / 2.0) / (double) model.dimPadded) : 0.0f;
-		model.rotSeed = TQ_ROTATION_SEED;
-		model.qjlSeed = TQ_QJL_SEED;
-
-		TqBuildCodebook(model.dimPadded, bits, model.boundaries, model.centroids);
-	}
-
-	/* Encode all nb base vectors upfront. */
-	entries = (TqEntry **) palloc(sizeof(TqEntry *) * nb);
-	for (j = 0; j < nb; j++)
-	{
-		Vector	   *xvec = DatumGetVector(belems[j]);
-
-		entries[j] = (TqEntry *) palloc0(TqEntrySize(model.dimCodes, bits, tqProd));
-		TqEncode(&model, xvec->x, entries[j]);
-	}
-
-	/* Allocate query buffers (sized by dimCodes for fast mode). */
-	lut = palloc(sizeof(float) * model.dimCodes * nLevels);
-	if (tqProd)
-		qjlQuery = palloc(sizeof(float) * model.dimCodes);
-
-	/* Main nested loop: all query×base pairs. */
-	for (i = 0; i < nq; i++)
-	{
-		Vector	   *qvec = DatumGetVector(qelems[i]);
-
-		TqBuildQueryLut(&model, qvec->x, lut, qjlQuery);
-
-		for (j = 0; j < nb; j++)
-		{
-			Vector	   *xvec = DatumGetVector(belems[j]);
-			double		est;
-			double		true_ip;
-			double		diff;
-			int			k;
-
-			est = (double) TqScoreEntry(&model, lut, qjlQuery, entries[j], entries[j]->data);
-
-			/* Exact inner product: sum_k q[k] * x[k] */
-			true_ip = 0.0;
-			for (k = 0; k < dim; k++)
-				true_ip += (double) qvec->x[k] * (double) xvec->x[k];
-
-			diff = est - true_ip;
-
-			S_diff += diff;
-			S_diff2 += diff * diff;
-			S_abs_true += fabs(true_ip);
-			S_est += est;
-			S_true += true_ip;
-			S_est2 += est * est;
-			S_true2 += true_ip * true_ip;
-			S_est_true += est * true_ip;
-			n_pairs += 1.0;
-		}
-	}
-
-	/* Compute the 5 output metrics. */
-	bias = S_diff / n_pairs;
-	rmse = sqrt(S_diff2 / n_pairs);
-	mean_abs_true = S_abs_true / n_pairs;
-
-	/* Pearson r = (n*Sxy - Sx*Sy) / sqrt((n*Sx2-Sx^2)*(n*Sy2-Sy^2)) */
-	denom_pearson = sqrt(
-		(n_pairs * S_est2 - S_est * S_est) *
-		(n_pairs * S_true2 - S_true * S_true));
-	pearson = (denom_pearson > 1e-30)
-		? (n_pairs * S_est_true - S_est * S_true) / denom_pearson
-		: 0.0;
-
-	/* Free working allocations. */
-	for (j = 0; j < nb; j++)
-		pfree(entries[j]);
-	pfree(entries);
-	pfree(lut);
-	if (qjlQuery)
-		pfree(qjlQuery);
-	pfree(model.boundaries);
-	pfree(model.centroids);
-	if (model.rotation)
-		pfree(model.rotation);
-	if (model.qjl)
-		pfree(model.qjl);
-
-	elems5[0] = Float8GetDatum(bias);
-	elems5[1] = Float8GetDatum(rmse);
-	elems5[2] = Float8GetDatum(mean_abs_true);
-	elems5[3] = Float8GetDatum(pearson);
-	elems5[4] = Float8GetDatum(n_pairs);
-	result = construct_array(elems5, 5, FLOAT8OID,
-							 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
-	PG_RETURN_ARRAYTYPE_P(result);
-}
-
-/*
  * tqflat_test_rht_coord_stats(d int) RETURNS float8[]
  * Applies the RHT to a batch of deterministic unit vectors and returns
  * {mean, variance, max_abs} over all output coordinates.  By Lemma 1 (for the
@@ -1189,7 +938,7 @@ tqflat_test_rht_coord_stats(PG_FUNCTION_ARGS)
 {
 	int			d = PG_GETARG_INT32(0);
 	int			dp = TqNextPow2(d);
-	int			nvec = 64;			/* enough unit vectors to average, still fast */
+	int			nvec = 64;		/* enough unit vectors to average, still fast */
 	float	   *in;
 	float	   *out;
 	double		sum = 0.0,
@@ -1551,19 +1300,4 @@ tqflat_test_score_block(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_INT32(mismatches);
-}
-
-/*
- * tqflat_test_active_kernel() RETURNS text
- *
- * Test-only wrapper: the block-scorer kernel TqInitDispatch selected at load
- * ("default" / "neon" / "avx512").  Lets the amd64 validation positively confirm
- * AVX-512 is the live kernel rather than inferring it from output consistency.
- * Prototype; drop before upstream.
- */
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(tqflat_test_active_kernel);
-Datum
-tqflat_test_active_kernel(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_TEXT_P(cstring_to_text(TqActiveKernelName()));
 }

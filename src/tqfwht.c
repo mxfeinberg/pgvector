@@ -28,7 +28,7 @@ static inline double
 tq_sign(uint64 seed, int stage, int idx)
 {
 	uint64		z = seed ^ ((uint64) (uint32) stage * UINT64CONST(0x100000001B3))
-		^ ((uint64) (uint32) idx * UINT64CONST(0x9E3779B97F4A7C15));
+	^ ((uint64) (uint32) idx * UINT64CONST(0x9E3779B97F4A7C15));
 
 	z += UINT64CONST(0x9E3779B97F4A7C15);
 	z = (z ^ (z >> 30)) * UINT64CONST(0xBF58476D1CE4E5B9);

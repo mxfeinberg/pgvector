@@ -31,12 +31,12 @@ typedef struct TqhnswPointerHashEntry
 {
 	uintptr_t	ptr;
 	char		status;
-}			TqhnswPointerHashEntry;
+} TqhnswPointerHashEntry;
 typedef struct TqhnswOffsetHashEntry
 {
 	Size		offset;
 	char		status;
-}			TqhnswOffsetHashEntry;
+} TqhnswOffsetHashEntry;
 
 static uint32
 tqhnsw_hash_pointer(uintptr_t ptr)
@@ -84,7 +84,7 @@ typedef union
 {
 	struct tqpointerhash_hash *pointers;
 	struct tqoffsethash_hash *offsets;
-}			TqhnswVisited;
+} TqhnswVisited;
 
 /*
  * Reconstruct the rotated, full-magnitude vector rhat[i] = norm*scale*centroids[code_i]
@@ -94,7 +94,7 @@ typedef union
  */
 void
 TqhnswReconstruct(const TqModel *model, const char *codes,
-				  float norm, float scale, float *rhat /* dimCodes */)
+				  float norm, float scale, float *rhat /* dimCodes */ )
 {
 	int			dc = model->dimCodes;
 	int			codesBytes = TQ_CODES_BYTES(dc, model->bits);
@@ -183,7 +183,7 @@ typedef struct TqhnswSearchCandidate
 	pairingheap_node w_node;
 	TqhnswElement *element;
 	double		distance;
-}			TqhnswSearchCandidate;
+} TqhnswSearchCandidate;
 
 #define TqhnswGetSearchCandidate(membername, ptr) \
 	pairingheap_container(TqhnswSearchCandidate, membername, ptr)
@@ -303,7 +303,8 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 	/*
 	 * In-memory path: a reusable buffer to snapshot each candidate's neighbor
 	 * array under its shared lock so the distance work below runs lock-free
-	 * (see the loop).  lc is fixed for this call, so one size fits every copy.
+	 * (see the loop).  lc is fixed for this call, so one size fits every
+	 * copy.
 	 */
 	if (index == NULL)
 	{
@@ -333,7 +334,10 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 		if (c->distance > f->distance)
 			break;
 
-		/* Iterate the candidate's neighbors at layer lc (skip levels it lacks). */
+		/*
+		 * Iterate the candidate's neighbors at layer lc (skip levels it
+		 * lacks).
+		 */
 		if (lc > cElement->level)
 			continue;
 
@@ -348,19 +352,20 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 
 		{
 			TqhnswNeighborArray *na;
-			bool		locked = (index == NULL);	/* in-memory graph: lock shared */
+			bool		locked = (index == NULL);	/* in-memory graph: lock
+													 * shared */
 
 			na = TqhnswGetNeighbors(base, cElement, lc);
 
 			if (locked)
 			{
 				/*
-				 * Snapshot the neighbor array under a brief shared lock, then do
-				 * all the distance work below lock-free (mirrors the oracle's
-				 * HnswLoadUnvisitedFromMemory).  Holding cElement->lock across
-				 * the distance kernels would block a concurrent reciprocal
-				 * connect (EXCLUSIVE) on this node for the whole inner loop --
-				 * the hottest path of a parallel build.
+				 * Snapshot the neighbor array under a brief shared lock, then
+				 * do all the distance work below lock-free (mirrors hnsw's
+				 * HnswLoadUnvisitedFromMemory).  Holding cElement->lock
+				 * across the distance kernels would block a concurrent
+				 * reciprocal connect (EXCLUSIVE) on this node for the whole
+				 * inner loop -- the hottest path of a parallel build.
 				 */
 				LWLockAcquire(&cElement->lock, LW_SHARED);
 				memcpy(localNa, na, localNaSize);
@@ -404,13 +409,14 @@ TqhnswSearchLayer(char *base, Relation index, const TqModel *model, HTAB *cache,
 
 					/*
 					 * tqhnsw keeps the textbook Alg-2 invariant wlen == |W|
-					 * (decrement on eviction).  This intentionally differs from
-					 * hnswutils.c, which never decrements wlen because it tracks
-					 * "admitted-live-elements" for its discarded-heap /
-					 * iterative-scan path, which tqhnsw lacks.  For build/insert
-					 * (skipElement==NULL) the two are equivalent; on the vacuum
-					 * repair path (skipElement!=NULL) repaired-node recall is
-					 * validated separately by the vacuum recall TAP test.
+					 * (decrement on eviction).  This intentionally differs
+					 * from hnswutils.c, which never decrements wlen because
+					 * it tracks "admitted-live-elements" for its
+					 * discarded-heap / iterative-scan path, which tqhnsw
+					 * lacks.  For build/insert (skipElement==NULL) the two
+					 * are equivalent; on the vacuum repair path
+					 * (skipElement!=NULL) repaired-node recall is validated
+					 * separately by the vacuum recall TAP test.
 					 */
 					if (wlen > ef)
 					{
@@ -444,8 +450,12 @@ CompareCandidateDistances(const ListCell *a, const ListCell *b)
 		return 1;
 	if (ca->distance > cb->distance)
 		return -1;
-	/* Tie-break on raw pointer (build) or relptr offset (disk) — both use .ptr for
-	 * consistent ordering; the exact value is immaterial, only stability matters. */
+
+	/*
+	 * Tie-break on raw pointer (build) or relptr offset (disk) — both use
+	 * .ptr for consistent ordering; the exact value is immaterial, only
+	 * stability matters.
+	 */
 	if (ca->element.ptr < cb->element.ptr)
 		return 1;
 	if (ca->element.ptr > cb->element.ptr)
@@ -601,7 +611,10 @@ TqhnswUpdateConnection(char *base, TqhnswElement *target, TqhnswElement *element
 			return;
 		}
 
-		/* element lost the prune: leave the list untouched (updateIdx stays -1). */
+		/*
+		 * element lost the prune: leave the list untouched (updateIdx stays
+		 * -1).
+		 */
 		if (pruned != newCand)
 		{
 			/* Replace the pruned element in place. */
@@ -753,7 +766,7 @@ TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 		if (!ItemPointerIsValid(t))
 			continue;
 		na->items[na->count].tid = *t;
-		na->items[na->count].element.ptr = NULL; /* lazy */
+		na->items[na->count].element.ptr = NULL;	/* lazy */
 		na->items[na->count].distance = 0;
 		na->count++;
 	}
@@ -820,10 +833,12 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 	int			lc;
 	TqhnswElement *skipElement = existing ? element : NULL;
 
-	/* No neighbors to select if there is no entry point (mirrors
+	/*
+	 * No neighbors to select if there is no entry point (mirrors
 	 * HnswFindElementNeighbors).  Repair may pass NULL when the graph's entry
-	 * point was deleted with no surviving replacement; the element then gets an
-	 * empty neighbor list, consistent with HNSW. */
+	 * point was deleted with no surviving replacement; the element then gets
+	 * an empty neighbor list, consistent with HNSW.
+	 */
 	if (entryPoint == NULL)
 		return;
 
@@ -846,29 +861,34 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 	if (level > entryLevel)
 		level = entryLevel;
 
-	/* Add one for existing element (it will be filtered from its own candidate set). */
+	/*
+	 * Add one for existing element (it will be filtered from its own
+	 * candidate set).
+	 */
 	if (existing)
 		efConstruction++;
 
 	/*
-	 * The unlocked phase-A forward writes below assume element is private to this
-	 * backend.  That holds for a fresh insert (existing=false) and for the only
-	 * existing=true caller (vacuum repair), which runs on-disk (base==NULL) and
-	 * single-backed.  An existing=true element in a shared/in-memory graph would
-	 * already be discoverable, so the unlocked reset would drop its edges mid-update.
+	 * The unlocked phase-A forward writes below assume element is private to
+	 * this backend.  That holds for a fresh insert (existing=false) and for
+	 * the only existing=true caller (vacuum repair), which runs on-disk
+	 * (base==NULL) and single-backed.  An existing=true element in a
+	 * shared/in-memory graph would already be discoverable, so the unlocked
+	 * reset would drop its edges mid-update.
 	 */
 	Assert(base == NULL || !existing);
 
 	/*
-	 * 2nd phase A: per-layer search + select, storing the forward neighbors into
-	 * element's own (still-private) neighbor lists.  No reciprocal edges are added
-	 * here, so element stays undiscoverable to other workers' searches -- these
-	 * forward writes therefore need no lock.  Deferring the reciprocal connections
-	 * to phase B mirrors hnsw's split of HnswFindElementNeighbors (forward) from
-	 * UpdateNeighborsInMemory (reciprocal).  It is essential for the parallel
-	 * build: it guarantees element's own lists are COMPLETE before element is
-	 * published, so a concurrent worker never races this worker's unlocked forward
-	 * writes against its own locked TqhnswUpdateConnection(element, ...).
+	 * 2nd phase A: per-layer search + select, storing the forward neighbors
+	 * into element's own (still-private) neighbor lists.  No reciprocal edges
+	 * are added here, so element stays undiscoverable to other workers'
+	 * searches -- these forward writes therefore need no lock.  Deferring the
+	 * reciprocal connections to phase B mirrors hnsw's split of
+	 * HnswFindElementNeighbors (forward) from UpdateNeighborsInMemory
+	 * (reciprocal).  It is essential for the parallel build: it guarantees
+	 * element's own lists are COMPLETE before element is published, so a
+	 * concurrent worker never races this worker's unlocked forward writes
+	 * against its own locked TqhnswUpdateConnection(element, ...).
 	 */
 	for (lc = level; lc >= 0; lc--)
 	{
@@ -898,7 +918,10 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 
 		selected = TqhnswSelectNeighbors(base, lw, lm, dc, metric, NULL);
 
-		/* Store the forward neighbors (element -> selected) in element's own list. */
+		/*
+		 * Store the forward neighbors (element -> selected) in element's own
+		 * list.
+		 */
 		na = TqhnswGetNeighbors(base, element, lc);
 		na->count = 0;
 		foreach(lc2, selected)
@@ -915,15 +938,15 @@ TqhnswInsertElement(char *base, Relation index, const TqModel *model, HTAB *cach
 	}
 
 	/*
-	 * 2nd phase B: add the reciprocal edges (selected -> element).  Adding the
-	 * first reciprocal edge is what publishes element into the searchable graph,
-	 * so this must run only after ALL forward lists are complete (phase A).
-	 * Mirrors UpdateNeighborsInMemory: snapshot element's layer-lc list under its
-	 * shared lock (once element is discoverable, a concurrent insert may add a
-	 * reciprocal edge into element), then add element to each neighbor under that
-	 * neighbor's exclusive lock (taken inside TqhnswUpdateConnection).  Repair
-	 * (existing) skips this -- its reciprocity is written to disk by
-	 * TqhnswUpdateNeighborsOnDisk.
+	 * 2nd phase B: add the reciprocal edges (selected -> element).  Adding
+	 * the first reciprocal edge is what publishes element into the searchable
+	 * graph, so this must run only after ALL forward lists are complete
+	 * (phase A). Mirrors UpdateNeighborsInMemory: snapshot element's layer-lc
+	 * list under its shared lock (once element is discoverable, a concurrent
+	 * insert may add a reciprocal edge into element), then add element to
+	 * each neighbor under that neighbor's exclusive lock (taken inside
+	 * TqhnswUpdateConnection).  Repair (existing) skips this -- its
+	 * reciprocity is written to disk by TqhnswUpdateNeighborsOnDisk.
 	 */
 	if (!existing)
 	{

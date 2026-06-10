@@ -287,7 +287,7 @@ TqhnswResetNeighbors(TqhnswElement *element, int m)
  * The caller passes a fresh per-element cache rooted in ctx, with the element
  * and entry point already loaded into ctx via TqhnswLoadElement (so
  * element->rhat exists).  The cache must be rooted in a context that outlives
- * the cache itself (the use-after-free footgun from a prior session).
+ * the cache itself (else a later cache hit can return freed memory).
  *
  * entryPoint may be NULL: TqhnswInsertElement then leaves the element with an
  * empty neighbor list and an all-invalid neighbor tuple is written.
@@ -314,11 +314,12 @@ RepairGraphElement(TqhnswVacuumState *vs, TqhnswElement *element,
 
 	/*
 	 * Re-search the graph for this already-present element (existing=true:
-	 * skip self, exclude dead nodes from the beam, fill only forward neighbors).
+	 * skip self, exclude dead nodes from the beam, fill only forward
+	 * neighbors).
 	 */
-	TqhnswInsertElement(NULL /* base */, index, vs->model, cache, ctx,
+	TqhnswInsertElement(NULL /* base */ , index, vs->model, cache, ctx,
 						element, entryPoint, vs->m, vs->efConstruction,
-						vs->dimCodes, vs->metric, true /* existing */);
+						vs->dimCodes, vs->metric, true /* existing */ );
 
 	/* Build the new neighbor tuple and FULL-overwrite the on-disk tuple. */
 	ntup = palloc0(ntupSize);
@@ -378,9 +379,9 @@ RepairGraphEntryPoint(TqhnswVacuumState *vs)
 	cache = TqhnswCreateElementCache(vs->tmpCtx);
 
 	/*
-	 * Repair the highest surviving non-entry point.  It may be outdated due to
-	 * inserts during/after RemoveHeapTids; the SHARE lock blocks new inserts
-	 * from changing the entry point while we work.
+	 * Repair the highest surviving non-entry point.  It may be outdated due
+	 * to inserts during/after RemoveHeapTids; the SHARE lock blocks new
+	 * inserts from changing the entry point while we work.
 	 */
 	highestPoint = LoadByTid(vs, vs->highestBlkno, vs->highestOffno, cache, vs->tmpCtx);
 	if (highestPoint != NULL)
@@ -417,8 +418,8 @@ RepairGraphEntryPoint(TqhnswVacuumState *vs)
 		{
 			/*
 			 * The entry point is being deleted.  Replace it with the highest
-			 * surviving point (may be NULL -> empties the entry point until an
-			 * element is repaired).
+			 * surviving point (may be NULL -> empties the entry point until
+			 * an element is repaired).
 			 */
 			TqhnswUpdateMetaPage(index, highestPoint, TQHNSW_ENTRY_ALWAYS,
 								 InvalidBlockNumber);
@@ -431,12 +432,13 @@ RepairGraphEntryPoint(TqhnswVacuumState *vs)
 			{
 				/*
 				 * If we repaired highestPoint above, its in-memory neighbor
-				 * arrays now hold the freshly-selected (possibly partial) edges.
-				 * Reset every layer slot to NULL so the search below reloads the
-				 * authoritative edges from disk (mirrors hnswvacuum.c's
-				 * HnswPtrStore reset before reusing highestPoint as the entry
-				 * point).  The pointer array itself stays allocated so
-				 * TqhnswSearchLayer's per-layer NULL check is valid.
+				 * arrays now hold the freshly-selected (possibly partial)
+				 * edges. Reset every layer slot to NULL so the search below
+				 * reloads the authoritative edges from disk (mirrors
+				 * hnswvacuum.c's HnswPtrStore reset before reusing
+				 * highestPoint as the entry point).  The pointer array itself
+				 * stays allocated so TqhnswSearchLayer's per-layer NULL check
+				 * is valid.
 				 */
 				if (highestPoint != NULL && !TqhnswPtrIsNull(NULL, highestPoint->neighbors))
 				{
@@ -466,7 +468,7 @@ typedef struct TqhnswRepairItem
 {
 	BlockNumber blkno;
 	OffsetNumber offno;
-}			TqhnswRepairItem;
+} TqhnswRepairItem;
 
 /*
  * Repair the graph for all surviving elements.  Mirrors hnswvacuum.c RepairGraph:
@@ -545,10 +547,11 @@ RepairGraph(TqhnswVacuumState *vs)
 		UnlockReleaseBuffer(buf);
 
 		/*
-		 * Per-element repair context, child of tmpCtx, reset every iteration so
-		 * a page's element caches and their loaded neighborhoods do not pile up
-		 * within a single page sweep.  The `items` list and its TqhnswRepairItem
-		 * structs stay in vs->tmpCtx (page-level) so they survive these resets.
+		 * Per-element repair context, child of tmpCtx, reset every iteration
+		 * so a page's element caches and their loaded neighborhoods do not
+		 * pile up within a single page sweep.  The `items` list and its
+		 * TqhnswRepairItem structs stay in vs->tmpCtx (page-level) so they
+		 * survive these resets.
 		 */
 		repairCtx = AllocSetContextCreate(vs->tmpCtx,
 										  "tqhnsw vacuum repair element context",
@@ -567,12 +570,12 @@ RepairGraph(TqhnswVacuumState *vs)
 			LOCKMODE	lockmode = ShareLock;
 
 			/*
-			 * Reset the per-element context up front (rather than at the end) so
-			 * every exit path -- including the !NeedsUpdated `continue` below --
-			 * reclaims the prior iteration's cache and loads.  The cache and the
-			 * elements loaded through it both live in repairCtx, which outlives
-			 * the cache for the whole iteration and is only reset here, before
-			 * the next iteration begins.
+			 * Reset the per-element context up front (rather than at the end)
+			 * so every exit path -- including the !NeedsUpdated `continue`
+			 * below -- reclaims the prior iteration's cache and loads.  The
+			 * cache and the elements loaded through it both live in
+			 * repairCtx, which outlives the cache for the whole iteration and
+			 * is only reset here, before the next iteration begins.
 			 */
 			MemoryContextReset(repairCtx);
 
@@ -590,7 +593,10 @@ RepairGraph(TqhnswVacuumState *vs)
 			TqhnswGetMetaInfo(index, NULL, NULL, NULL, &entryBlkno, &entryOffno,
 							  &entryLevel, NULL, NULL);
 
-			/* Prevent concurrent inserts when likely updating the entry point. */
+			/*
+			 * Prevent concurrent inserts when likely updating the entry
+			 * point.
+			 */
 			if (!BlockNumberIsValid(entryBlkno) || entryLevel < 0 ||
 				element->level > entryLevel)
 			{
@@ -645,9 +651,9 @@ MarkDeleted(TqhnswVacuumState *vs)
 	Size		etupSize = TQHNSW_ELEMENT_TUPLE_SIZE(codesBytes);
 
 	/*
-	 * Wait for index scans to complete.  Scans before this point may reference
-	 * tuples about to be deleted; scans after this point will not, since the
-	 * graph has been repaired.
+	 * Wait for index scans to complete.  Scans before this point may
+	 * reference tuples about to be deleted; scans after this point will not,
+	 * since the graph has been repaired.
 	 */
 	LockPage(index, TQHNSW_SCAN_LOCK, ExclusiveLock);
 	UnlockPage(index, TQHNSW_SCAN_LOCK, ExclusiveLock);
@@ -666,7 +672,8 @@ MarkDeleted(TqhnswVacuumState *vs)
 
 		/*
 		 * ambulkdelete cannot delete entries from pages pinned by other
-		 * backends.  https://www.postgresql.org/docs/current/index-locking.html
+		 * backends.
+		 * https://www.postgresql.org/docs/current/index-locking.html
 		 */
 		LockBufferForCleanup(buf);
 

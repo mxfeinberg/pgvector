@@ -36,7 +36,7 @@ typedef struct TqivfScanResult
 {
 	double		dist;
 	ItemPointerData tid;
-}			TqivfScanResult;
+} TqivfScanResult;
 
 /*
  * Scan state.  Mirrors tqscan's TqScanOpaqueData (model, per-query LUT, exact
@@ -58,10 +58,13 @@ typedef struct TqivfScanOpaqueData
 	/* Per-query state (rebuilt on each rescan). */
 	float	   *lut;			/* dimCodes * nLevels */
 	uint8	   *lut8;			/* 8-bit query LUT for the block kernel */
-	float		lutBias;		/* affine recovery: mse = lutScale*sum + dc*lutBias */
+	float		lutBias;		/* affine recovery: mse = lutScale*sum +
+								 * dc*lutBias */
 	float		lutScale;
-	const TqTypeInfo *typeInfo;	/* tqivf type-info vtable (extractor + normalize) */
-	Datum		queryDatum;		/* native query (normalized for cosine), for rerank/probe */
+	const TqTypeInfo *typeInfo; /* tqivf type-info vtable (extractor +
+								 * normalize) */
+	Datum		queryDatum;		/* native query (normalized for cosine), for
+								 * rerank/probe */
 	bool		haveQuery;
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) for the LUT */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
@@ -86,12 +89,12 @@ typedef struct TqivfScanOpaqueData
 	pairingheap *listQueue;		/* max-heap during probe selection */
 	TqivfScanList *probeLists;	/* materialized, ascending distance */
 	int			nProbeLists;	/* number of entries in probeLists */
-	int			listIndex;		/* next probed list to score (Task 9 seam) */
+	int			listIndex;		/* next probed list to score (iterative scan) */
 
 	MemoryContext tmpCtx;
-}			TqivfScanOpaqueData;
+} TqivfScanOpaqueData;
 
-typedef TqivfScanOpaqueData * TqivfScanOpaque;
+typedef TqivfScanOpaqueData *TqivfScanOpaque;
 
 /*
  * qsort comparator: ascending distance.
@@ -291,8 +294,9 @@ TqivfGetScanLists(IndexScanDesc scan)
 
 	/*
 	 * Drain the max-heap into a temporary array (the heap nodes alias the
-	 * probeLists slots), then copy back in ascending distance order.  Removing
-	 * from a max-heap yields descending distance, so fill from the back.
+	 * probeLists slots), then copy back in ascending distance order.
+	 * Removing from a max-heap yields descending distance, so fill from the
+	 * back.
 	 */
 	{
 		TqivfScanList *ordered = palloc(listCount * sizeof(TqivfScanList));
@@ -367,13 +371,14 @@ TqivfScoreList(IndexScanDesc scan, TqivfScanList *L,
 			{
 				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
 				const uint8 *plane = so->haveQuery ?
-					(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
+				(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
 
 				if (!so->haveQuery)
 				{
 					/*
-					 * NULL order-by key: every distance is NULL, but rows must
-					 * still be returned (mirrors ivfflat's ZeroDistance path).
+					 * NULL order-by key: every distance is NULL, but rows
+					 * must still be returned (mirrors ivfflat's ZeroDistance
+					 * path).
 					 */
 					for (int j = 0; j < srec->nvecs; j++)
 					{
@@ -556,11 +561,11 @@ TqivfLoadBatch(IndexScanDesc scan)
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
 	/*
-	 * Estimate the initial capacity from the lists in this batch (nvectors is a
-	 * hint; the array grows by doubling in TqivfScoreList as needed).  Each
-	 * nvectors is a uint32 and the per-index cap is ~4.29B, so accumulate into a
-	 * 64-bit count; the allocation uses the huge variant since a large batch can
-	 * exceed MaxAllocSize.
+	 * Estimate the initial capacity from the lists in this batch (nvectors is
+	 * a hint; the array grows by doubling in TqivfScoreList as needed).  Each
+	 * nvectors is a uint32 and the per-index cap is ~4.29B, so accumulate
+	 * into a 64-bit count; the allocation uses the huge variant since a large
+	 * batch can exceed MaxAllocSize.
 	 */
 	batchEnd = Min(so->listIndex + so->probes, so->nProbeLists);
 	capacity = 0;
@@ -581,13 +586,14 @@ TqivfLoadBatch(IndexScanDesc scan)
 	 * and replace the estimate with the exact FUNCTION 1 distance.  Mirrors
 	 * tqscan's rerank block.
 	 *
-	 * Documented prototype tradeoff (inherited from tqflat): the reranked subset
-	 * carries an exact FUNCTION 1 distance while the rest carry the quantized
-	 * estimate; the two scales match exactly for L2 and IP, and for cosine the
-	 * exact -cos(q, x) is shifted by +1 below so it sorts on the estimate's
-	 * 1 - cos(q, x) scale -- the remaining difference is quantization error
-	 * only.  Distances are never surfaced to the caller (the AM does not set
-	 * xs_orderbyvals), so this affects only internal ordering.
+	 * Documented prototype tradeoff (inherited from tqflat): the reranked
+	 * subset carries an exact FUNCTION 1 distance while the rest carry the
+	 * quantized estimate; the two scales match exactly for L2 and IP, and for
+	 * cosine the exact -cos(q, x) is shifted by +1 below so it sorts on the
+	 * estimate's 1 - cos(q, x) scale -- the remaining difference is
+	 * quantization error only.  Distances are never surfaced to the caller
+	 * (the AM does not set xs_orderbyvals), so this affects only internal
+	 * ordering.
 	 */
 	if (tqivf_rerank > 0 && n > 0 && so->haveQuery &&
 		AttributeNumberIsValid(so->heapAttno))
@@ -618,9 +624,9 @@ TqivfLoadBatch(IndexScanDesc scan)
 													 so->queryDatum, cmpDatum));
 
 				/*
-				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while the
-				 * quantized estimate scale is 1 - cos; shift by 1 so the two
-				 * populations sort on the same scale in the final qsort.
+				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while
+				 * the quantized estimate scale is 1 - cos; shift by 1 so the
+				 * two populations sort on the same scale in the final qsort.
 				 */
 				if (so->metric == TQ_METRIC_COSINE)
 					d += 1.0;
@@ -774,9 +780,10 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->heapRel = NULL;
 
 	/*
-	 * Reset per-query allocations (LUT, queryDatum, results, probeLists, listQueue).
-	 * The model lives in rd_indexcxt and is unaffected.  listQueue lives in tmpCtx
-	 * and is freed by the reset, so re-allocate it afterward.
+	 * Reset per-query allocations (LUT, queryDatum, results, probeLists,
+	 * listQueue). The model lives in rd_indexcxt and is unaffected.
+	 * listQueue lives in tmpCtx and is freed by the reset, so re-allocate it
+	 * afterward.
 	 */
 	pairingheap_reset(so->listQueue);
 	MemoryContextReset(so->tmpCtx);
@@ -807,8 +814,9 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
 
 		/*
-		 * Cosine: normalize the NATIVE query (type-specific) so probe/rerank's
-		 * FUNCTION 1 sees a unit query and the float LUT is built from it.
+		 * Cosine: normalize the NATIVE query (type-specific) so
+		 * probe/rerank's FUNCTION 1 sees a unit query and the float LUT is
+		 * built from it.
 		 */
 		if (so->metric == TQ_METRIC_COSINE && so->typeInfo->normalize != NULL)
 			value = DirectFunctionCall1Coll(so->typeInfo->normalize, so->collation, value);
@@ -871,9 +879,9 @@ tqivfgettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	/*
-	 * Task-9 seam: when iterative scan is enabled, score the next batch of
-	 * probed lists once the current batch is exhausted.  With iterative scan
-	 * OFF, maxProbes == probes so the single batch covers every probed list and
+	 * When iterative scan is enabled, score the next batch of probed lists
+	 * once the current batch is exhausted.  With iterative scan OFF,
+	 * maxProbes == probes so the single batch covers every probed list and
 	 * this loop never re-enters.
 	 */
 	while (so->cursor >= so->nresults)

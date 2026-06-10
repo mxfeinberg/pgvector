@@ -35,9 +35,9 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 	TqEntry    *scratch = (TqEntry *) palloc(scratchSize);
 	const TqTypeInfo *ti = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
 	float	   *vscratch = palloc(sizeof(float) * model->dim);	/* freed with the
-																	 * caller's short-lived
-																	 * context (insertCtx /
-																	 * build tmpCtx reset) */
+																 * caller's short-lived
+																 * context (insertCtx /
+																 * build tmpCtx reset) */
 	const float *fv;
 
 	value = PointerGetDatum(PG_DETOAST_DATUM(value));
@@ -178,7 +178,10 @@ TqhnswFreeOffset(Relation index, Buffer buf, Page page, TqhnswElement *e,
 	OffsetNumber offno;
 	OffsetNumber maxoffno = PageGetMaxOffsetNumber(page);
 
-	/* Sizes must be aligned for the ItemIdGetLength >= size comparisons to be exact. */
+	/*
+	 * Sizes must be aligned for the ItemIdGetLength >= size comparisons to be
+	 * exact.
+	 */
 	Assert(etupSize == MAXALIGN(etupSize));
 	Assert(ntupSize == MAXALIGN(ntupSize));
 
@@ -217,9 +220,9 @@ TqhnswFreeOffset(Relation index, Buffer buf, Page page, TqhnswElement *e,
 		nitemid = PageGetItemId(*npage, neighborOffno);
 
 		/*
-		 * Deleted neighbor slot alone must fit the new neighbor tuple (slot-only /
-		 * conservative check — see function comment above for why we do not add
-		 * PageGetExactFreeSpace as HnswFreeOffset does).
+		 * Deleted neighbor slot alone must fit the new neighbor tuple
+		 * (slot-only / conservative check — see function comment above for
+		 * why we do not add PageGetExactFreeSpace as HnswFreeOffset does).
 		 */
 		if (ItemIdGetLength(nitemid) < ntupSize)
 		{
@@ -231,7 +234,8 @@ TqhnswFreeOffset(Relation index, Buffer buf, Page page, TqhnswElement *e,
 
 		*freeOffno = offno;
 		*freeNeighborOffno = neighborOffno;
-		*tupleVersion = etup->version;	/* carry version for iterative-scan correctness */
+		*tupleVersion = etup->version;	/* carry version for iterative-scan
+										 * correctness */
 		return true;
 	}
 	return false;
@@ -297,14 +301,15 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 	TqhnswSetNeighborTuple(ntup, e, m);
 
 	if (!BlockNumberIsValid(currentPage))
-		currentPage = firstElementPage;	/* may still be Invalid for an empty index */
+		currentPage = firstElementPage; /* may still be Invalid for an empty
+										 * index */
 
 	if (!BlockNumberIsValid(currentPage))
 	{
 		/*
 		 * Empty index: allocate the first element page.  Never reuse block 1
-		 * (the codebook page).  Record the new block so the caller can persist
-		 * firstElementPage and insertPage in the meta.
+		 * (the codebook page).  Record the new block so the caller can
+		 * persist firstElementPage and insertPage in the meta.
 		 */
 		LockRelationForExtension(index, ExclusiveLock);
 		buf = TqNewBuffer(index, MAIN_FORKNUM);
@@ -367,9 +372,9 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 			}
 
 			/*
-			 * Try to reuse a deleted element slot on this page.  Since no tuple
-			 * currently has deleted=1 this always returns false; it becomes live
-			 * once tqhnsw vacuum lands.
+			 * Try to reuse a deleted element slot on this page.  Since no
+			 * tuple currently has deleted=1 this always returns false; it
+			 * becomes live once tqhnsw vacuum lands.
 			 */
 			if (TqhnswFreeOffset(index, buf, page, e, etupSize, ntupSize,
 								 &nbuf, &npage,
@@ -384,7 +389,10 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 				break;
 			}
 
-			/* Element only, if both can't share a page and this is the last page. */
+			/*
+			 * Element only, if both can't share a page and this is the last
+			 * page.
+			 */
 			if (combinedSize > maxSize && PageGetFreeSpace(page) >= etupSize &&
 				!BlockNumberIsValid(TqhnswPageGetOpaque(page)->nextblkno))
 			{
@@ -427,7 +435,7 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 				break;
 			}
 		}
-	}	/* end if/else empty-index vs normal page walk */
+	}							/* end if/else empty-index vs normal page walk */
 
 	e->blkno = BufferGetBlockNumber(buf);
 	e->neighborPage = BufferGetBlockNumber(nbuf);
@@ -442,7 +450,10 @@ TqhnswAddElementOnDisk(Relation index, TqhnswElement *e, int m, int codesBytes,
 		e->offno = freeOffno;
 		e->neighborOffno = freeNeighborOffno;
 
-		/* Carry the deleted tuple's version so iterative-scan cursors stay valid. */
+		/*
+		 * Carry the deleted tuple's version so iterative-scan cursors stay
+		 * valid.
+		 */
 		etup->version = tupleVersion;
 		ntup->version = tupleVersion;
 	}
@@ -540,10 +551,10 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 	MemoryContext oldCtx = MemoryContextSwitchTo(updateCtx);
 
 	/*
-	 * Load the neighbor's current layer-lc edges (SHARE).  TqhnswLoadNeighbors
-	 * assigns the freshly loaded array (in updateCtx) to
-	 * neighborElement->neighbors[lc]; since this is a cache-shared element and
-	 * updateCtx is reset between neighbors, save and restore the original
+	 * Load the neighbor's current layer-lc edges (SHARE).
+	 * TqhnswLoadNeighbors assigns the freshly loaded array (in updateCtx) to
+	 * neighborElement->neighbors[lc]; since this is a cache-shared element
+	 * and updateCtx is reset between neighbors, save and restore the original
 	 * pointer so we never leave a dangling array on, or otherwise mutate, the
 	 * cached element's authoritative neighbor state (FIX 2).
 	 */
@@ -559,16 +570,16 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 	{
 		/*
 		 * Full: run the prune in a LOCAL scratch element so neighborElement's
-		 * cached neighbor array is never mutated (FIX 2).  The scratch element
-		 * shares neighborElement's rhat (used only for distance) and carries a
-		 * private neighbor slice seeded from the loaded edges.
+		 * cached neighbor array is never mutated (FIX 2).  The scratch
+		 * element shares neighborElement's rhat (used only for distance) and
+		 * carries a private neighbor slice seeded from the loaded edges.
 		 */
 		TqhnswElement scratch;
 		TqhnswNeighborArray *sna;
 		int			i;
 
 		TqhnswPtrStore(NULL, scratch.rhat, TqhnswPtrAccess(NULL, neighborElement->rhat));
-		scratch.level = (uint8) lc;		/* neighbors[] sized [0..lc] */
+		scratch.level = (uint8) lc; /* neighbors[] sized [0..lc] */
 		LWLockInitialize(&scratch.lock, tqhnsw_lock_tranche_id);
 		sna = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
 		sna->count = na->count;
@@ -591,10 +602,11 @@ GetUpdateIndex(Relation index, const TqModel *model, TqMetric metric, HTAB *cach
 		}
 
 		/*
-		 * Re-select with newElement competing.  TqhnswUpdateConnection replaces
-		 * the pruned-out item IN PLACE and sets idx to its index in the
-		 * loaded (on-disk slot order) slice -- the index the single-slot disk
-		 * write below needs.  If newElement loses the prune, idx stays -1.
+		 * Re-select with newElement competing.  TqhnswUpdateConnection
+		 * replaces the pruned-out item IN PLACE and sets idx to its index in
+		 * the loaded (on-disk slot order) slice -- the index the single-slot
+		 * disk write below needs.  If newElement loses the prune, idx stays
+		 * -1.
 		 */
 		TqhnswUpdateConnection(NULL, &scratch, newElement, distance, lm, lc,
 							   dc, metric, &idx);
@@ -850,9 +862,10 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	/*
 	 * Take a shared page lock for the whole insert.  This lets a future
 	 * graph-mutating vacuum (#2) drain in-flight inserts before repairing the
-	 * graph.  A page lock is used so it does not interfere with buffer locks (or
-	 * reads while vacuuming).  Upgraded to ExclusiveLock below when this insert
-	 * may change the entry point.  Mirrors hnswinsert.c HnswInsertTupleOnDisk.
+	 * graph.  A page lock is used so it does not interfere with buffer locks
+	 * (or reads while vacuuming).  Upgraded to ExclusiveLock below when this
+	 * insert may change the entry point.  Mirrors hnswinsert.c
+	 * HnswInsertTupleOnDisk.
 	 */
 	LockPage(index, TQHNSW_UPDATE_LOCK, lockmode);
 
@@ -866,8 +879,8 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	/*
 	 * Prevent concurrent inserts when this element may change the entry point
 	 * (empty index, or its level exceeds the current entry level) -- the same
-	 * condition HNSW uses.  Re-read the entry point after the upgrade since it
-	 * may have advanced while we held only the shared lock.
+	 * condition HNSW uses.  Re-read the entry point after the upgrade since
+	 * it may have advanced while we held only the shared lock.
 	 */
 	if (!BlockNumberIsValid(entryBlkno) || entryLevel < 0 ||
 		newElement->level > entryLevel)
@@ -883,8 +896,9 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 	if (!BlockNumberIsValid(entryBlkno) || entryLevel < 0)
 	{
 		/*
-		 * Empty index: the new element becomes the sole node and the entry point.
-		 * Its neighbor tuple is all-invalid (no forward links to write).
+		 * Empty index: the new element becomes the sole node and the entry
+		 * point. Its neighbor tuple is all-invalid (no forward links to
+		 * write).
 		 */
 		TqhnswAddElementOnDisk(index, newElement, m, codesBytes,
 							   insertPage, firstElementPage, &updatedInsertPage);
@@ -894,7 +908,10 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 		return;
 	}
 
-	/* Non-empty: materialize the entry point and run Alg 1 over the disk graph. */
+	/*
+	 * Non-empty: materialize the entry point and run Alg 1 over the disk
+	 * graph.
+	 */
 	{
 		ItemPointerData entryTid;
 		TqhnswElement *entryPoint;
@@ -903,9 +920,9 @@ TqhnswInsertTupleOnDisk(Relation index, const TqModel *model, TqMetric metric,
 		entryPoint = TqhnswLoadElement(index, model, metric, &entryTid,
 									   insertCtx, cache);
 
-		TqhnswInsertElement(NULL /* base */, index, model, cache, insertCtx,
+		TqhnswInsertElement(NULL /* base */ , index, model, cache, insertCtx,
 							newElement, entryPoint, m, efConstruction, dimCodes,
-							metric, false /* existing */);
+							metric, false /* existing */ );
 	}
 
 	/* Write the new element (forward links from newElement->neighbors). */
@@ -940,8 +957,9 @@ tqhnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 	/*
 	 * Unlike hnsw, the on-disk insert path takes element LWLocks, so the
-	 * tranche must be valid here too.  Under shared_preload_libraries _PG_init
-	 * skips registration; do it lazily on first use (0 = never assigned).
+	 * tranche must be valid here too.  Under shared_preload_libraries
+	 * _PG_init skips registration; do it lazily on first use (0 = never
+	 * assigned).
 	 */
 	if (tqhnsw_lock_tranche_id == 0)
 		TqhnswInitLockTranche();
