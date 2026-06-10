@@ -424,6 +424,8 @@ TqEncode(const TqModel *model, const float *vec, TqEntry *entry)
 		double		rnorm;
 		double		rinv;
 
+		Assert(codeOf != NULL);
+
 		rnorm = 0.0;
 		for (i = 0; i < dc; i++)
 		{

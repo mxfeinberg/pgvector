@@ -6,7 +6,11 @@ CREATE INDEX tqivf_s_idx ON tqivf_s USING tqivf (v vector_l2_ops) WITH (lists = 
 
 SET tqivf.probes = 10;
 SET tqivf.rerank = 100;
-SELECT id FROM tqivf_s ORDER BY v <-> '[5,0,0,0]' LIMIT 5;
+-- The 5 nearest to [5,0,0,0] are {5,4,6,3,7} (distances 0,1,1,2,2 -> two
+-- exact-distance ties).  Re-sort by id so the tie order is deterministic.
+SELECT id FROM (
+  SELECT id FROM tqivf_s ORDER BY v <-> '[5,0,0,0]' LIMIT 5
+) q ORDER BY id;
 
 CREATE TABLE tqivf_e (v vector(4));
 CREATE INDEX tqivf_e_idx ON tqivf_e USING tqivf (v vector_l2_ops) WITH (lists = 2);
@@ -34,7 +38,10 @@ INSERT INTO tqivf_ins SELECT g, ARRAY[g,0,0,0]::real[]::vector FROM generate_ser
 CREATE INDEX ON tqivf_ins USING tqivf (v vector_l2_ops) WITH (lists = 5);
 SET tqivf.probes = 5;
 INSERT INTO tqivf_ins VALUES (999, '[3,0,0,0]');
-SELECT id FROM tqivf_ins ORDER BY v <-> '[3,0,0,0]' LIMIT 2;
+-- ids 3 and 999 are both at distance 0 (a tie); re-sort by id.
+SELECT id FROM (
+  SELECT id FROM tqivf_ins ORDER BY v <-> '[3,0,0,0]' LIMIT 2
+) q ORDER BY id;
 DROP TABLE tqivf_ins;
 
 -- Iterative scan: probes=1 with many tiny lists; relaxed_order must probe more

@@ -15,8 +15,8 @@ VACUUM tqhnsw_vac;
 -- The plan still uses the tqhnsw index scan after vacuum.
 EXPLAIN (COSTS OFF) SELECT id FROM tqhnsw_vac ORDER BY v <-> '[5,0,0,0]' LIMIT 3;
 
--- After deleting 4,5,6 the nearest to [5,0,0,0] are {3,7} (dist 4) then {2,8}
--- (dist 9).  LIMIT 4 captures both tie pairs so the tie does not straddle the
+-- After deleting 4,5,6 the nearest to [5,0,0,0] are {3,7} (dist 2) then {2,8}
+-- (dist 3).  LIMIT 4 captures both tie pairs so the tie does not straddle the
 -- cutoff; re-sort by id for determinism.  Proves 4,5,6 are ABSENT and the index
 -- returns the planted survivors {2,3,7,8}.
 SELECT id FROM (
@@ -46,12 +46,14 @@ SELECT id FROM (
 -- Count after reinsert (191 + 3 = 194).
 SELECT count(*) FROM tqhnsw_vac;  -- 194
 
--- A second vacuum after reinsert must also be clean.
+-- A second vacuum after reinsert must also be clean.  After deleting 100 the
+-- nearest to [100,0,0,0] are {99,101} (dist 1) then the TIE {98,102} (dist 2);
+-- LIMIT 4 captures both tie pairs so the tie does not straddle the cutoff.
 DELETE FROM tqhnsw_vac WHERE id = 100;
 VACUUM tqhnsw_vac;
 SELECT id FROM (
-  SELECT id FROM tqhnsw_vac ORDER BY v <-> '[100,0,0,0]' LIMIT 3
+  SELECT id FROM tqhnsw_vac ORDER BY v <-> '[100,0,0,0]' LIMIT 4
 ) q ORDER BY id;
--- expect: 99,101,102 (100 absent)
+-- expect: 98,99,101,102 (100 absent)
 
 DROP TABLE tqhnsw_vac;

@@ -19,12 +19,6 @@
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
 #endif
 
-#if defined(_WIN32) || defined(_WIN64)
-#define FUNCTION_PREFIX PGDLLEXPORT
-#else
-#define FUNCTION_PREFIX
-#endif
-
 int			tqhnsw_ef_search;
 int			tqhnsw_rerank;
 bool		tqhnsw_force_scalar;

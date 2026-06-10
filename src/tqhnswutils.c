@@ -3,7 +3,6 @@
 #include <math.h>
 
 #include "common/hashfn.h"
-#include "common/pg_prng.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "storage/bufmgr.h"
@@ -147,6 +146,8 @@ TqhnswBuildDistance(const float *a, const float *b, int dc, TqMetric metric)
 {
 	double		acc = 0.0;
 	int			i;
+
+	Assert(a != NULL && b != NULL);
 
 	if (metric == TQ_METRIC_L2)
 	{
@@ -471,13 +472,20 @@ static bool
 CheckElementCloser(char *base, TqhnswCandidate *e, List *r, int dc, TqMetric metric)
 {
 	ListCell   *lc2;
+	TqhnswElement *eElement = TqhnswPtrAccess(base, e->element);
+
+	Assert(eElement != NULL);
 
 	foreach(lc2, r)
 	{
 		TqhnswCandidate *ri = lfirst(lc2);
-		double		distance = TqhnswBuildDistance(TqhnswPtrAccess(base, TqhnswPtrAccess(base, e->element)->rhat),
-												   TqhnswPtrAccess(base, TqhnswPtrAccess(base, ri->element)->rhat),
-												   dc, metric);
+		TqhnswElement *riElement = TqhnswPtrAccess(base, ri->element);
+		double		distance;
+
+		Assert(riElement != NULL);
+		distance = TqhnswBuildDistance(TqhnswPtrAccess(base, eElement->rhat),
+									   TqhnswPtrAccess(base, riElement->rhat),
+									   dc, metric);
 
 		if (distance <= e->distance)
 			return false;
@@ -669,12 +677,15 @@ TqhnswElement *
 TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 				  ItemPointer tid, MemoryContext ctx, HTAB *cache)
 {
+	char	   *base = NULL;
 	bool		found;
 	TqhnswElementCacheEntry *entry;
 	TqhnswElement *e;
 	Buffer		buf;
 	Page		page;
 	TqhnswElementTuple etup;
+	char	   *codes;
+	float	   *rhat;
 	int			codesBytes = TQ_CODES_BYTES(model->dimCodes, model->bits);
 	MemoryContext old;
 
@@ -702,20 +713,22 @@ TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 	e->offno = ItemPointerGetOffsetNumber(tid);
 	e->neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 	e->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
-	TqhnswPtrStore(NULL, e->codes, (char *) palloc(codesBytes));
-	memcpy(TqhnswPtrAccess(NULL, e->codes), etup->codes, codesBytes);
+	codes = (char *) palloc(codesBytes);
+	memcpy(codes, etup->codes, codesBytes);
+	TqhnswPtrStore(base, e->codes, codes);
 
 	UnlockReleaseBuffer(buf);
 
-	TqhnswPtrStore(NULL, e->rhat, (float *) palloc(sizeof(float) * model->dimCodes));
-	TqhnswReconstruct(model, TqhnswPtrAccess(NULL, e->codes), e->norm, e->scale, TqhnswPtrAccess(NULL, e->rhat));
+	rhat = (float *) palloc(sizeof(float) * model->dimCodes);
+	TqhnswPtrStore(base, e->rhat, rhat);
+	TqhnswReconstruct(model, codes, e->norm, e->scale, rhat);
 
 	/* Cosine: unit-normalize rhat so -IP orders by cosine (mirrors build). */
 	if (metric == TQ_METRIC_COSINE)
-		TqhnswNormalizeRhat(TqhnswPtrAccess(NULL, e->rhat), model->dimCodes);
+		TqhnswNormalizeRhat(rhat, model->dimCodes);
 
 	/* Neighbor arrays populated lazily per layer by TqhnswLoadNeighbors. */
-	TqhnswPtrStore(NULL, e->neighbors,
+	TqhnswPtrStore(base, e->neighbors,
 				   (TqhnswNeighborArrayPtr *) palloc0(sizeof(TqhnswNeighborArrayPtr) * (e->level + 1)));
 
 	MemoryContextSwitchTo(old);
@@ -734,6 +747,7 @@ TqhnswNeighborArray *
 TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 					TqhnswElement *element, int lc, int m, MemoryContext ctx)
 {
+	char	   *base = NULL;
 	Buffer		buf;
 	Page		page;
 	TqhnswNeighborTuple ntup;
@@ -774,9 +788,9 @@ TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 	MemoryContextSwitchTo(old);
 
 	{
-		TqhnswNeighborArrayPtr *neighborList = TqhnswPtrAccess(NULL, element->neighbors);
+		TqhnswNeighborArrayPtr *neighborList = TqhnswPtrAccess(base, element->neighbors);
 
-		TqhnswPtrStore(NULL, neighborList[lc], na);
+		TqhnswPtrStore(base, neighborList[lc], na);
 	}
 	return na;
 }
@@ -793,13 +807,14 @@ TqhnswLoadNeighbors(Relation index, const TqModel *model, TqMetric metric,
 static List *
 TqhnswRemoveElements(List *w, TqhnswElement *skipElement)
 {
+	char	   *base = NULL;
 	ListCell   *lc2;
 	List	   *w2 = NIL;
 
 	foreach(lc2, w)
 	{
 		TqhnswCandidate *hc = (TqhnswCandidate *) lfirst(lc2);
-		TqhnswElement *hce = TqhnswPtrAccess(NULL, hc->element);
+		TqhnswElement *hce = TqhnswPtrAccess(base, hc->element);
 
 		if (skipElement != NULL &&
 			hce->blkno == skipElement->blkno && hce->offno == skipElement->offno)

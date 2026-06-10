@@ -140,8 +140,12 @@ extern void tqivfbuildempty(Relation index);
 PGDLLEXPORT void TqivfParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 extern bool tqivfinsert(Relation index, Datum *values, bool *isnull,
 						ItemPointer heap_tid, Relation heap,
-						IndexUniqueCheck checkUnique,
-						bool indexUnchanged, struct IndexInfo *indexInfo);
+						IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+						,bool indexUnchanged
+#endif
+						,struct IndexInfo *indexInfo
+);
 extern TqModel *TqivfGetCachedModel(Relation index);
 
 /* ---- tqivfscan.c ---- */

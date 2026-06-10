@@ -20,8 +20,12 @@ SET tqivf.probes = 10;
 DELETE FROM tqivf_v WHERE id = 5;
 VACUUM tqivf_v;
 
--- id 5 must NOT appear; nearest to [5,0,0,0] should be 4 and 6 (dist 1).
-SELECT id FROM tqivf_v ORDER BY v <-> '[5,0,0,0]' LIMIT 3;
+-- id 5 must NOT appear; nearest to [5,0,0,0] are {4,6} (dist 1) then the TIE
+-- {3,7} (dist 2).  LIMIT 4 captures both tie pairs so the tie does not
+-- straddle the cutoff; re-sort by id.
+SELECT id FROM (
+  SELECT id FROM tqivf_v ORDER BY v <-> '[5,0,0,0]' LIMIT 4
+) q ORDER BY id;
 
 -- Confirm id 5 is absent from the top-10.
 SELECT count(*) AS deleted_id_5_count
@@ -30,8 +34,10 @@ SELECT count(*) AS deleted_id_5_count
 
 VACUUM FULL tqivf_v;
 
--- After VACUUM FULL (rebuild), id 5 still absent.
-SELECT id FROM tqivf_v ORDER BY v <-> '[5,0,0,0]' LIMIT 3;
+-- After VACUUM FULL (rebuild), id 5 still absent (same tie-safe shape).
+SELECT id FROM (
+  SELECT id FROM tqivf_v ORDER BY v <-> '[5,0,0,0]' LIMIT 4
+) q ORDER BY id;
 
 SELECT count(*) AS deleted_id_5_count_after_full
 	FROM (SELECT id FROM tqivf_v ORDER BY v <-> '[5,0,0,0]' LIMIT 10) s

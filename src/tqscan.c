@@ -345,7 +345,7 @@ TqHeapFetchDatum(IndexScanDesc scan, TqScanOpaque so, ItemPointer tid)
 		else
 			so->heapRel = heap;
 
-		so->fetch = table_index_fetch_begin(heap);
+		so->fetch = TqTableIndexFetchBegin(heap);
 		so->slot = table_slot_create(heap, NULL);
 	}
 

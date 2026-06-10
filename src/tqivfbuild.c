@@ -7,6 +7,7 @@
 #include "access/parallel.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
@@ -23,11 +24,15 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplesort.h"
-#include "utils/wait_event.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
+#endif
+
+#if PG_VERSION_NUM >= 140000
+#include "utils/backend_status.h"
+#include "utils/wait_event.h"
 #endif
 
 #define PARALLEL_KEY_TQIVF_SHARED		UINT64CONST(0xB000000000000001)
@@ -203,7 +208,7 @@ TqIvfCodeAppend(Relation index, ForkNumber forkNum, TqivfListCursor *cur,
 		if (chunk > nbytes - offset)
 			chunk = nbytes - offset;
 
-		offno = PageAddItem(cur->codePage, (Item) (bytes + offset), chunk,
+		offno = PageAddItem(cur->codePage, (Pointer) (bytes + offset), chunk,
 							InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 			elog(ERROR, "failed to add code-plane item to \"%s\"", RelationGetRelationName(index));
@@ -234,7 +239,7 @@ TqIvfAppendSideRec(Relation index, ForkNumber forkNum, TqivfListCursor *cur,
 		TqAppendPage(index, &cur->sideBuf, &cur->sidePage, &cur->sideState, forkNum,
 					 TQIVF_PAGE_ID);
 
-	offno = PageAddItem(cur->sidePage, (Item) rec, sizeof(TqBlockSideRec),
+	offno = PageAddItem(cur->sidePage, (Pointer) rec, sizeof(TqBlockSideRec),
 						InvalidOffsetNumber, false, false);
 	if (offno == InvalidOffsetNumber)
 		elog(ERROR, "failed to add tqivf side record to \"%s\"",
@@ -994,7 +999,7 @@ TqivfCreateListPages(TqivfBuildState *buildstate)
 		if (PageGetFreeSpace(page) < listSize)
 			TqAppendPage(index, &buf, &page, &state, forkNum, TQIVF_PAGE_ID);
 
-		offno = PageAddItem(page, (Item) list, listSize, InvalidOffsetNumber, false, false);
+		offno = PageAddItem(page, (Pointer) list, listSize, InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 			elog(ERROR, "failed to add tqivf list item to \"%s\"", RelationGetRelationName(index));
 
@@ -1434,8 +1439,12 @@ tqivfbuildempty(Relation index)
  */
 bool
 tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
-			Relation heap, IndexUniqueCheck checkUnique, bool indexUnchanged,
-			struct IndexInfo *indexInfo)
+			Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+			,bool indexUnchanged
+#endif
+			,struct IndexInfo *indexInfo
+)
 {
 	TqModel    *model;
 	Datum		vecDatum;
@@ -1631,7 +1640,7 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			newpage = GenericXLogRegisterBuffer(newstate, newbuf, GENERIC_XLOG_FULL_IMAGE);
 			TqInitPage(newbuf, newpage, TQIVF_PAGE_ID);
 
-			offno = PageAddItem(newpage, (Item) entry, entrySize,
+			offno = PageAddItem(newpage, (Pointer) entry, entrySize,
 								InvalidOffsetNumber, false, false);
 			if (offno == InvalidOffsetNumber)
 			{
@@ -1645,9 +1654,9 @@ tqivfinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			UnlockReleaseBuffer(newbuf);
 
 			/*
-			 * Now take the directory lock and try to claim tailStart.
-			 * Another session may have won the race and already set tailStart
-			 * while we were allocating and writing newblk.
+			 * Now take the directory lock and try to claim tailStart. Another
+			 * session may have won the race and already set tailStart while
+			 * we were allocating and writing newblk.
 			 */
 			{
 				Buffer		dbuf;
@@ -1720,7 +1729,7 @@ append_to_existing_chain:
 				if (PageGetFreeSpace(page) >= entrySize)
 				{
 					/* Room on this page. */
-					offno = PageAddItem(page, (Item) entry, entrySize,
+					offno = PageAddItem(page, (Pointer) entry, entrySize,
 										InvalidOffsetNumber, false, false);
 					if (offno == InvalidOffsetNumber)
 					{
@@ -1785,7 +1794,7 @@ append_to_existing_chain:
 					buf = newbuf;
 					page = GenericXLogRegisterBuffer(state, buf, 0);
 
-					offno = PageAddItem(page, (Item) entry, entrySize,
+					offno = PageAddItem(page, (Pointer) entry, entrySize,
 										InvalidOffsetNumber, false, false);
 					if (offno == InvalidOffsetNumber)
 					{
@@ -1798,7 +1807,6 @@ append_to_existing_chain:
 					GenericXLogFinish(state);
 					UnlockReleaseBuffer(buf);
 
-					insertPage = newblkno;
 					newTailInsertPage = newblkno;
 					dirtyDir = true;
 					break;

@@ -182,7 +182,7 @@ TqivfHeapFetchDatum(IndexScanDesc scan, TqivfScanOpaque so, ItemPointer tid)
 		else
 			so->heapRel = heap;
 
-		so->fetch = table_index_fetch_begin(heap);
+		so->fetch = TqTableIndexFetchBegin(heap);
 		so->slot = table_slot_create(heap, NULL);
 	}
 
@@ -294,9 +294,8 @@ TqivfGetScanLists(IndexScanDesc scan)
 
 	/*
 	 * Drain the max-heap into a temporary array (the heap nodes alias the
-	 * probeLists slots), then copy back in ascending distance order.
-	 * Removing from a max-heap yields descending distance, so fill from the
-	 * back.
+	 * probeLists slots), then copy back in ascending distance order. Removing
+	 * from a max-heap yields descending distance, so fill from the back.
 	 */
 	{
 		TqivfScanList *ordered = palloc(listCount * sizeof(TqivfScanList));
@@ -781,9 +780,8 @@ tqivfrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 	/*
 	 * Reset per-query allocations (LUT, queryDatum, results, probeLists,
-	 * listQueue). The model lives in rd_indexcxt and is unaffected.
-	 * listQueue lives in tmpCtx and is freed by the reset, so re-allocate it
-	 * afterward.
+	 * listQueue). The model lives in rd_indexcxt and is unaffected. listQueue
+	 * lives in tmpCtx and is freed by the reset, so re-allocate it afterward.
 	 */
 	pairingheap_reset(so->listQueue);
 	MemoryContextReset(so->tmpCtx);

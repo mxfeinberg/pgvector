@@ -260,7 +260,7 @@ TqWriteBytes(Relation index, ForkNumber forkNum, const char *bytes, Size nbytes,
 		if (chunk > nbytes - offset)
 			chunk = nbytes - offset;
 
-		offno = PageAddItem(page, (Item) (bytes + offset), chunk,
+		offno = PageAddItem(page, (Pointer) (bytes + offset), chunk,
 							InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 			elog(ERROR, "failed to add side-page item to \"%s\"", RelationGetRelationName(index));
@@ -326,7 +326,7 @@ TqCodeAppend(TqBuildState *buildstate, const char *bytes, Size nbytes)
 		if (chunk > nbytes - offset)
 			chunk = nbytes - offset;
 
-		offno = PageAddItem(buildstate->codePage, (Item) (bytes + offset), chunk,
+		offno = PageAddItem(buildstate->codePage, (Pointer) (bytes + offset), chunk,
 							InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 			elog(ERROR, "failed to add code-plane item to \"%s\"", RelationGetRelationName(index));
@@ -495,10 +495,10 @@ TqBuildModelAndSidePages(TqBuildState *buildstate, BlockNumber *rotStart,
 	 * ~= qjlScale * ||r|| * <S q, sign(S r)> is unbiased for a DENSE Gaussian
 	 * sketch S iff qjlScale = sqrt(pi/2)/dimPadded (dimPadded == dimCodes
 	 * here; derived from E[X sign(Y)] = sqrt(2/pi) Cov(X,Y)/sqrt(Var(Y)) for
-	 * jointly Gaussian (X,Y), summed over dimPadded QJL coordinates).
-	 * Matches turboquant TurboQuantProd.qjl_scale.  NOTE: in fast mode the
-	 * structured RHT sketch is not i.i.d. Gaussian, so this estimate is
-	 * biased (see the note in TqEncode); tq_prod defaults off accordingly.
+	 * jointly Gaussian (X,Y), summed over dimPadded QJL coordinates). Matches
+	 * turboquant TurboQuantProd.qjl_scale.  NOTE: in fast mode the structured
+	 * RHT sketch is not i.i.d. Gaussian, so this estimate is biased (see the
+	 * note in TqEncode); tq_prod defaults off accordingly.
 	 */
 	if (buildstate->tqProd)
 	{
@@ -550,7 +550,7 @@ TqAppendSideRec(TqBuildState *buildstate, BlockNumber *sideStart,
 		TqAppendPage(index, &buildstate->sideBuf, &buildstate->sidePage,
 					 &buildstate->sideState, buildstate->forkNum, TQ_PAGE_ID);
 
-	offno = PageAddItem(buildstate->sidePage, (Item) rec, sizeof(TqBlockSideRec),
+	offno = PageAddItem(buildstate->sidePage, (Pointer) rec, sizeof(TqBlockSideRec),
 						InvalidOffsetNumber, false, false);
 	if (offno == InvalidOffsetNumber)
 		elog(ERROR, "failed to add tqflat side record to \"%s\"",
@@ -917,8 +917,12 @@ TqFindInsertPage(Relation index, BlockNumber dataStart)
 bool
 tqinsert(Relation index, Datum *values, bool *isnull,
 		 ItemPointer heap_tid, Relation heap,
-		 IndexUniqueCheck checkUnique,
-		 bool indexUnchanged, struct IndexInfo *indexInfo)
+		 IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+		 ,bool indexUnchanged
+#endif
+		 ,struct IndexInfo *indexInfo
+)
 {
 	TqModel    *model;
 	TqEntry    *entry;
@@ -1008,7 +1012,7 @@ tqinsert(Relation index, Datum *values, bool *isnull,
 		newpage = GenericXLogRegisterBuffer(newstate, newbuf, GENERIC_XLOG_FULL_IMAGE);
 		TqInitPage(newbuf, newpage, TQ_PAGE_ID);
 		TqPageGetOpaque(newpage)->nextblkno = InvalidBlockNumber;
-		offno = PageAddItem(newpage, (Item) entry, entrySize,
+		offno = PageAddItem(newpage, (Pointer) entry, entrySize,
 							InvalidOffsetNumber, false, false);
 		if (offno == InvalidOffsetNumber)
 		{
@@ -1089,7 +1093,7 @@ append_entry:
 		if (PageGetFreeSpace(page) >= entrySize)
 		{
 			/* Entry fits on this page */
-			offno = PageAddItem(page, (Item) entry, entrySize,
+			offno = PageAddItem(page, (Pointer) entry, entrySize,
 								InvalidOffsetNumber, false, false);
 			if (offno == InvalidOffsetNumber)
 			{
@@ -1149,7 +1153,7 @@ append_entry:
 			buf = newbuf;
 			page = GenericXLogRegisterBuffer(state, buf, 0);
 
-			offno = PageAddItem(page, (Item) entry, entrySize,
+			offno = PageAddItem(page, (Pointer) entry, entrySize,
 								InvalidOffsetNumber, false, false);
 			if (offno == InvalidOffsetNumber)
 			{
@@ -1161,8 +1165,6 @@ append_entry:
 
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(buf);
-
-			insertPage = newblkno;
 			break;
 		}
 	}

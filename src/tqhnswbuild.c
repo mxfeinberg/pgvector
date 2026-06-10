@@ -9,7 +9,6 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "commands/progress.h"
-#include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
@@ -17,10 +16,15 @@
 #include "storage/condition_variable.h"
 #include "tcop/tcopprot.h"
 #include "tqhnsw.h"
-#include "utils/backend_progress.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+
+#if PG_VERSION_NUM >= 140000
+#include "utils/backend_progress.h"
+#include "utils/backend_status.h"
+#include "utils/wait_event.h"
+#endif
 
 #define PARALLEL_KEY_TQHNSW_SHARED		UINT64CONST(0xB000000000000001)
 #define PARALLEL_KEY_TQHNSW_AREA		UINT64CONST(0xB000000000000002)
@@ -285,7 +289,7 @@ TqhnswWriteEmptyIndex(Relation index, ForkNumber forkNum)
 int
 TqhnswRandomLevel(double ml, int maxLevel)
 {
-	int			level = (int) (-log(pg_prng_double(&pg_global_prng_state)) * ml);
+	int			level = (int) (-log(TqhnswRandomDouble()) * ml);
 
 	if (level > maxLevel)
 		level = maxLevel;
@@ -443,18 +447,22 @@ TqhnswInsertTuple(TqhnswBuildState *buildstate, Datum value, ItemPointer tid)
 											 buildstate->metric,
 											 buildstate->vecScratch, buildstate->dim);
 
+		char	   *codes;
+		float	   *rhat;
+
 		memset(buildstate->scratch, 0, buildstate->scratchSize);
 		TqEncode(model, fv, buildstate->scratch);
 		element->norm = buildstate->scratch->norm;
 		element->scale = buildstate->scratch->scale;
-		memcpy(TqhnswPtrAccess(base, element->codes), buildstate->scratch->data,
-			   buildstate->codesBytes);
-		TqhnswReconstruct(model, TqhnswPtrAccess(base, element->codes), element->norm,
-						  element->scale, TqhnswPtrAccess(base, element->rhat));
+		codes = TqhnswPtrAccess(base, element->codes);
+		rhat = TqhnswPtrAccess(base, element->rhat);
+		Assert(codes != NULL && rhat != NULL);
+		memcpy(codes, buildstate->scratch->data, buildstate->codesBytes);
+		TqhnswReconstruct(model, codes, element->norm, element->scale, rhat);
 
 		/* Cosine: unit-normalize rhat so -IP orders by cosine. */
 		if (buildstate->metric == TQ_METRIC_COSINE)
-			TqhnswNormalizeRhat(TqhnswPtrAccess(base, element->rhat), buildstate->dimCodes);
+			TqhnswNormalizeRhat(rhat, buildstate->dimCodes);
 	}
 
 	/*
@@ -646,6 +654,7 @@ TqhnswFlushGraph(TqhnswBuildState *buildstate)
 		Size		ntupSize = TQHNSW_NEIGHBOR_TUPLE_SIZE(iter->level, m);
 		Size		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 		OffsetNumber offno;
+		char	   *codes;
 
 		MemSet(etupBuf, 0, etupAlloc);
 
@@ -656,7 +665,9 @@ TqhnswFlushGraph(TqhnswBuildState *buildstate)
 		etup->heaptid = iter->heaptid;
 		etup->norm = iter->norm;
 		etup->scale = iter->scale;
-		memcpy(etup->codes, TqhnswPtrAccess(buildstate->base, iter->codes), buildstate->codesBytes);
+		codes = TqhnswPtrAccess(buildstate->base, iter->codes);
+		Assert(codes != NULL);
+		memcpy(etup->codes, codes, buildstate->codesBytes);
 
 		/* Keep element + its neighbor tuple on the same page when possible. */
 		if (PageGetFreeSpace(page) < etupSize ||
@@ -678,7 +689,7 @@ TqhnswFlushGraph(TqhnswBuildState *buildstate)
 
 		ItemPointerSet(&etup->neighbortid, iter->neighborPage, iter->neighborOffno);
 
-		offno = PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber,
+		offno = PageAddItem(page, (Pointer) etup, etupSize, InvalidOffsetNumber,
 							false, false);
 		if (offno != iter->offno)
 			elog(ERROR, "failed to add index item to \"%s\"",
@@ -688,7 +699,7 @@ TqhnswFlushGraph(TqhnswBuildState *buildstate)
 		if (PageGetFreeSpace(page) < ntupSize)
 			TqAppendPage(index, &buf, &page, &state, MAIN_FORKNUM, TQHNSW_PAGE_ID);
 
-		offno = PageAddItem(page, (Item) ntupBuf, ntupSize, InvalidOffsetNumber,
+		offno = PageAddItem(page, (Pointer) ntupBuf, ntupSize, InvalidOffsetNumber,
 							false, false);
 		if (offno != iter->neighborOffno)
 			elog(ERROR, "failed to add index item to \"%s\"",
@@ -744,7 +755,7 @@ TqhnswFlushGraph(TqhnswBuildState *buildstate)
 		state = GenericXLogStart(index);
 		page = GenericXLogRegisterBuffer(state, buf, 0);
 
-		if (!PageIndexTupleOverwrite(page, iter->neighborOffno, (Item) ntup, ntupSize))
+		if (!PageIndexTupleOverwrite(page, iter->neighborOffno, (Pointer) ntup, ntupSize))
 			elog(ERROR, "failed to add index item to \"%s\"",
 				 RelationGetRelationName(index));
 
@@ -1174,11 +1185,14 @@ TqhnswBuildGraph(TqhnswBuildState *buildstate, Relation heap, Relation index,
 	if (parallel_workers > 0)
 		TqhnswBeginParallel(buildstate, indexInfo->ii_Concurrent, parallel_workers);
 
-	if (buildstate->tqhnswleader)
-		reltuples = ParallelTqhnswHeapScan(buildstate);
-	else
-		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
-										   TqhnswBuildCallback, (void *) buildstate, NULL);
+	if (heap != NULL)
+	{
+		if (buildstate->tqhnswleader)
+			reltuples = ParallelTqhnswHeapScan(buildstate);
+		else
+			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+											   TqhnswBuildCallback, (void *) buildstate, NULL);
+	}
 
 	/* Capture totals before any DSM teardown. */
 	buildstate->indtuples = buildstate->graph->indtuples;

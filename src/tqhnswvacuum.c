@@ -262,19 +262,20 @@ NeedsUpdated(TqhnswVacuumState *vs, TqhnswElement *element)
 static void
 TqhnswResetNeighbors(TqhnswElement *element, int m)
 {
+	char	   *base = NULL;
 	int			lc;
 
 	{
 		TqhnswNeighborArrayPtr *neighbors = palloc(sizeof(TqhnswNeighborArrayPtr) * (element->level + 1));
 
-		TqhnswPtrStore(NULL, element->neighbors, neighbors);
+		TqhnswPtrStore(base, element->neighbors, neighbors);
 		for (lc = 0; lc <= element->level; lc++)
 		{
 			int			lm = TqhnswGetLayerM(m, lc);
 			TqhnswNeighborArray *na = palloc(TQHNSW_NEIGHBOR_ARRAY_SIZE(lm));
 
 			na->count = 0;
-			TqhnswPtrStore(NULL, neighbors[lc], na);
+			TqhnswPtrStore(base, neighbors[lc], na);
 		}
 	}
 }
@@ -330,7 +331,7 @@ RepairGraphElement(TqhnswVacuumState *vs, TqhnswElement *element,
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 
-	if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
+	if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Pointer) ntup, ntupSize))
 		elog(ERROR, "failed to overwrite neighbor tuple in \"%s\"",
 			 RelationGetRelationName(index));
 
@@ -368,6 +369,7 @@ LoadByTid(TqhnswVacuumState *vs, BlockNumber blkno, OffsetNumber offno,
 static void
 RepairGraphEntryPoint(TqhnswVacuumState *vs)
 {
+	char	   *base = NULL;
 	Relation	index = vs->index;
 	BlockNumber entryBlkno;
 	OffsetNumber entryOffno;
@@ -440,13 +442,13 @@ RepairGraphEntryPoint(TqhnswVacuumState *vs)
 				 * stays allocated so TqhnswSearchLayer's per-layer NULL check
 				 * is valid.
 				 */
-				if (highestPoint != NULL && !TqhnswPtrIsNull(NULL, highestPoint->neighbors))
+				if (highestPoint != NULL && !TqhnswPtrIsNull(base, highestPoint->neighbors))
 				{
-					TqhnswNeighborArrayPtr *nl = TqhnswPtrAccess(NULL, highestPoint->neighbors);
+					TqhnswNeighborArrayPtr *nl = TqhnswPtrAccess(base, highestPoint->neighbors);
 					int			lc;
 
 					for (lc = 0; lc <= highestPoint->level; lc++)
-						TqhnswPtrStore(NULL, nl[lc], (TqhnswNeighborArray *) NULL);
+						TqhnswPtrStore(base, nl[lc], (TqhnswNeighborArray *) NULL);
 				}
 
 				RepairGraphElement(vs, entryPoint, highestPoint, cache, vs->tmpCtx);

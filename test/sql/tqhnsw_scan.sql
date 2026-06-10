@@ -6,7 +6,7 @@ CREATE INDEX tqhnsw_s_idx ON tqhnsw_s USING tqhnsw (v vector_l2_ops) WITH (m = 1
 
 SET tqhnsw.ef_search = 100;
 SET tqhnsw.rerank = 100;
--- The 5 nearest to [5,0,0,0] are {5,4,6,3,7} (distances 0,1,1,4,4 -> two
+-- The 5 nearest to [5,0,0,0] are {5,4,6,3,7} (distances 0,1,1,2,2 -> two
 -- exact-distance ties).  Re-sort the index-scan output by id so the tie order is
 -- deterministic; this still proves the index returned exactly the planted top-5.
 SELECT id FROM (
@@ -52,7 +52,7 @@ SET tqhnsw.ef_search = 100;
 SET tqhnsw.rerank = 100;
 DELETE FROM tqhnsw_v WHERE id = 5;
 VACUUM tqhnsw_v;
--- After deleting id 5, the nearest to [5,0,0,0] are 4,6 (dist 1) then a dist-4
+-- After deleting id 5, the nearest to [5,0,0,0] are 4,6 (dist 1) then a dist-2
 -- tie between 3 and 7.  Take LIMIT 4 (captures both tie members so the tie does
 -- not straddle the cutoff) and re-sort by id for determinism.  This proves id 5
 -- is ABSENT (dropped at rerank via heap visibility) and the planted set {3,4,6,7}
@@ -67,7 +67,7 @@ DROP TABLE tqhnsw_v;
 -- (force_scalar=on) must return identical results for each metric.
 
 -- L2: tqhnsw_s has vectors [g,0,0,0]; nearest to [5,0,0,0] are ids 3-7.
--- Wrap in ORDER BY id to neutralize tie order (dist-1 tie at 4,6; dist-4 tie at 3,7).
+-- Wrap in ORDER BY id to neutralize tie order (dist-1 tie at 4,6; dist-2 tie at 3,7).
 SET tqhnsw.ef_search = 100;
 SET tqhnsw.rerank = 100;
 SET tqhnsw.force_scalar = off;

@@ -598,6 +598,8 @@ TqhnswSearchGraph(IndexScanDesc scan)
 	pairingheap_add(W, &entry->w_node);
 	wlen = 1;
 
+	/* Zero once so the struct's trailing padding hashes consistently */
+	MemSet(&key, 0, sizeof(key));
 	key.blkno = curBlkno;
 	key.offno = curOffno;
 	hash_search(visited, &key, HASH_ENTER, &found);
@@ -774,7 +776,7 @@ TqhnswHeapFetchDatum(IndexScanDesc scan, TqhnswScanOpaque so, ItemPointer tid)
 		else
 			so->heapRel = heap;
 
-		so->fetch = table_index_fetch_begin(heap);
+		so->fetch = TqTableIndexFetchBegin(heap);
 		so->slot = table_slot_create(heap, NULL);
 	}
 
@@ -982,9 +984,9 @@ tqhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		UnlockPage(scan->indexRelation, TQHNSW_SCAN_LOCK, ShareLock);
 
 		/*
-		 * Rerank the top candidates against full-precision heap vectors.
-		 * Rows whose heap tuple is no longer visible get +inf and drop out
-		 * (this is how deletes are handled without graph mutation).
+		 * Rerank the top candidates against full-precision heap vectors. Rows
+		 * whose heap tuple is no longer visible get +inf and drop out (this
+		 * is how deletes are handled without graph mutation).
 		 */
 		if (tqhnsw_rerank > 0 && so->nresults > 0 && so->haveQuery &&
 			AttributeNumberIsValid(so->heapAttno))

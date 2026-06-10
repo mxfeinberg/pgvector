@@ -22,12 +22,20 @@
 								 * TqPackCode */
 #include "vector.h"
 
+#if PG_VERSION_NUM >= 150000
+#include "common/pg_prng.h"
+#define TqhnswRandomDouble() pg_prng_double(&pg_global_prng_state)
+#else
+#define TqhnswRandomDouble() (((double) random()) / MAX_RANDOM_VALUE)
+#endif
+
 /*
- * base==NULL -> absolute pointer; relptr branch dormant until parallel build (#3).
- * Two intentional divergences from hnsw.h's HnswPtr: (1) base is cast to (char *)
- * so relptr's byte-offset arithmetic is correct regardless of the caller's base
- * type; (2) there is no extra TqhnswNeighborsPtr indirection layer (see
- * TqhnswGetNeighbors) -- the relptr migration in #3 must reconcile that.
+ * base==NULL -> absolute pointer (serial build, on-disk insert, vacuum);
+ * base!=NULL -> relptr into the shared parallel-build area.  Two intentional
+ * divergences from hnsw.h's HnswPtr: (1) base is cast to (char *) so relptr's
+ * byte-offset arithmetic is correct regardless of the caller's base type;
+ * (2) there is no extra TqhnswNeighborsPtr indirection layer (see
+ * TqhnswGetNeighbors).
  */
 #define TqhnswPtrDeclare(type, relptrtype, ptrtype) \
 	relptr_declare(type, relptrtype); \
@@ -403,8 +411,12 @@ extern IndexBuildResult *tqhnswbuild(Relation heap, Relation index, struct Index
 extern void tqhnswbuildempty(Relation index);
 extern bool tqhnswinsert(Relation index, Datum *values, bool *isnull,
 						 ItemPointer heap_tid, Relation heap,
-						 IndexUniqueCheck checkUnique,
-						 bool indexUnchanged, struct IndexInfo *indexInfo);
+						 IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+						 ,bool indexUnchanged
+#endif
+						 ,struct IndexInfo *indexInfo
+);
 
 /* ---- tqhnswscan.c ---- */
 extern IndexScanDesc tqhnswbeginscan(Relation index, int nkeys, int norderbys);

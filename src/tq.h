@@ -12,6 +12,18 @@
 #include "utils/relcache.h"
 #include "vector.h"
 
+/* MSVC's math.h does not define M_PI without _USE_MATH_DEFINES */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* PG 19 added a ScanOptions flags argument to table_index_fetch_begin */
+#if PG_VERSION_NUM >= 190000
+#define TqTableIndexFetchBegin(rel) table_index_fetch_begin((rel), 0)
+#else
+#define TqTableIndexFetchBegin(rel) table_index_fetch_begin(rel)
+#endif
+
 /* Limits / defaults */
 #define TQ_MAX_DIM 16000
 #define TQ_MIN_BITS 2
@@ -357,8 +369,12 @@ extern IndexBuildResult *tqbuild(Relation heap, Relation index, struct IndexInfo
 extern void tqbuildempty(Relation index);
 extern bool tqinsert(Relation index, Datum *values, bool *isnull,
 					 ItemPointer heap_tid, Relation heap,
-					 IndexUniqueCheck checkUnique,
-					 bool indexUnchanged, struct IndexInfo *indexInfo);
+					 IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					 ,bool indexUnchanged
+#endif
+					 ,struct IndexInfo *indexInfo
+);
 extern TqModel *TqGetCachedModel(Relation index);
 extern void TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes);
 
