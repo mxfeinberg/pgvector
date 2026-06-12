@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/genam.h"
 #include "access/reloptions.h"
 #include "catalog/index.h"
 #include "catalog/pg_type_d.h"
@@ -14,6 +15,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/spccache.h"
 
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
@@ -113,6 +115,52 @@ tqivfcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
+
+	/*
+	 * Mirror ivfflatcostestimate: the first row is returned only after the
+	 * probed lists are read, scored, and sorted, so charge that fraction of
+	 * the total cost to startup; treat half of the page reads as sequential
+	 * (lists are read in chain order).
+	 */
+	{
+		double		sequentialRatio = 0.5;
+		double		ratio;
+		double		startupPages;
+		double		spc_seq_page_cost;
+		int			lists;
+		Relation	index;
+
+		index = index_open(path->indexinfo->indexoid, NoLock);
+		TqivfGetMetaInfo(index, NULL, NULL, &lists, NULL);
+		index_close(index, NoLock);
+
+		ratio = ((double) tqivf_probes) / lists;
+		if (ratio > 1.0)
+			ratio = 1.0;
+
+		get_tablespace_page_costs(path->indexinfo->reltablespace, NULL,
+								  &spc_seq_page_cost);
+
+		/* Change some page cost from random to sequential */
+		costs.indexTotalCost -= sequentialRatio * costs.numIndexPages *
+			(costs.spc_random_page_cost - spc_seq_page_cost);
+
+		/* Startup cost is cost before returning the first row */
+		costs.indexStartupCost = costs.indexTotalCost * ratio;
+
+		/* Adjust cost if needed since TOAST not included in seq scan cost */
+		startupPages = costs.numIndexPages * ratio;
+		if (startupPages > path->indexinfo->rel->pages && ratio < 0.5)
+		{
+			/* Change rest of page cost from random to sequential */
+			costs.indexStartupCost -= (1 - sequentialRatio) * startupPages *
+				(costs.spc_random_page_cost - spc_seq_page_cost);
+
+			/* Remove cost of extra pages */
+			costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+		}
+	}
+
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;

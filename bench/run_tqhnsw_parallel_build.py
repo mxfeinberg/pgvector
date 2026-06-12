@@ -21,7 +21,7 @@ import tqflat_bench as tb
 
 
 def connect(args):
-    return psycopg2.connect(host=args.host, dbname=args.dbname, user=args.user)
+    return psycopg2.connect(host=args.host, port=args.port, dbname=args.dbname, user=args.user)
 
 
 def set_guc(conn, k, v):
@@ -85,6 +85,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--datasets", default="sift,glove,openai")
     p.add_argument("--host", default="/var/run/postgresql")
+    p.add_argument("--port", type=int, default=5432)
     p.add_argument("--dbname", default="tqtest")
     p.add_argument("--user", default="max")
     p.add_argument("--mwm", default="12GB")

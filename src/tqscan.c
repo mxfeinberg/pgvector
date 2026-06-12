@@ -6,7 +6,10 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupdesc.h"
 #include "catalog/index.h"
+#include "catalog/pg_operator_d.h"
+#include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -17,6 +20,7 @@
 #include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/tuplesort.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -37,7 +41,7 @@ typedef struct TqScanResult
 /*
  * Scan state.  Mirrors IvfflatScanOpaqueData: the loaded model, the per-query
  * LUT (+ qjlQuery when tqProd), the metric, the exact-distance procinfo +
- * collation used for rerank, ||q||^2, an ordered results array, and a cursor.
+ * collation used for rerank, ||q||^2, and the sorted candidate stream.
  */
 typedef struct TqScanOpaqueData
 {
@@ -65,10 +69,29 @@ typedef struct TqScanOpaqueData
 	float	   *vecScratch;		/* dim floats (rebuilt per rescan) */
 	double		qNormSq;		/* ||q||^2 (1.0 for cosine after normalize) */
 
-	/* Results.  64-bit: a flat scan visits every row (nVectors is uint32). */
-	TqScanResult *results;
-	int64		nresults;
-	int64		cursor;
+	/*
+	 * Sorted candidates: a work_mem-bounded, disk-spilling tuplesort (mirrors
+	 * ivfscan.c) instead of an in-memory array, so scan memory does not grow
+	 * with the index.  Lives OUTSIDE tmpCtx -- rescan resets tmpCtx but only
+	 * tuplesort_reset's the sort.
+	 */
+	TupleDesc	tupdesc;
+	Tuplesortstate *sortstate;
+	TupleTableSlot *vslot;		/* virtual slot for puttuple */
+	TupleTableSlot *mslot;		/* minimal-tuple slot for gettuple */
+	bool		streamExhausted;
+	bool		streamHeadValid;
+	TqScanResult streamHead;	/* buffered head of the sorted stream */
+
+	/*
+	 * Reranked top-K with exact distances (K <= tqflat.rerank, so bounded by
+	 * the GUC).  Sorted ascending; gettuple merges it with the remaining
+	 * estimate-ordered stream, which yields the same total order as the
+	 * previous sort-everything-mixed approach.  Allocated in tmpCtx.
+	 */
+	TqScanResult *rerank;
+	int64		nrerank;
+	int64		rerankCursor;
 
 	/* Heap access for rerank. */
 	Relation	heapRel;		/* opened here iff heapOpened */
@@ -99,6 +122,41 @@ CompareResults(const void *a, const void *b)
 }
 
 /*
+ * Feed one scored candidate into the scan's tuplesort (mirrors ivfscan.c's
+ * virtual-tuple add).  tid may point into a locked page: tuplesort copies the
+ * slot into a minimal tuple immediately.
+ */
+static inline void
+TqAddCandidate(TqScanOpaque so, double dist, ItemPointer tid)
+{
+	ExecClearTuple(so->vslot);
+	so->vslot->tts_values[0] = Float8GetDatum(dist);
+	so->vslot->tts_isnull[0] = false;
+	so->vslot->tts_values[1] = PointerGetDatum(tid);
+	so->vslot->tts_isnull[1] = false;
+	ExecStoreVirtualTuple(so->vslot);
+
+	tuplesort_puttupleslot(so->sortstate, so->vslot);
+}
+
+/*
+ * Pull the next (dist, tid) off the sorted stream.  Decodes immediately: the
+ * slot's contents are only valid until the next gettupleslot call.
+ */
+static bool
+TqStreamNext(TqScanOpaque so, TqScanResult *out)
+{
+	bool		isnull;
+
+	if (!tuplesort_gettupleslot(so->sortstate, true, false, so->mslot, NULL))
+		return false;
+
+	out->dist = DatumGetFloat8(slot_getattr(so->mslot, 1, &isnull));
+	out->tid = *((ItemPointer) DatumGetPointer(slot_getattr(so->mslot, 2, &isnull)));
+	return true;
+}
+
+/*
  * tqbeginscan -- initialize a scan descriptor.
  *
  * Loads the model (via the same rd_amcache path inserts use, falling back to
@@ -120,6 +178,33 @@ tqbeginscan(Relation index, int nkeys, int norderbys)
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Tqflat scan temporary context",
 									   ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Sort state for the candidate stream (mirrors ivfflatbeginscan).  Kept
+	 * outside tmpCtx: rescan resets tmpCtx but reuses the sort via
+	 * tuplesort_reset.
+	 */
+	so->tupdesc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(so->tupdesc, (AttrNumber) 1, "distance", FLOAT8OID, -1, 0);
+	TupleDescInitEntry(so->tupdesc, (AttrNumber) 2, "heaptid", TIDOID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	TupleDescFinalize(so->tupdesc);
+#endif
+
+	{
+		AttrNumber	attNums[] = {1};
+		Oid			sortOperators[] = {Float8LessOperator};
+		Oid			sortCollations[] = {InvalidOid};
+		bool		nullsFirstFlags[] = {false};
+
+		so->sortstate = tuplesort_begin_heap(so->tupdesc, 1, attNums,
+											 sortOperators, sortCollations,
+											 nullsFirstFlags, work_mem, NULL, false);
+	}
+
+	/* Need separate slots for puttuple and gettuple */
+	so->vslot = MakeSingleTupleTableSlot(so->tupdesc, &TTSOpsVirtual);
+	so->mslot = MakeSingleTupleTableSlot(so->tupdesc, &TTSOpsMinimalTuple);
 
 	/*
 	 * Load the model from the relcache (rd_amcache / rd_indexcxt).  The
@@ -145,9 +230,11 @@ tqbeginscan(Relation index, int nkeys, int norderbys)
 	so->lut8 = NULL;
 	so->qjlQuery = NULL;
 	so->vecScratch = NULL;
-	so->results = NULL;
-	so->nresults = 0;
-	so->cursor = 0;
+	so->streamExhausted = false;
+	so->streamHeadValid = false;
+	so->rerank = NULL;
+	so->nrerank = 0;
+	so->rerankCursor = 0;
 	so->heapRel = NULL;
 	so->heapOpened = false;
 	so->fetch = NULL;
@@ -171,8 +258,14 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	MemoryContext oldCtx;
 
 	so->first = true;
-	so->cursor = 0;
-	so->nresults = 0;
+
+	/* Empty the sort for reuse; reset the merge cursors. */
+	tuplesort_reset(so->sortstate);
+	so->streamExhausted = false;
+	so->streamHeadValid = false;
+	so->rerank = NULL;
+	so->nrerank = 0;
+	so->rerankCursor = 0;
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -198,7 +291,7 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->heapRel = NULL;
 
 	/*
-	 * Reset per-query allocations (LUT, qjlQuery, vecScratch, results array).
+	 * Reset per-query allocations (LUT, qjlQuery, vecScratch, rerank array).
 	 * The model lives in rd_indexcxt (via TqGetCachedModel) and must NOT be
 	 * freed here — assign model from so->model after the reset.
 	 */
@@ -208,7 +301,6 @@ tqrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->qjlQuery = NULL;
 	so->haveQuery = false;
 	so->vecScratch = NULL;
-	so->results = NULL;
 
 	/* so->model still points at the cached model (unaffected by the reset). */
 	model = so->model;
@@ -363,9 +455,9 @@ TqHeapFetchDatum(IndexScanDesc scan, TqScanOpaque so, ItemPointer tid)
 }
 
 /*
- * Perform the full scan: score every live entry, optionally rerank the top
- * candidates against full-precision heap vectors, and sort the results array
- * in ascending distance order.
+ * Perform the full scan: score every live entry into the work_mem-bounded
+ * tuplesort, sort it, and optionally pull + rerank the top candidates against
+ * full-precision heap vectors (gettuple then merges the two sorted sources).
  */
 static void
 TqDoScan(IndexScanDesc scan)
@@ -378,9 +470,7 @@ TqDoScan(IndexScanDesc scan)
 	BlockNumber sideStart;
 	BlockNumber tailStart;
 	uint32		blockCount;
-	int64		capacity;
 	int64		n = 0;
-	TqScanResult *results;
 	MemoryContext oldCtx;
 
 	/* Block-layout chain heads + counts from the meta page. */
@@ -397,43 +487,33 @@ TqDoScan(IndexScanDesc scan)
 		sideStart = metap->sideStart;
 		tailStart = metap->tailStart;
 		blockCount = metap->blockCount;
-		capacity = (int64) metap->nVectors;
 		UnlockReleaseBuffer(metabuf);
 	}
 
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
-	if (capacity < 1)
-		capacity = 1;
-	/* Huge variant: at nVectors near uint32 max this exceeds MaxAllocSize. */
-	results = (TqScanResult *) MemoryContextAllocHuge(CurrentMemoryContext,
-													  sizeof(TqScanResult) * capacity);
-
 	/*
-	 * Block scan: read the whole code-plane chain into one contiguous buffer,
-	 * then walk the side chain in block order.  For each block, fold its
-	 * code-plane into the 32-lane accumulator with the SIMD kernel and
-	 * recover each live lane's estimate from the side record's per-lane
-	 * scale/norm.
+	 * Block scan: walk the side chain in block order, streaming each block's
+	 * code plane (dc*16 bytes) from the code chain as it is consumed -- the
+	 * blocks were written in the same order, so a forward-only byte stream
+	 * suffices and scan memory stays one block, not the whole plane.  For
+	 * each block, fold its code-plane into the 32-lane accumulator with the
+	 * SIMD kernel and recover each live lane's estimate from the side
+	 * record's per-lane scale/norm.
 	 */
 	if (blockCount > 0 && BlockNumberIsValid(codeStart))
 	{
 		Size		blockCodeBytes = TQ_BLOCK_CODE_BYTES(dc);
-		Size		codeLen = (Size) blockCount * blockCodeBytes;
-		char	   *codeBuf = NULL;
+		char	   *planeBuf = NULL;
+		TqByteStream codeStream;
 		BlockNumber sblk = sideStart;
-		uint32		b = 0;
+		uint32		b PG_USED_FOR_ASSERTS_ONLY = 0;
 
-		/*
-		 * The whole code plane is read into one contiguous buffer. For a flat
-		 * index this grows with the table: at ~2M+ rows (high dim) it exceeds
-		 * the 1GB MaxAllocSize of a normal palloc, so use the huge variant.
-		 * Skipped for a NULL order-by key (nothing is scored).
-		 */
+		/* Skipped for a NULL order-by key (nothing is scored). */
 		if (so->haveQuery)
 		{
-			codeBuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, codeLen);
-			TqReadBytes(index, codeStart, codeBuf, codeLen);
+			planeBuf = (char *) palloc(blockCodeBytes);
+			TqByteStreamInit(&codeStream, index, codeStart);
 		}
 
 		while (BlockNumberIsValid(sblk))
@@ -453,8 +533,19 @@ TqDoScan(IndexScanDesc scan)
 			for (soff = FirstOffsetNumber; soff <= smax; soff = OffsetNumberNext(soff))
 			{
 				TqBlockSideRec *srec = (TqBlockSideRec *) PageGetItem(spage, PageGetItemId(spage, soff));
-				const uint8 *plane = so->haveQuery ?
-				(const uint8 *) codeBuf + (Size) b * blockCodeBytes : NULL;
+				const uint8 *plane = NULL;
+
+				/*
+				 * Stream this block's code plane.  The code chain holds only
+				 * share-locked page reads, taken while the side page is also
+				 * share-locked; no path locks these chains in the reverse
+				 * order.
+				 */
+				if (so->haveQuery)
+				{
+					TqByteStreamRead(&codeStream, planeBuf, blockCodeBytes);
+					plane = (const uint8 *) planeBuf;
+				}
 
 				if (!so->haveQuery)
 				{
@@ -468,13 +559,7 @@ TqDoScan(IndexScanDesc scan)
 						if (srec->deletedMask & (1u << j))
 							continue;
 
-						if (n >= capacity)
-						{
-							capacity *= 2;
-							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
-						}
-						results[n].dist = 0.0;
-						results[n].tid = srec->side[j].heaptid;
+						TqAddCandidate(so, 0.0, &srec->side[j].heaptid);
 						n++;
 					}
 				}
@@ -505,13 +590,7 @@ TqDoScan(IndexScanDesc scan)
 						sd = &srec->side[j];
 						est = (float) ((double) sd->scale * mse);
 
-						if (n >= capacity)
-						{
-							capacity *= 2;
-							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
-						}
-						results[n].dist = TqEstToDistSide(so, sd->norm, est);
-						results[n].tid = sd->heaptid;
+						TqAddCandidate(so, TqEstToDistSide(so, sd->norm, est), &sd->heaptid);
 						n++;
 					}
 				}
@@ -537,13 +616,7 @@ TqDoScan(IndexScanDesc scan)
 						mse = (double) so->lutScale * acc.acc32[j] + (double) dc * so->lutBias;
 						est = (float) ((double) sd->scale * mse);
 
-						if (n >= capacity)
-						{
-							capacity *= 2;
-							results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
-						}
-						results[n].dist = TqEstToDistSide(so, sd->norm, est);
-						results[n].tid = sd->heaptid;
+						TqAddCandidate(so, TqEstToDistSide(so, sd->norm, est), &sd->heaptid);
 						n++;
 					}
 				}
@@ -583,24 +656,20 @@ TqDoScan(IndexScanDesc scan)
 			for (toff = FirstOffsetNumber; toff <= tmax; toff = OffsetNumberNext(toff))
 			{
 				TqEntry    *entry = (TqEntry *) PageGetItem(tpage, PageGetItemId(tpage, toff));
+				double		dist;
 
 				if (entry->deleted)
 					continue;
 
-				if (n >= capacity)
-				{
-					capacity *= 2;
-					results = repalloc_huge(results, sizeof(TqScanResult) * capacity);
-				}
 				if (so->haveQuery)
 				{
 					float		est = TqScoreEntry(model, so->lut, so->qjlQuery, entry, entry->data);
 
-					results[n].dist = TqEstToDist(so, entry, est);
+					dist = TqEstToDist(so, entry, est);
 				}
 				else
-					results[n].dist = 0.0;	/* NULL order-by key */
-				results[n].tid = entry->heaptid;
+					dist = 0.0; /* NULL order-by key */
+				TqAddCandidate(so, dist, &entry->heaptid);
 				n++;
 			}
 
@@ -610,12 +679,17 @@ TqDoScan(IndexScanDesc scan)
 		}
 	}
 
+	/* Sort all candidates by estimated distance (spills past work_mem). */
+	tuplesort_performsort(so->sortstate);
+
 	/*
-	 * Rerank: for the top-K candidates by estimate, fetch the original vector
-	 * and replace the estimate with the exact FUNCTION 1 distance.
+	 * Rerank: pull the top-K candidates by estimate off the sorted stream,
+	 * fetch the original vectors, and replace the estimates with the exact
+	 * FUNCTION 1 distance.  The K-array is re-sorted and gettuple merges it
+	 * with the rest of the stream -- merging two ascending sequences yields
+	 * the same total order as the previous sort-everything-mixed approach.
 	 *
-	 * Approach (documented prototype tradeoff): rerank the top-K exactly,
-	 * then sort the whole array by distance.  Exact and estimated distances
+	 * Approach (documented prototype tradeoff): exact and estimated distances
 	 * are not perfectly comparable, but in the top-K region the exact values
 	 * dominate, which is what matters for the returned neighbors.
 	 */
@@ -623,12 +697,17 @@ TqDoScan(IndexScanDesc scan)
 		AttributeNumberIsValid(so->heapAttno))
 	{
 		int64		k = Min((int64) tqflat_rerank, n);
+		int64		nrerank = 0;
 
-		qsort(results, n, sizeof(TqScanResult), CompareResults);
+		/* Bounded by the tqflat.rerank GUC (TQ_MAX_RERANK). */
+		so->rerank = (TqScanResult *) palloc(sizeof(TqScanResult) * k);
 
-		for (int64 i = 0; i < k; i++)
+		while (nrerank < k && TqStreamNext(so, &so->rerank[nrerank]))
+			nrerank++;
+
+		for (int64 i = 0; i < nrerank; i++)
 		{
-			Datum		heapDatum = TqHeapFetchDatum(scan, so, &results[i].tid);
+			Datum		heapDatum = TqHeapFetchDatum(scan, so, &so->rerank[i].tid);
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -652,28 +731,28 @@ TqDoScan(IndexScanDesc scan)
 				/*
 				 * Cosine: FUNCTION 1 yields -cos on normalized inputs while
 				 * the quantized estimate scale is 1 - cos; shift by 1 so the
-				 * two populations sort on the same scale in the final qsort.
+				 * two populations sort on the same scale in the merge.
 				 */
 				if (so->metric == TQ_METRIC_COSINE)
 					d += 1.0;
 
-				results[i].dist = d;
+				so->rerank[i].dist = d;
 
 				if (cmpDatum != heapDatum)
 					pfree(DatumGetPointer(cmpDatum));
 				pfree(DatumGetPointer(heapDatum));
 			}
 			else
-				results[i].dist = get_float8_infinity();
+				so->rerank[i].dist = get_float8_infinity();
 		}
+
+		qsort(so->rerank, nrerank, sizeof(TqScanResult), CompareResults);
+		so->nrerank = nrerank;
 	}
 
-	/* Final ordering. */
-	qsort(results, n, sizeof(TqScanResult), CompareResults);
-
-	so->results = results;
-	so->nresults = n;
-	so->cursor = 0;
+	so->rerankCursor = 0;
+	so->streamExhausted = false;
+	so->streamHeadValid = false;
 
 	MemoryContextSwitchTo(oldCtx);
 }
@@ -711,13 +790,38 @@ tqgettuple(IndexScanDesc scan, ScanDirection dir)
 		so->first = false;
 	}
 
-	if (so->cursor >= so->nresults)
+	/* Keep the head of the sorted stream buffered for the merge. */
+	if (!so->streamHeadValid && !so->streamExhausted)
+	{
+		if (TqStreamNext(so, &so->streamHead))
+			so->streamHeadValid = true;
+		else
+			so->streamExhausted = true;
+	}
+
+	/*
+	 * 2-way merge of the reranked top-K (exact distances) and the remaining
+	 * estimate-ordered stream; both are ascending, so emitting the smaller
+	 * head reproduces a global sort of the mixed distances.  Ties prefer the
+	 * reranked (exact) entry.
+	 */
+	if (so->rerankCursor < so->nrerank &&
+		(!so->streamHeadValid ||
+		 so->rerank[so->rerankCursor].dist <= so->streamHead.dist))
+	{
+		scan->xs_heaptid = so->rerank[so->rerankCursor].tid;
+		so->rerankCursor++;
+	}
+	else if (so->streamHeadValid)
+	{
+		scan->xs_heaptid = so->streamHead.tid;
+		so->streamHeadValid = false;
+	}
+	else
 		return false;
 
-	scan->xs_heaptid = so->results[so->cursor].tid;
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
-	so->cursor++;
 
 	return true;
 }
@@ -736,6 +840,12 @@ tqendscan(IndexScanDesc scan)
 		ExecDropSingleTupleTableSlot(so->slot);
 	if (so->heapOpened && so->heapRel != NULL)
 		table_close(so->heapRel, AccessShareLock);
+
+	/* Free any temporary files */
+	tuplesort_end(so->sortstate);
+
+	ExecDropSingleTupleTableSlot(so->vslot);
+	ExecDropSingleTupleTableSlot(so->mslot);
 
 	MemoryContextDelete(so->tmpCtx);
 

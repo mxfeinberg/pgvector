@@ -13,6 +13,7 @@
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/selfuncs.h"
+#include "utils/spccache.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM < 150000
@@ -103,7 +104,29 @@ tqcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
-	/* Flat scan visits every page: keep generic estimate. */
+
+	/*
+	 * The code/side/tail chains are read in order: treat the page reads as
+	 * sequential rather than random (mirrors ivfflatcostestimate's
+	 * adjustment, with the visit ratio fixed at 1.0).
+	 */
+	{
+		double		spc_seq_page_cost;
+
+		get_tablespace_page_costs(path->indexinfo->reltablespace, NULL,
+								  &spc_seq_page_cost);
+		costs.indexTotalCost -= costs.numIndexPages *
+			(costs.spc_random_page_cost - spc_seq_page_cost);
+	}
+
+	/*
+	 * A flat scan reads, scores, and sorts the WHOLE index before returning
+	 * its first row, so all of the total cost is startup cost.  Without this
+	 * the generic near-zero startup cost makes the index look like a cheap
+	 * first-row plan for LIMIT queries.
+	 */
+	costs.indexStartupCost = costs.indexTotalCost;
+
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;

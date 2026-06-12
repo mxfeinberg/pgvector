@@ -131,6 +131,12 @@ TqhnswNormalizeRhat(float *rhat, int dimCodes)
 	}
 }
 
+#if defined(USE_TARGET_CLONES) && !defined(__FMA__)
+#define TQHNSW_TARGET_CLONES __attribute__((target_clones("default", "fma")))
+#else
+#define TQHNSW_TARGET_CLONES
+#endif
+
 /*
  * Build-time distance on the reconstructed rotated vectors (variant A).  Smaller
  * is nearer, matching the HNSW convention.
@@ -140,29 +146,36 @@ TqhnswNormalizeRhat(float *rhat, int dimCodes)
  *
  * For cosine the rhat vectors are pre-normalized to unit length at node creation,
  * so -IP orders by cosine distance.
+ *
+ * Accumulates in float, like vector.c's VectorL2SquaredDistance /
+ * VectorInnerProduct kernels: the loops auto-vectorize at full float width
+ * instead of paying a float->double convert chain at half width, and graph
+ * construction tolerates the same rounding hnsw's build does on raw vectors.
  */
-double
+TQHNSW_TARGET_CLONES double
 TqhnswBuildDistance(const float *a, const float *b, int dc, TqMetric metric)
 {
-	double		acc = 0.0;
+	float		acc = 0.0;
 	int			i;
 
 	Assert(a != NULL && b != NULL);
 
 	if (metric == TQ_METRIC_L2)
 	{
+		/* Auto-vectorized */
 		for (i = 0; i < dc; i++)
 		{
-			double		d = (double) a[i] - (double) b[i];
+			float		d = a[i] - b[i];
 
 			acc += d * d;
 		}
-		return acc;
+		return (double) acc;
 	}
 
+	/* Auto-vectorized */
 	for (i = 0; i < dc; i++)
-		acc += (double) a[i] * (double) b[i];
-	return -acc;
+		acc += a[i] * b[i];
+	return -(double) acc;
 }
 
 /* ------------------------------------------------------------------------- *

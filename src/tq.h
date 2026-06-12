@@ -380,6 +380,21 @@ extern TqModel *TqGetCachedModel(Relation index);
 extern void TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes);
 
 /*
+ * Forward-only cursor over a linked page chain of raw bytes; lets scans read
+ * the code plane block-by-block instead of buffering the whole chain.
+ */
+typedef struct TqByteStream
+{
+	Relation	index;
+	BlockNumber blkno;
+	OffsetNumber offno;
+	Size		itemOff;		/* byte offset within the current item */
+} TqByteStream;
+
+extern void TqByteStreamInit(TqByteStream *bs, Relation index, BlockNumber startBlock);
+extern void TqByteStreamRead(TqByteStream *bs, char *dest, Size len);
+
+/*
  * Build-time page helpers, exported for reuse by the tqivf access method.
  * These operate on a (Relation, ForkNumber) page chain and are independent of
  * any AM-specific build state.

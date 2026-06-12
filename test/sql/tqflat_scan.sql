@@ -49,6 +49,16 @@ SELECT id FROM tqscan_empty ORDER BY v <-> '[1,2,3,4]'::vector LIMIT 5;
 INSERT INTO tqscan VALUES (9, '[0,0,0,0,10,0,0,0]');
 SELECT id FROM tqscan ORDER BY v <-> '[0,0,0,0,10,0,0,0]'::vector LIMIT 1;  -- expect 9
 
+-- Merge path: with rerank smaller than the table, a full (no LIMIT) consumption
+-- crosses the reranked-array/stream boundary; every row comes back exactly once.
+SET enable_seqscan = off;
+SET tqflat.rerank = 2;
+SELECT count(*), count(DISTINCT id) FROM (SELECT id FROM tqscan ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector) s;
+SET tqflat.rerank = 0;
+SELECT count(*), count(DISTINCT id) FROM (SELECT id FROM tqscan ORDER BY v <-> '[10,0,0,0,0,0,0,0]'::vector) s;
+RESET tqflat.rerank;
+RESET enable_seqscan;
+
 -- tq_prod = true is unsupported in the blocked v4 layout; CREATE INDEX must error.
 \set ON_ERROR_STOP 0
 CREATE INDEX tqscan_idx_prod ON tqscan USING tqflat (v vector_l2_ops) WITH (bits = 4, tq_prod = true);
@@ -181,3 +191,14 @@ SELECT count(*) FROM (SELECT id FROM tqbig ORDER BY v <-> ('[100,' || array_to_s
 RESET tqflat.rerank;
 RESET enable_seqscan;
 DROP TABLE tqbig;
+
+-- Cost estimate: a flat scan does ALL its work before the first row, so the
+-- whole cost is charged to startup.  With default planner settings on a tiny
+-- table, a LIMIT query must therefore prefer a plain seq scan + sort over the
+-- index's cheap-looking-first-row plan.
+CREATE TABLE tqcost (id int, v vector(8));
+INSERT INTO tqcost SELECT g, ('[' || g || ',1,0,0,0,0,0,0]')::vector FROM generate_series(1, 50) g;
+CREATE INDEX ON tqcost USING tqflat (v vector_l2_ops);
+ANALYZE tqcost;
+EXPLAIN (COSTS OFF) SELECT id FROM tqcost ORDER BY v <-> '[5,1,0,0,0,0,0,0]' LIMIT 1;
+DROP TABLE tqcost;

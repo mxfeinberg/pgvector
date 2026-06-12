@@ -336,46 +336,80 @@ TqCodeAppend(TqBuildState *buildstate, const char *bytes, Size nbytes)
 }
 
 /*
+ * Position a byte stream at the head of a linked page chain.  The stream
+ * reads the chain's items forward-only via TqByteStreamRead; no buffer pins
+ * are held between reads.
+ */
+void
+TqByteStreamInit(TqByteStream *bs, Relation index, BlockNumber startBlock)
+{
+	bs->index = index;
+	bs->blkno = startBlock;
+	bs->offno = FirstOffsetNumber;
+	bs->itemOff = 0;
+}
+
+/*
+ * Copy the next len bytes from the chain into dest, advancing the cursor
+ * across items and pages as needed.  Errors out if the chain runs short.
+ */
+void
+TqByteStreamRead(TqByteStream *bs, char *dest, Size len)
+{
+	Size		offset = 0;
+
+	while (BlockNumberIsValid(bs->blkno) && offset < len)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+
+		buf = ReadBuffer(bs->index, bs->blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		while (bs->offno <= maxoff && offset < len)
+		{
+			ItemId		iid = PageGetItemId(page, bs->offno);
+			Size		itemLen = ItemIdGetLength(iid);
+			char	   *item = (char *) PageGetItem(page, iid);
+			Size		avail = itemLen - bs->itemOff;
+			Size		chunk = Min(avail, len - offset);
+
+			memcpy(dest + offset, item + bs->itemOff, chunk);
+			offset += chunk;
+			bs->itemOff += chunk;
+			if (bs->itemOff >= itemLen)
+			{
+				bs->offno = OffsetNumberNext(bs->offno);
+				bs->itemOff = 0;
+			}
+		}
+
+		if (bs->offno > maxoff)
+		{
+			bs->blkno = TqPageGetOpaque(page)->nextblkno;
+			bs->offno = FirstOffsetNumber;
+			bs->itemOff = 0;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (offset != len)
+		elog(ERROR, "index side page chain shorter than expected");
+}
+
+/*
  * Read a raw byte buffer back from a linked page chain into dest.
  */
 void
 TqReadBytes(Relation index, BlockNumber startBlock, char *dest, Size nbytes)
 {
-	BlockNumber blkno = startBlock;
-	Size		offset = 0;
+	TqByteStream bs;
 
-	while (BlockNumberIsValid(blkno) && offset < nbytes)
-	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber offno;
-
-		buf = ReadBuffer(index, blkno);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		maxoff = PageGetMaxOffsetNumber(page);
-
-		for (offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
-		{
-			ItemId		iid = PageGetItemId(page, offno);
-			Size		len = ItemIdGetLength(iid);
-			char	   *item = (char *) PageGetItem(page, iid);
-
-			if (len > nbytes - offset)
-				len = nbytes - offset;
-			memcpy(dest + offset, item, len);
-			offset += len;
-			if (offset >= nbytes)
-				break;
-		}
-
-		blkno = TqPageGetOpaque(page)->nextblkno;
-		UnlockReleaseBuffer(buf);
-	}
-
-	if (offset != nbytes)
-		elog(ERROR, "index side page chain shorter than expected");
+	TqByteStreamInit(&bs, index, startBlock);
+	TqByteStreamRead(&bs, dest, nbytes);
 }
 
 /*

@@ -699,6 +699,31 @@ flush-to-disk fallback was validated under 4 workers with low `maintenance_work_
 (recall-equivalent to the in-memory path, 0.5612 vs 0.5624). Correctness validation ran
 with `-DUSE_ASSERT_CHECKING`; these timing numbers use the optimized non-assert build.
 
+### Update (2026-06-10) — build-distance kernel fix: serial 1.3–1.6× faster
+
+Profiling the serial SIFT1M build (perf, full symbols) showed `TqhnswBuildDistance` at
+**58.6% of all build cycles**, with ~35% of its samples in `vcvtps2pd` float→double
+conversions: the kernel accumulated in `double`, forcing 8-wide math plus a convert chain
+where hnsw's `vector_l2_squared_distance` runs 16-wide float. (Build WAL was measured and
+exonerated first: the flush tail is 4.9 s of a 490 s build — per-page GenericXLog elision
+would buy <1%.) The fix switches `TqhnswBuildDistance` to float accumulation, mirroring
+vector.c's kernels. Re-run of this suite, same host/methodology
+(`bench/results/tqhnsw_parallel_build_floatkernel.csv`):
+
+| Dataset | dim | serial build | parallel build | speedup | recall@10 (serial/parallel) |
+|---|---|---|---|---|---|
+| SIFT1M    | 128  | 457 → **348 s** | 86 → **77 s**   | 4.53× | 0.9746 / 0.9756 |
+| GloVe-200 | 200  | 1252 → **773 s** | 208 → **142 s** | 5.43× | 0.7036 / 0.6968 |
+| OpenAI-1M | 1536 | 3434 → **2141 s** | 578 → **440 s** | 4.87× | 0.9650 / 0.9615 |
+
+Index sizes are unchanged; recall deltas are build-PRNG noise (SIFT and OpenAI moved
+*up*). The cosine/IP datasets gain the most (1.62×/1.60× serial) because the convert
+chain ran over the padded `dimCodes` (200→256, 1536→2048). Against hnsw at matched
+m/efc the build gap is now **1.30× serial on SIFT** (348 s vs 267 s same-box) and
+**1.58× on OpenAI-1M parallel** (440 s vs 278 s @4 workers), down from 1.83×/2.08× —
+while keeping the 6× index-size advantage. Validated: full TAP suite (53 files / 1399
+subtests) green on this build; Mac installcheck 26/26.
+
 ---
 
 # Five-way head-to-head — tqflat · ivfflat · hnsw · tqivf · tqhnsw
@@ -738,8 +763,8 @@ apples-to-apples on _size and recall_, indicative on _latency_ and _build_.**
 | hnsw (m16, ef=100)           | 73      | 782 MB       | 0.983  | **4.9** |
 | hnsw (m32, ef=100)           | 234     | 966 MB       | 0.9944 | 8.8 |
 | **tqivf** (p=99, r=200)      | 9.2ᵖ    | **87.5 MB**  | 0.9988 | 14.6 |
-| **tqhnsw** (ef=100)          | 86ᵖ     | 295.7 MB     | 0.977  | 4.4 |
-| **tqhnsw** (ef=200)          | 86ᵖ     | 295.7 MB     | **0.992** | 7.5 |
+| **tqhnsw** (ef=100)          | 77ᵖ     | 295.7 MB     | 0.977  | 4.4 |
+| **tqhnsw** (ef=200)          | 77ᵖ     | 295.7 MB     | **0.992** | 7.5 |
 
 ## GloVe-200-angular — 1,183,514 × 200, cosine
 
@@ -750,8 +775,8 @@ apples-to-apples on _size and recall_, indicative on _latency_ and _build_.**
 | hnsw (m16, ef=100)           | 120     | 1320.9 MB    | 0.701  | **6.8** |
 | hnsw (m32, ef=100)           | 436     | 1542 MB      | 0.8386 | 12.2 |
 | **tqivf** (p=99, r=200)      | 16.4ᵖ   | **177.5 MB** | 0.933  | 20.6 |
-| **tqhnsw** (ef=100)          | 208ᵖ    | 424.1 MB     | 0.709  | 6.6 |
-| **tqhnsw** (ef=200)          | 208ᵖ    | 424.1 MB     | **0.779** | 11.2 |
+| **tqhnsw** (ef=100)          | 142ᵖ    | 424.1 MB     | 0.709  | 6.6 |
+| **tqhnsw** (ef=200)          | 142ᵖ    | 424.1 MB     | **0.779** | 11.2 |
 
 _(GloVe-angular is graph-hostile: every method needs a high recall knob; `tqivf` at p=400
 reaches 0.987, `tqflat` flat-scan is 1.000.)_
@@ -765,11 +790,12 @@ reaches 0.987, `tqflat` flat-scan is 1.000.)_
 | hnsw (m16, ef=100)           | 278     | 7810.9 MB    | 0.960  | **7.2** |
 | hnsw (m32, ef=100)           | 812     | 7811 MB      | 0.990  | 14.9 |
 | **tqivf** (p=99, r=200)      | 87.1ᵖ   | **1029 MB**  | 0.976  | 51.3 |
-| **tqhnsw** (ef=100)          | 578ᵖ    | **1301.8 MB**| 0.964  | 12.9 |
-| **tqhnsw** (ef=200)          | 578ᵖ    | **1301.8 MB**| **0.981** | 21.1 |
+| **tqhnsw** (ef=100)          | 440ᵖ    | **1301.8 MB**| 0.964  | 12.9 |
+| **tqhnsw** (ef=200)          | 440ᵖ    | **1301.8 MB**| **0.981** | 21.1 |
 
 ᵖ parallel build. `tqhnsw` forces the full 8-worker grant
-(`min_parallel_table_scan_size=0`); serial is **5.3–6.0× higher** (457 / 1252 / 3434 s).
+(`min_parallel_table_scan_size=0`); build numbers include the 2026-06-10 float-kernel
+fix (see *Parallel build → Update*); serial is **4.5–5.4× higher** (348 / 773 / 2141 s).
 `tqivf` parallel build; its serial is ~1.9–2.2× higher (21 / 38 / 161 s). All other methods
 built with parallel workers. With the *default* (non-forced) grant, high-dim tables
 (OpenAI) TOAST out of the main heap and the planner grants fewer workers (~2) — see

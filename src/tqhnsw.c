@@ -1,6 +1,9 @@
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/amapi.h"
+#include "access/genam.h"
 #include "access/reloptions.h"
 #include "catalog/index.h"
 #include "commands/vacuum.h"
@@ -14,6 +17,7 @@
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/spccache.h"
 
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
@@ -130,6 +134,60 @@ tqhnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
+
+	/*
+	 * Mirror hnswcostestimate: estimate the fraction of tuples touched
+	 * before the first row is returned (entry-layer descent plus the layer-0
+	 * search bounded by ef_search) and charge that fraction of the total
+	 * cost to startup.  See hnsw.c for the formula's derivation.
+	 */
+	{
+		double		ratio;
+		double		startupPages;
+		double		spc_seq_page_cost;
+		int			m;
+		Relation	index;
+
+		index = index_open(path->indexinfo->indexoid, NoLock);
+		TqhnswGetMetaInfo(index, NULL, NULL, &m, NULL, NULL, NULL, NULL, NULL);
+		index_close(index, NoLock);
+
+		if (path->indexinfo->tuples > 0)
+		{
+			double		scalingFactor = 0.55;
+			int			entryLevel = (int) (log(path->indexinfo->tuples) * TqhnswGetMl(m));
+			int			layer0TuplesMax = TqhnswGetLayerM(m, 0) * tqhnsw_ef_search;
+			double		layer0Selectivity = scalingFactor * log(path->indexinfo->tuples) /
+				(log(m) * (1 + log(tqhnsw_ef_search)));
+
+			ratio = (entryLevel * m + layer0TuplesMax * layer0Selectivity) /
+				path->indexinfo->tuples;
+
+			if (ratio > 1)
+				ratio = 1;
+		}
+		else
+			ratio = 1;
+
+		get_tablespace_page_costs(path->indexinfo->reltablespace, NULL,
+								  &spc_seq_page_cost);
+
+		/* Startup cost is cost before returning the first row */
+		costs.indexStartupCost = costs.indexTotalCost * ratio;
+
+		/* Adjust cost if needed since TOAST not included in seq scan cost */
+		startupPages = costs.numIndexPages * ratio;
+		if (startupPages > path->indexinfo->rel->pages && ratio < 0.5)
+		{
+			/* Change all page cost from random to sequential */
+			costs.indexStartupCost -= startupPages *
+				(costs.spc_random_page_cost - spc_seq_page_cost);
+
+			/* Remove cost of extra pages */
+			costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+		}
+	}
+
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;

@@ -310,16 +310,23 @@ def bench_exact(conn, queries, k, gt, op="<->", verbose=False):
     }
 
 
-def bench_hnsw(conn, queries, k, gt, dim, op="<->", opclass="vector_l2_ops", ef_search=100,
-               m=16, ef_construction=64, verbose=False):
+def bench_hnsw_build(conn, opclass="vector_l2_ops", m=16, ef_construction=64):
+    """Build an hnsw index once; return (build_s, idx_bytes). ef_search is a
+    query-time GUC, so a single built index is reused across the whole sweep
+    (mirrors bench_tqhnsw_build — keeps the matched comparison apples-to-apples)."""
     ddl = (f"CREATE INDEX {INDEX_NAME} ON {TABLE} USING hnsw (v {opclass}) "
            f"WITH (m={m}, ef_construction={ef_construction})")
     print(f"  Building hnsw index ({opclass}, m={m}, ef_construction={ef_construction}) …",
           end="", flush=True)
     build_s = build_index_and_time(conn, ddl)
     print(f" {build_s:.1f}s")
+    sz, _ = index_size(conn)
+    return build_s, sz
 
-    sz, sz_total = index_size(conn)
+
+def bench_hnsw_query(conn, queries, k, gt, m, ef_construction, ef_search, build_s, idx_bytes,
+                     op="<->", verbose=False):
+    """Query an already-built hnsw index at a given ef_search."""
     _execute(conn, f"SET hnsw.ef_search = {ef_search}")
     _execute(conn, "SET enable_seqscan = off")
     results, qps, avg_ms = run_queries(conn, queries, k, op=op, verbose=verbose, explain_first=verbose)
@@ -329,12 +336,12 @@ def bench_hnsw(conn, queries, k, gt, dim, op="<->", opclass="vector_l2_ops", ef_
     return {
         "method": f"hnsw (m={m},ef_construction={ef_construction},ef_search={ef_search})",
         "build_s": build_s,
-        "idx_size": format_bytes(sz),
+        "idx_size": format_bytes(idx_bytes),
         "recall": rec,
         "qps": qps,
         "avg_ms": avg_ms,
         "_build_s_raw": build_s,
-        "_idx_bytes": sz,
+        "_idx_bytes": idx_bytes,
     }
 
 
@@ -606,6 +613,10 @@ def parse_args():
     p.add_argument("--hnsw-ef-search", type=int, default=100,
                    help="hnsw.ef_search at query time (default 100; pgvector's default is 40, "
                         "which under-recalls on hard datasets like GloVe-angular)")
+    p.add_argument("--hnsw-ef-search-list", type=int, nargs="+", default=None,
+                   help="Sweep hnsw.ef_search across these values on ONE built index "
+                        "(build-once, query-many; mirrors --tqhnsw-ef-search-list). "
+                        "Overrides --hnsw-ef-search when set.")
     p.add_argument("--hnsw-m", type=int, default=16,
                    help="hnsw m (max connections per layer; build reloption, default 16)")
     p.add_argument("--hnsw-ef-construction", type=int, default=64,
@@ -828,14 +839,21 @@ def main():
                     print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
                     results_rows.append(row)
 
-        # ---- hnsw ----
+        # ---- hnsw: build once, query across the ef_search sweep ----
         if run_hnsw:
-            print(f"\n--- HNSW ({metric}) ---")
-            row = bench_hnsw(conn, queries, k, gt, dim, op=op, opclass=opclass,
-                             ef_search=args.hnsw_ef_search, m=args.hnsw_m,
-                             ef_construction=args.hnsw_ef_construction, verbose=args.verbose)
-            row["metric"] = metric
-            results_rows.append(row)
+            ef_sweep = args.hnsw_ef_search_list if args.hnsw_ef_search_list else [args.hnsw_ef_search]
+            print(f"\n--- HNSW ({metric}) m={args.hnsw_m} ef_construction={args.hnsw_ef_construction} "
+                  f"ef_search={ef_sweep} ---")
+            build_s, idx_bytes = bench_hnsw_build(conn, opclass=opclass, m=args.hnsw_m,
+                                                  ef_construction=args.hnsw_ef_construction)
+            for ef_search in ef_sweep:
+                print(f"  Querying ef_search={ef_search} …", end="", flush=True)
+                row = bench_hnsw_query(conn, queries, k, gt, args.hnsw_m,
+                                       args.hnsw_ef_construction, ef_search, build_s, idx_bytes,
+                                       op=op, verbose=args.verbose)
+                row["metric"] = metric
+                print(f" {row['qps']:.0f} QPS, recall={row['recall']:.4f}")
+                results_rows.append(row)
 
         # ---- ivfflat ----
         if run_ivfflat:
