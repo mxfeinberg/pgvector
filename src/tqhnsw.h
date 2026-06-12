@@ -21,6 +21,7 @@
 #include "tq.h"					/* TqModel, TqEntry, TqMetric, TqTypeInfo,
 								 * TqPackCode */
 #include "vector.h"
+#include "halfvec.h"			/* half type for fp16 rhat */
 
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
@@ -50,7 +51,7 @@ TqhnswPtrDeclare(TqhnswNeighborArray, TqhnswNeighborArrayRelptr, TqhnswNeighborA
  * so the in-memory graph is DSM-relocatable for parallel build). */
 TqhnswPtrDeclare(TqhnswNeighborArrayPtr, TqhnswNeighborsRelptr, TqhnswNeighborsPtr);
 /* rhat/codes: relptr-capable element payloads (DSM-relocatable for parallel build). */
-TqhnswPtrDeclare(float, TqhnswRhatRelptr, TqhnswRhatPtr);
+TqhnswPtrDeclare(half, TqhnswRhatRelptr, TqhnswRhatPtr);
 TqhnswPtrDeclare(char, TqhnswCodesRelptr, TqhnswCodesPtr);
 
 #define TqhnswPtrAccess(base, hp) ((base) == NULL ? (hp).ptr : relptr_access((char *)(base), (hp).relptr))
@@ -258,7 +259,7 @@ struct TqhnswElementData
 	ItemPointerData heaptid;
 	uint8		level;
 	TqhnswRhatPtr rhat;			/* reconstructed rotated vector, dimCodes
-								 * floats */
+								 * halfs (fp16) */
 	TqhnswCodesPtr codes;		/* packed codes (flushed to disk) */
 	float		norm;
 	float		scale;
@@ -348,16 +349,18 @@ typedef struct TqhnswLeader
 } TqhnswLeader;
 
 /* ---- tqhnswutils.c ---- */
-/* Reconstruct the rotated full-magnitude vector from an entry's codes (no inverse
- * rotation: distances are computed in rotated space, which is orthonormal). */
-extern void TqhnswReconstruct(const TqModel *model, const char *codes,
-							  float norm, float scale, float *rhat /* dimCodes */ );
-
-/* Cosine: unit-normalize a reconstructed rhat vector in place. */
-extern void TqhnswNormalizeRhat(float *rhat, int dimCodes);
+/*
+ * Reconstruct rhat from codes into a float scratch, optionally cosine
+ * unit-normalize, and pack to fp16 `out`.  scratch and out are both dimCodes
+ * long and caller-owned.
+ */
+extern void TqhnswReconstructHalf(const TqModel *model, const char *codes,
+								  float norm, float scale, bool normalize,
+								  float *scratch /* dimCodes */ ,
+								  half *out /* dimCodes */ );
 
 /* Build-time distance on reconstructed rotated vectors (smaller = nearer). */
-extern double TqhnswBuildDistance(const float *a, const float *b, int dc,
+extern double TqhnswBuildDistance(half *a, half *b, int dc,
 								  TqMetric metric);
 
 /* Add element as a neighbor of target at layer lc, pruning target's neighbor

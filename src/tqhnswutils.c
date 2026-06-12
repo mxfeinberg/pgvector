@@ -8,6 +8,7 @@
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
 #include "tqhnsw.h"
+#include "halfutils.h"			/* HalfToFloat4 / Float4ToHalf / Halfvec*Distance */
 
 /* murmurhash64 became public in common/hashfn.h in PG17; shim for older. */
 #if PG_VERSION_NUM < 170000
@@ -86,14 +87,20 @@ typedef union
 } TqhnswVisited;
 
 /*
- * Reconstruct the rotated, full-magnitude vector rhat[i] = norm*scale*centroids[code_i]
- * from an entry's packed codes.  Because the RHT rotation is orthonormal, L2/IP
- * distances between two rhat's equal the distances between the original vectors, so
- * the graph can be built entirely in rotated space without an inverse rotation.
+ * Reconstruct rhat[i] = norm*scale*centroids[code_i] from the packed codes into
+ * the caller's float `scratch`, optionally cosine unit-normalize it, then pack to
+ * fp16 `out`.  rhat is stored fp16 to halve the bytes streamed per build distance
+ * (the parallel build's dominant, memory-bandwidth-bound traffic).  Reconstruct
+ * and normalize run in float and round once at the pack, preserving precision.
+ * The RHT rotation is orthonormal, so L2/IP between two rhat equal the distances
+ * between the original vectors -- the graph is built in rotated space.
+ *
+ * scratch and out are both model->dimCodes long and caller-owned.
  */
 void
-TqhnswReconstruct(const TqModel *model, const char *codes,
-				  float norm, float scale, float *rhat /* dimCodes */ )
+TqhnswReconstructHalf(const TqModel *model, const char *codes,
+					  float norm, float scale, bool normalize,
+					  float *scratch, half *out)
 {
 	int			dc = model->dimCodes;
 	int			codesBytes = TQ_CODES_BYTES(dc, model->bits);
@@ -104,78 +111,65 @@ TqhnswReconstruct(const TqModel *model, const char *codes,
 	{
 		uint8		code = TqUnpackCode(codes, codesBytes, i, model->bits);
 
-		rhat[i] = s * model->centroids[code];
+		scratch[i] = s * model->centroids[code];
 	}
-}
 
-/*
- * Cosine: unit-normalize a reconstructed rhat vector so that -IP orders by
- * cosine distance.  Shared by every node-creation path (build, on-disk insert,
- * lazy scan-load) so the epsilon and accumulation precision stay identical.
- */
-void
-TqhnswNormalizeRhat(float *rhat, int dimCodes)
-{
-	double		n = 0.0;
-	int			i;
-
-	for (i = 0; i < dimCodes; i++)
-		n += (double) rhat[i] * (double) rhat[i];
-	n = sqrt(n);
-	if (n > 1e-20)
+	if (normalize)
 	{
-		float		inv = (float) (1.0 / n);
+		double		n = 0.0;
 
-		for (i = 0; i < dimCodes; i++)
-			rhat[i] *= inv;
+		for (i = 0; i < dc; i++)
+			n += (double) scratch[i] * (double) scratch[i];
+		n = sqrt(n);
+		if (n > 1e-20)
+		{
+			float		inv = (float) (1.0 / n);
+
+			for (i = 0; i < dc; i++)
+				scratch[i] *= inv;
+		}
+	}
+
+	for (i = 0; i < dc; i++)
+	{
+		float		v = scratch[i];
+
+		/*
+		 * Clamp finite floats to ±HALF_MAX before conversion.
+		 * Float4ToHalfUnchecked maps finite-but-too-large floats to ±infinity;
+		 * infinity in rhat breaks distance ordering (all inf nodes look
+		 * equidistant).  Clamping preserves the "very large but finite"
+		 * ordering without corrupting the distance metric.  Genuine infinities
+		 * (isinf(v)) pass through unchanged -- HalfvecL2/IP handle them
+		 * consistently.
+		 */
+		if (!isinf(v))
+		{
+			if (v > HALF_MAX)
+				v = HALF_MAX;
+			else if (v < -HALF_MAX)
+				v = -HALF_MAX;
+		}
+		out[i] = Float4ToHalfUnchecked(v);
 	}
 }
 
-#if defined(USE_TARGET_CLONES) && !defined(__FMA__)
-#define TQHNSW_TARGET_CLONES __attribute__((target_clones("default", "fma")))
-#else
-#define TQHNSW_TARGET_CLONES
-#endif
-
 /*
- * Build-time distance on the reconstructed rotated vectors (variant A).  Smaller
- * is nearer, matching the HNSW convention.
+ * Build-time distance on the reconstructed fp16 rotated vectors.  Smaller is
+ * nearer (HNSW convention): L2 -> squared Euclidean; IP/cosine -> negative inner
+ * product (rhat is pre-normalized for cosine so -IP orders by cosine distance).
  *
- *   L2          -> squared Euclidean distance
- *   IP / cosine -> negative inner product
- *
- * For cosine the rhat vectors are pre-normalized to unit length at node creation,
- * so -IP orders by cosine distance.
- *
- * Accumulates in float, like vector.c's VectorL2SquaredDistance /
- * VectorInnerProduct kernels: the loops auto-vectorize at full float width
- * instead of paying a float->double convert chain at half width, and graph
- * construction tolerates the same rounding hnsw's build does on raw vectors.
+ * Dispatches to pgvector's F16C-probed halfvec kernels (installed in HalfvecInit),
+ * which accumulate in float -- matching the prior float-accumulated build kernel.
  */
-TQHNSW_TARGET_CLONES double
-TqhnswBuildDistance(const float *a, const float *b, int dc, TqMetric metric)
+double
+TqhnswBuildDistance(half *a, half *b, int dc, TqMetric metric)
 {
-	float		acc = 0.0;
-	int			i;
-
 	Assert(a != NULL && b != NULL);
 
 	if (metric == TQ_METRIC_L2)
-	{
-		/* Auto-vectorized */
-		for (i = 0; i < dc; i++)
-		{
-			float		d = a[i] - b[i];
-
-			acc += d * d;
-		}
-		return (double) acc;
-	}
-
-	/* Auto-vectorized */
-	for (i = 0; i < dc; i++)
-		acc += a[i] * b[i];
-	return -(double) acc;
+		return (double) HalfvecL2SquaredDistance(dc, a, b);
+	return -(double) HalfvecInnerProduct(dc, a, b);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -698,7 +692,8 @@ TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 	Page		page;
 	TqhnswElementTuple etup;
 	char	   *codes;
-	float	   *rhat;
+	half	   *rhat;
+	float	   *rhatScratch;
 	int			codesBytes = TQ_CODES_BYTES(model->dimCodes, model->bits);
 	MemoryContext old;
 
@@ -732,13 +727,12 @@ TqhnswLoadElement(Relation index, const TqModel *model, TqMetric metric,
 
 	UnlockReleaseBuffer(buf);
 
-	rhat = (float *) palloc(sizeof(float) * model->dimCodes);
+	rhat = (half *) palloc(sizeof(half) * model->dimCodes);
+	rhatScratch = (float *) palloc(sizeof(float) * model->dimCodes);
 	TqhnswPtrStore(base, e->rhat, rhat);
-	TqhnswReconstruct(model, codes, e->norm, e->scale, rhat);
-
-	/* Cosine: unit-normalize rhat so -IP orders by cosine (mirrors build). */
-	if (metric == TQ_METRIC_COSINE)
-		TqhnswNormalizeRhat(rhat, model->dimCodes);
+	TqhnswReconstructHalf(model, codes, e->norm, e->scale,
+						  metric == TQ_METRIC_COSINE, rhatScratch, rhat);
+	pfree(rhatScratch);			/* only needed during reconstruct; rhat lives on */
 
 	/* Neighbor arrays populated lazily per layer by TqhnswLoadNeighbors. */
 	TqhnswPtrStore(base, e->neighbors,

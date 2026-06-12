@@ -64,6 +64,8 @@ typedef struct TqhnswBuildState
 	/* Type-info vtable (resolved from opclass support proc). */
 	const TqTypeInfo *typeInfo;
 	float	   *vecScratch;		/* dim floats, reused per tuple */
+	float	   *rhatScratch;	/* dimCodes; float reconstruct buffer, packed
+								 * to the element's fp16 rhat (per-worker) */
 
 	TqhnswGraph graphData;		/* serial: graph lives here */
 	TqhnswGraph *graph;			/* points at graphData (serial) or DSM
@@ -341,7 +343,7 @@ TqhnswAllocElement(TqhnswBuildState *buildstate, ItemPointer tid, int level)
 	MemSet(element, 0, sizeof(TqhnswElement));
 	element->heaptid = *tid;
 	element->level = (uint8) level;
-	TqhnswPtrStore(base, element->rhat, (float *) TqhnswAlloc(&buildstate->allocator, sizeof(float) * buildstate->dimCodes));
+	TqhnswPtrStore(base, element->rhat, (half *) TqhnswAlloc(&buildstate->allocator, sizeof(half) * buildstate->dimCodes));
 	{
 		char	   *codes = TqhnswAlloc(&buildstate->allocator, buildstate->codesBytes);
 
@@ -448,7 +450,7 @@ TqhnswInsertTuple(TqhnswBuildState *buildstate, Datum value, ItemPointer tid)
 											 buildstate->vecScratch, buildstate->dim);
 
 		char	   *codes;
-		float	   *rhat;
+		half	   *rhat;
 
 		memset(buildstate->scratch, 0, buildstate->scratchSize);
 		TqEncode(model, fv, buildstate->scratch);
@@ -458,11 +460,9 @@ TqhnswInsertTuple(TqhnswBuildState *buildstate, Datum value, ItemPointer tid)
 		rhat = TqhnswPtrAccess(base, element->rhat);
 		Assert(codes != NULL && rhat != NULL);
 		memcpy(codes, buildstate->scratch->data, buildstate->codesBytes);
-		TqhnswReconstruct(model, codes, element->norm, element->scale, rhat);
-
-		/* Cosine: unit-normalize rhat so -IP orders by cosine. */
-		if (buildstate->metric == TQ_METRIC_COSINE)
-			TqhnswNormalizeRhat(rhat, buildstate->dimCodes);
+		TqhnswReconstructHalf(model, codes, element->norm, element->scale,
+							  buildstate->metric == TQ_METRIC_COSINE,
+							  buildstate->rhatScratch, rhat);
 	}
 
 	/*
@@ -852,6 +852,7 @@ TqhnswInitWorkerBuildState(TqhnswBuildState *buildstate, Relation index)
 	buildstate->scratch = (TqEntry *) palloc(buildstate->scratchSize);
 	buildstate->typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
 	buildstate->vecScratch = palloc(sizeof(float) * buildstate->dim);
+	buildstate->rhatScratch = (float *) palloc(sizeof(float) * buildstate->dimCodes);
 	buildstate->graphCtx = AllocSetContextCreate(CurrentMemoryContext,
 												 "tqhnsw build graph",
 												 ALLOCSET_DEFAULT_SIZES);
@@ -1273,6 +1274,7 @@ tqhnswbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	buildstate.scratch = (TqEntry *) palloc(buildstate.scratchSize);
 	buildstate.typeInfo = TqGetTypeInfo(index, TQHNSW_TYPE_INFO_PROC);
 	buildstate.vecScratch = palloc(sizeof(float) * buildstate.dim);
+	buildstate.rhatScratch = (float *) palloc(sizeof(float) * buildstate.dimCodes);
 
 	if (buildstate.typeInfo->toFloat == TqSparsevecToFloat)
 		ereport(NOTICE,

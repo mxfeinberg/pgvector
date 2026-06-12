@@ -16,8 +16,9 @@
 /*
  * Quantize a heap value into a fresh in-memory element (codes + rhat), drawing a
  * random level.  Mirrors TqhnswBuildCallback's encode block exactly (detoast ->
- * TqExtractForEncode -> TqEncode -> reconstruct rhat -> cosine unit-normalize
- * rhat) so on-disk inserts are numerically identical to build-time nodes.
+ * TqExtractForEncode -> TqEncode -> TqhnswReconstructHalf, which reconstructs
+ * rhat with cosine unit-normalization when applicable) so on-disk inserts are
+ * numerically identical to build-time nodes.
  *
  * Allocated in the current (per-insert) memory context.  Neighbor arrays are
  * sized per layer (level 0 doubled) and zero-initialized; forward links are
@@ -41,7 +42,8 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 																 * build tmpCtx reset) */
 	const float *fv;
 	char	   *codes;
-	float	   *rhat;
+	half	   *rhat;
+	float	   *rhatScratch;
 
 	value = PointerGetDatum(PG_DETOAST_DATUM(value));
 
@@ -60,7 +62,8 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 	codes = (char *) palloc0(codesBytes);
 	memcpy(codes, scratch->data, codesBytes);
 	TqhnswPtrStore(base, element->codes, codes);
-	rhat = (float *) palloc(sizeof(float) * dimCodes);
+	rhat = (half *) palloc(sizeof(half) * dimCodes);
+	rhatScratch = (float *) palloc(sizeof(float) * dimCodes);
 	TqhnswPtrStore(base, element->rhat, rhat);
 
 	{
@@ -84,11 +87,8 @@ TqhnswQuantizeElement(Relation index, const TqModel *model, TqMetric metric,
 	TqhnswPtrStore(base, element->next, (TqhnswElement *) NULL);
 	LWLockInitialize(&element->lock, tqhnsw_lock_tranche_id);
 
-	TqhnswReconstruct(model, codes, element->norm, element->scale, rhat);
-
-	/* Cosine: unit-normalize rhat so -IP orders by cosine (mirrors build). */
-	if (metric == TQ_METRIC_COSINE)
-		TqhnswNormalizeRhat(rhat, dimCodes);
+	TqhnswReconstructHalf(model, codes, element->norm, element->scale,
+						  metric == TQ_METRIC_COSINE, rhatScratch, rhat);
 
 	pfree(scratch);
 	return element;

@@ -860,3 +860,37 @@ float32. The win grows with dimension.
 > kernel, single host pass) a unified re-run is the clean follow-up — the harness supports
 > all five methods in one invocation. The numbers above are assembled from the existing
 > suites and are exact on size/recall, indicative on latency/build.
+
+---
+
+## fp16 `rhat` build optimization (2026-06-12)
+
+The tqhnsw graph build reconstructs each node's rotated vector `rhat` (`float[dimCodes]`)
+and scores graph-construction distances on it. A bottleneck diagnostic
+(`bench/diag_parallel_build.py`, the-fire, 12-worker) showed the parallel build is
+**memory-bandwidth-bound** (99.4–99.7% CPU, ~0% LWLock; tqhnsw scaling matches hnsw),
+so the dominant cost is the bytes streamed per distance. Storing `rhat` as fp16
+(`half`) halves that traffic. `rhat` is never persisted (only codes/norm/scale hit disk),
+so the on-disk format and index size are unchanged.
+
+**A/B (scratch cluster, m=32 / ef_construction=128, fp16 vs float32 `rhat`):**
+
+Build time — 12-worker, 400k rows:
+
+| dataset | dimCodes | float32 | fp16 | speedup |
+|---|--:|--:|--:|--:|
+| SIFT (L2)      | 128  | 81.3 s  | 69.5 s  | 1.17× |
+| OpenAI (cosine)| 2048 | 538.5 s | 468.6 s | 1.15× |
+
+Recall@10 — serial build, 300k rows, ef_search=100 / rerank=100 (exact seqscan GT):
+
+| dataset | metric | float32 | fp16 | Δ |
+|---|---|--:|--:|--:|
+| SIFT  | L2     | 0.9952 | 0.9932 | −0.0020 |
+| GloVe | cosine | 0.8698 | 0.8710 | +0.0012 |
+
+Recall is within build-PRNG noise (±0.008); index size identical (196.6 MB / 625.0 MB
+both arms); per-node `rhat` build-RAM halved. Net: **~13–15% faster parallel build at
+neutral recall and zero size cost.** Validated: installcheck 26/26, TAP 102–105 + WAL
+106/107 (128 subtests). The build distance reuses pgvector's F16C-dispatched
+`HalfvecL2SquaredDistance`/`HalfvecInnerProduct` kernels.
